@@ -1,34 +1,45 @@
 /**
- * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * GET  /              service index
- * GET  /health
- * GET  /api/balance?repo=owner/repo
- * GET  /api/ledger?repo=&limit=
- * POST /api/pay       atomic micro-transfer
- * POST /api/fund      demo faucet (capped)
+ * Autonomous Edge-Agent Economy — hardened Worker + D1
  */
 
-const CORS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
-  "Access-Control-Max-Age": "86400",
-};
+const ALLOWED_ORIGINS = new Set([
+  "https://newhorizons-beyondhorizon.pages.dev",
+  "https://autonomous-edge-agent-economy.explorercosmic7.workers.dev",
+]);
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const FAUCET_MAX_PER_CALL = 10;
 const FAUCET_ACCOUNT_CAP = 100;
 const SYSTEM_FAUCET = "system/faucet";
+const MIN_AMOUNT = 0.000001;
+const MAX_AMOUNT = 1_000_000;
 
-function json(data, status = 200) {
+function corsHeaders(request) {
+  const origin = request.headers.get("Origin");
+  const allow =
+    origin && ALLOWED_ORIGINS.has(origin)
+      ? origin
+      : origin
+        ? "https://newhorizons-beyondhorizon.pages.dev"
+        : "*";
+  return {
+    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+}
+
+function json(request, data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...CORS },
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(request) },
   });
 }
 
-function bad(message, status = 400) {
-  return json({ ok: false, error: message }, status);
+function bad(request, message, status = 400) {
+  return json(request, { ok: false, error: message }, status);
 }
 
 function parseRepo(v) {
@@ -38,21 +49,20 @@ function parseRepo(v) {
 
 function parseAmount(v) {
   const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0) return null;
-  if (n > 1_000_000) return null;
-  return n;
+  if (!Number.isFinite(n) || n < MIN_AMOUNT || n > MAX_AMOUNT) return null;
+  return Math.round(n * 1e6) / 1e6;
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: CORS });
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
     try {
       if (request.method === "GET" && url.pathname === "/") {
-        return json({
+        return json(request, {
           ok: true,
           service: "a2a-ledger",
           endpoints: {
@@ -65,7 +75,7 @@ export default {
         });
       }
       if (request.method === "GET" && url.pathname === "/health") {
-        return json({ ok: true, service: "a2a-ledger", ts: Date.now() });
+        return json(request, { ok: true, service: "a2a-ledger", ts: Date.now() });
       }
       if (request.method === "POST" && url.pathname === "/api/pay") {
         return await handlePay(request, env);
@@ -74,14 +84,14 @@ export default {
         return await handleFund(request, env);
       }
       if (request.method === "GET" && url.pathname === "/api/balance") {
-        return await handleBalance(url, env);
+        return await handleBalance(request, url, env);
       }
       if (request.method === "GET" && url.pathname === "/api/ledger") {
-        return await handleLedger(url, env);
+        return await handleLedger(request, url, env);
       }
-      return bad("Not found", 404);
+      return bad(request, "Not found", 404);
     } catch (err) {
-      return bad(err.message || "Internal error", 500);
+      return bad(request, err.message || "Internal error", 500);
     }
   },
 };
@@ -94,24 +104,62 @@ async function ensureAccount(env, repo) {
     .run();
 }
 
+async function readBalances(env, fromRepo, toRepo) {
+  const [fromAcc, toAcc] = await env.DB.batch([
+    env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?`).bind(fromRepo),
+    env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?`).bind(toRepo),
+  ]);
+  return {
+    from: fromAcc.results?.[0]?.balance ?? 0,
+    to: toAcc.results?.[0]?.balance ?? 0,
+  };
+}
+
 async function handlePay(request, env) {
   const t0 = Date.now();
   let body;
   try {
     body = await request.json();
   } catch {
-    return bad("Invalid JSON body");
+    return bad(request, "Invalid JSON body");
   }
 
   const fromRepo = parseRepo(body.from_repo || body.fromRepo);
   const toRepo = parseRepo(body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
   const task = String(body.task || "").slice(0, 500);
+  const idem =
+    String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
+      .trim()
+      .slice(0, 128) || null;
 
-  if (!fromRepo) return bad("from_repo must be owner/repo");
-  if (!toRepo) return bad("to_repo must be owner/repo");
-  if (fromRepo === toRepo) return bad("from_repo and to_repo must differ");
-  if (amount == null) return bad("amount must be a positive number");
+  if (!fromRepo) return bad(request, "from_repo must be owner/repo");
+  if (!toRepo) return bad(request, "to_repo must be owner/repo");
+  if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
+  if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
+
+  if (idem) {
+    const replay = await env.DB.prepare(
+      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms
+       FROM transactions WHERE idempotency_key = ? AND status = 'success'`
+    )
+      .bind(idem)
+      .first();
+    if (replay) {
+      const balances = await readBalances(env, fromRepo, toRepo);
+      return json(request, {
+        ok: true,
+        status: "success",
+        replayed: true,
+        from_repo: replay.from_repo,
+        to_repo: replay.to_repo,
+        amount: replay.amount,
+        task: replay.task,
+        latency_ms: replay.latency_ms,
+        balances,
+      });
+    }
+  }
 
   await env.DB.batch([
     env.DB.prepare(
@@ -122,7 +170,6 @@ async function handlePay(request, env) {
     ).bind(toRepo),
   ]);
 
-  // Serialized by SQLite: parallel spends on the same row cannot both match.
   const debit = await env.DB.prepare(
     `UPDATE accounts
      SET balance = balance - ?1, updated_at = datetime('now')
@@ -133,46 +180,56 @@ async function handlePay(request, env) {
     .first();
 
   if (!debit) {
-    const latency = Date.now() - t0;
     await env.DB.prepare(
       `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
        VALUES (?1, ?2, ?3, ?4, 'failed', ?5)`
     )
-      .bind(fromRepo, toRepo, amount, task, latency)
+      .bind(fromRepo, toRepo, amount, task, Date.now() - t0)
       .run();
-    return bad("Insufficient funds", 402);
+    return bad(request, "Insufficient funds", 402);
   }
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE accounts
-       SET balance = balance + ?1, updated_at = datetime('now')
-       WHERE repo_id = ?2`
-    ).bind(amount, toRepo),
-    env.DB.prepare(
-      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
-       VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
-    ).bind(fromRepo, toRepo, amount, task, Date.now() - t0),
-  ]);
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE accounts
+         SET balance = balance + ?1, updated_at = datetime('now')
+         WHERE repo_id = ?2`
+      ).bind(amount, toRepo),
+      env.DB.prepare(
+        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
+         VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
+      ).bind(fromRepo, toRepo, amount, task, Date.now() - t0, idem),
+    ]);
+  } catch (err) {
+    const msg = String(err.message || err);
+    if (idem && /UNIQUE|constraint/i.test(msg)) {
+      const balances = await readBalances(env, fromRepo, toRepo);
+      return json(request, {
+        ok: true,
+        status: "success",
+        replayed: true,
+        from_repo: fromRepo,
+        to_repo: toRepo,
+        amount,
+        task,
+        balances,
+      });
+    }
+    throw err;
+  }
 
-  const latency_ms = Date.now() - t0;
-  const [fromAcc, toAcc] = await env.DB.batch([
-    env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?`).bind(fromRepo),
-    env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?`).bind(toRepo),
-  ]);
-
-  return json({
+  const balances = await readBalances(env, fromRepo, toRepo);
+  return json(request, {
     ok: true,
     status: "success",
+    replayed: false,
     from_repo: fromRepo,
     to_repo: toRepo,
     amount,
     task,
-    latency_ms,
-    balances: {
-      from: fromAcc.results?.[0]?.balance,
-      to: toAcc.results?.[0]?.balance,
-    },
+    latency_ms: Date.now() - t0,
+    balances,
   });
 }
 
@@ -182,17 +239,17 @@ async function handleFund(request, env) {
   try {
     body = await request.json();
   } catch {
-    return bad("Invalid JSON body");
+    return bad(request, "Invalid JSON body");
   }
 
   const repo = parseRepo(body.repo || body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
   const task = String(body.task || "faucet").slice(0, 500);
 
-  if (!repo) return bad("repo must be owner/repo");
-  if (amount == null) return bad("amount must be a positive number");
+  if (!repo) return bad(request, "repo must be owner/repo");
+  if (amount == null) return bad(request, "amount must be a positive number");
   if (amount > FAUCET_MAX_PER_CALL) {
-    return bad("Faucet max is $" + FAUCET_MAX_PER_CALL + " per request");
+    return bad(request, "Faucet max is $" + FAUCET_MAX_PER_CALL + " per request");
   }
 
   await ensureAccount(env, repo);
@@ -207,49 +264,45 @@ async function handleFund(request, env) {
     .first();
 
   if (!row) {
-    return bad("Faucet cap reached ($" + FAUCET_ACCOUNT_CAP + " per agent)", 429);
+    return bad(request, "Faucet cap reached ($" + FAUCET_ACCOUNT_CAP + " per agent)", 429);
   }
 
-  const latency_ms = Date.now() - t0;
   await env.DB.prepare(
     `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
      VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
   )
-    .bind(SYSTEM_FAUCET, repo, amount, task, latency_ms)
+    .bind(SYSTEM_FAUCET, repo, amount, task, Date.now() - t0)
     .run();
 
-  return json({
+  return json(request, {
     ok: true,
     status: "funded",
     repo,
     amount,
     balance: row.balance,
     cap: FAUCET_ACCOUNT_CAP,
-    latency_ms,
+    latency_ms: Date.now() - t0,
   });
 }
 
-async function handleBalance(url, env) {
+async function handleBalance(request, url, env) {
   const repo = parseRepo(url.searchParams.get("repo"));
-  if (!repo) return bad("repo query must be owner/repo");
-
+  if (!repo) return bad(request, "repo query must be owner/repo");
   const row = await env.DB.prepare(
     `SELECT repo_id, balance, created_at, updated_at FROM accounts WHERE repo_id = ?`
   )
     .bind(repo)
     .first();
-
-  if (!row) return json({ ok: true, repo_id: repo, balance: 0, exists: false });
-  return json({ ok: true, ...row, exists: true });
+  if (!row) return json(request, { ok: true, repo_id: repo, balance: 0, exists: false });
+  return json(request, { ok: true, ...row, exists: true });
 }
 
-async function handleLedger(url, env) {
+async function handleLedger(request, url, env) {
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 25), 1), 100);
   const repo = (url.searchParams.get("repo") || "").trim();
-
   let stmt;
   if (repo) {
-    if (!parseRepo(repo)) return bad("repo query must be owner/repo");
+    if (!parseRepo(repo)) return bad(request, "repo query must be owner/repo");
     stmt = env.DB.prepare(
       `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at
        FROM transactions
@@ -259,11 +312,9 @@ async function handleLedger(url, env) {
   } else {
     stmt = env.DB.prepare(
       `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at
-       FROM transactions
-       ORDER BY id DESC LIMIT ?1`
+       FROM transactions ORDER BY id DESC LIMIT ?1`
     ).bind(limit);
   }
-
   const { results } = await stmt.all();
-  return json({ ok: true, count: results.length, transactions: results });
+  return json(request, { ok: true, count: results.length, transactions: results });
 }
