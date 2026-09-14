@@ -1,18 +1,24 @@
-
 /**
- * Autonomous Edge-Agent Economy
- * Pure Cloudflare Worker + D1 atomic ledger
- * POST /api/pay  — AI-to-AI micro-transfer
+ * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
+ * GET  /              service index
+ * GET  /health
+ * GET  /api/balance?repo=owner/repo
+ * GET  /api/ledger?repo=&limit=
+ * POST /api/pay       atomic micro-transfer
+ * POST /api/fund      demo faucet (capped)
  */
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
   "Access-Control-Max-Age": "86400",
 };
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const FAUCET_MAX_PER_CALL = 10;
+const FAUCET_ACCOUNT_CAP = 100;
+const SYSTEM_FAUCET = "system/faucet";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -25,17 +31,47 @@ function bad(message, status = 400) {
   return json({ ok: false, error: message }, status);
 }
 
+function parseRepo(v) {
+  const s = String(v || "").trim();
+  return REPO_RE.test(s) ? s : null;
+}
+
+function parseAmount(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n > 1_000_000) return null;
+  return n;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS });
     }
 
     try {
+      if (request.method === "GET" && url.pathname === "/") {
+        return json({
+          ok: true,
+          service: "a2a-ledger",
+          endpoints: {
+            health: "GET /health",
+            pay: "POST /api/pay",
+            fund: "POST /api/fund",
+            balance: "GET /api/balance?repo=owner/repo",
+            ledger: "GET /api/ledger",
+          },
+        });
+      }
+      if (request.method === "GET" && url.pathname === "/health") {
+        return json({ ok: true, service: "a2a-ledger", ts: Date.now() });
+      }
       if (request.method === "POST" && url.pathname === "/api/pay") {
         return await handlePay(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/fund") {
+        return await handleFund(request, env);
       }
       if (request.method === "GET" && url.pathname === "/api/balance") {
         return await handleBalance(url, env);
@@ -43,15 +79,20 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/ledger") {
         return await handleLedger(url, env);
       }
-      if (request.method === "GET" && url.pathname === "/health") {
-        return json({ ok: true, service: "a2a-ledger", ts: Date.now() });
-      }
       return bad("Not found", 404);
     } catch (err) {
       return bad(err.message || "Internal error", 500);
     }
   },
 };
+
+async function ensureAccount(env, repo) {
+  await env.DB.prepare(
+    `INSERT INTO accounts (repo_id, balance) VALUES (?, 0) ON CONFLICT(repo_id) DO NOTHING`
+  )
+    .bind(repo)
+    .run();
+}
 
 async function handlePay(request, env) {
   const t0 = Date.now();
@@ -62,18 +103,16 @@ async function handlePay(request, env) {
     return bad("Invalid JSON body");
   }
 
-  const fromRepo = String(body.from_repo || body.fromRepo || "").trim();
-  const toRepo = String(body.to_repo || body.toRepo || "").trim();
+  const fromRepo = parseRepo(body.from_repo || body.fromRepo);
+  const toRepo = parseRepo(body.to_repo || body.toRepo);
+  const amount = parseAmount(body.amount);
   const task = String(body.task || "").slice(0, 500);
-  const amount = Number(body.amount);
 
-  if (!REPO_RE.test(fromRepo)) return bad("from_repo must be owner/repo");
-  if (!REPO_RE.test(toRepo)) return bad("to_repo must be owner/repo");
+  if (!fromRepo) return bad("from_repo must be owner/repo");
+  if (!toRepo) return bad("to_repo must be owner/repo");
   if (fromRepo === toRepo) return bad("from_repo and to_repo must differ");
-  if (!Number.isFinite(amount) || amount <= 0) return bad("amount must be a positive number");
-  if (amount > 1_000_000) return bad("amount exceeds max");
+  if (amount == null) return bad("amount must be a positive number");
 
-  // Auto-create both ledgers (zero-friction onboarding). Sender still needs funds.
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO accounts (repo_id, balance) VALUES (?, 0) ON CONFLICT(repo_id) DO NOTHING`
@@ -83,8 +122,7 @@ async function handlePay(request, env) {
     ).bind(toRepo),
   ]);
 
-  // Atomic debit: SQLite serializes writers. Second parallel $1 spend on a $1
-  // balance matches 0 rows — no dirty read, no extra locks.
+  // Serialized by SQLite: parallel spends on the same row cannot both match.
   const debit = await env.DB.prepare(
     `UPDATE accounts
      SET balance = balance - ?1, updated_at = datetime('now')
@@ -118,10 +156,9 @@ async function handlePay(request, env) {
   ]);
 
   const latency_ms = Date.now() - t0;
-
   const [fromAcc, toAcc] = await env.DB.batch([
-    env.DB.prepare(`SELECT repo_id, balance FROM accounts WHERE repo_id = ?`).bind(fromRepo),
-    env.DB.prepare(`SELECT repo_id, balance FROM accounts WHERE repo_id = ?`).bind(toRepo),
+    env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?`).bind(fromRepo),
+    env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?`).bind(toRepo),
   ]);
 
   return json({
@@ -133,15 +170,68 @@ async function handlePay(request, env) {
     task,
     latency_ms,
     balances: {
-      from: fromAcc.results?.[0]?.balance ?? debit.balance,
-      to: toAcc.results?.[0]?.balance ?? null,
+      from: fromAcc.results?.[0]?.balance,
+      to: toAcc.results?.[0]?.balance,
     },
   });
 }
 
+async function handleFund(request, env) {
+  const t0 = Date.now();
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad("Invalid JSON body");
+  }
+
+  const repo = parseRepo(body.repo || body.to_repo || body.toRepo);
+  const amount = parseAmount(body.amount);
+  const task = String(body.task || "faucet").slice(0, 500);
+
+  if (!repo) return bad("repo must be owner/repo");
+  if (amount == null) return bad("amount must be a positive number");
+  if (amount > FAUCET_MAX_PER_CALL) {
+    return bad("Faucet max is $" + FAUCET_MAX_PER_CALL + " per request");
+  }
+
+  await ensureAccount(env, repo);
+
+  const row = await env.DB.prepare(
+    `UPDATE accounts
+     SET balance = balance + ?1, updated_at = datetime('now')
+     WHERE repo_id = ?2 AND (balance + ?1) <= ?3
+     RETURNING balance`
+  )
+    .bind(amount, repo, FAUCET_ACCOUNT_CAP)
+    .first();
+
+  if (!row) {
+    return bad("Faucet cap reached ($" + FAUCET_ACCOUNT_CAP + " per agent)", 429);
+  }
+
+  const latency_ms = Date.now() - t0;
+  await env.DB.prepare(
+    `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+     VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+  )
+    .bind(SYSTEM_FAUCET, repo, amount, task, latency_ms)
+    .run();
+
+  return json({
+    ok: true,
+    status: "funded",
+    repo,
+    amount,
+    balance: row.balance,
+    cap: FAUCET_ACCOUNT_CAP,
+    latency_ms,
+  });
+}
+
 async function handleBalance(url, env) {
-  const repo = (url.searchParams.get("repo") || "").trim();
-  if (!REPO_RE.test(repo)) return bad("repo query must be owner/repo");
+  const repo = parseRepo(url.searchParams.get("repo"));
+  if (!repo) return bad("repo query must be owner/repo");
 
   const row = await env.DB.prepare(
     `SELECT repo_id, balance, created_at, updated_at FROM accounts WHERE repo_id = ?`
@@ -154,12 +244,12 @@ async function handleBalance(url, env) {
 }
 
 async function handleLedger(url, env) {
-  const limit = Math.min(Number(url.searchParams.get("limit") || 25), 100);
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 25), 1), 100);
   const repo = (url.searchParams.get("repo") || "").trim();
 
   let stmt;
   if (repo) {
-    if (!REPO_RE.test(repo)) return bad("repo query must be owner/repo");
+    if (!parseRepo(repo)) return bad("repo query must be owner/repo");
     stmt = env.DB.prepare(
       `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at
        FROM transactions
