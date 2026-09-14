@@ -1,0 +1,8 @@
+name = "a2a-economy"
+main = "worker.js"
+compatibility_date = "2026-09-15"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "a2a-ledger"
+database_id = "75d9a918-0d02-4db1-99ca-307631be7eaf"
