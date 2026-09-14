@@ -1,5 +1,6 @@
 /**
- * Autonomous Edge-Agent Economy — hardened Worker + D1
+ * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
+ * Reserve-before-debit idempotency (parallel same key never 402s)
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -53,13 +54,16 @@ function parseAmount(v) {
   return Math.round(n * 1e6) / 1e6;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
-
     try {
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
@@ -115,6 +119,27 @@ async function readBalances(env, fromRepo, toRepo) {
   };
 }
 
+async function waitForIdem(env, key) {
+  for (let i = 0; i < 12; i++) {
+    const row = await env.DB.prepare(
+      `SELECT status, result_json FROM idempotency WHERE key = ?`
+    )
+      .bind(key)
+      .first();
+    if (row?.status === "success" && row.result_json) {
+      const data = JSON.parse(row.result_json);
+      data.replayed = true;
+      return data;
+    }
+    if (row?.status === "failed") {
+      return { ok: false, error: row.result_json || "Insufficient funds", replayed: true };
+    }
+    if (!row) return null;
+    await sleep(25);
+  }
+  return { ok: false, error: "Payment still in flight", pending: true };
+}
+
 async function handlePay(request, env) {
   const t0 = Date.now();
   let body;
@@ -138,26 +163,21 @@ async function handlePay(request, env) {
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
 
+  let wonLock = false;
   if (idem) {
-    const replay = await env.DB.prepare(
-      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms
-       FROM transactions WHERE idempotency_key = ? AND status = 'success'`
+    const ins = await env.DB.prepare(
+      `INSERT INTO idempotency (key, status) VALUES (?1, 'pending')
+       ON CONFLICT(key) DO NOTHING`
     )
       .bind(idem)
-      .first();
-    if (replay) {
-      const balances = await readBalances(env, fromRepo, toRepo);
-      return json(request, {
-        ok: true,
-        status: "success",
-        replayed: true,
-        from_repo: replay.from_repo,
-        to_repo: replay.to_repo,
-        amount: replay.amount,
-        task: replay.task,
-        latency_ms: replay.latency_ms,
-        balances,
-      });
+      .run();
+    wonLock = (ins.meta?.changes || 0) === 1;
+
+    if (!wonLock) {
+      const replay = await waitForIdem(env, idem);
+      if (replay && replay.ok) return json(request, replay);
+      if (replay && replay.pending) return json(request, replay, 202);
+      if (replay && !replay.ok) return bad(request, replay.error, 402);
     }
   }
 
@@ -180,6 +200,11 @@ async function handlePay(request, env) {
     .first();
 
   if (!debit) {
+    if (idem && wonLock) {
+      await env.DB.prepare(`DELETE FROM idempotency WHERE key = ? AND status = 'pending'`)
+        .bind(idem)
+        .run();
+    }
     await env.DB.prepare(
       `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
        VALUES (?1, ?2, ?3, ?4, 'failed', ?5)`
@@ -189,38 +214,19 @@ async function handlePay(request, env) {
     return bad(request, "Insufficient funds", 402);
   }
 
-  try {
-    await env.DB.batch([
-      env.DB.prepare(
-        `UPDATE accounts
-         SET balance = balance + ?1, updated_at = datetime('now')
-         WHERE repo_id = ?2`
-      ).bind(amount, toRepo),
-      env.DB.prepare(
-        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
-         VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
-      ).bind(fromRepo, toRepo, amount, task, Date.now() - t0, idem),
-    ]);
-  } catch (err) {
-    const msg = String(err.message || err);
-    if (idem && /UNIQUE|constraint/i.test(msg)) {
-      const balances = await readBalances(env, fromRepo, toRepo);
-      return json(request, {
-        ok: true,
-        status: "success",
-        replayed: true,
-        from_repo: fromRepo,
-        to_repo: toRepo,
-        amount,
-        task,
-        balances,
-      });
-    }
-    throw err;
-  }
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE accounts
+       SET balance = balance + ?1, updated_at = datetime('now')
+       WHERE repo_id = ?2`
+    ).bind(amount, toRepo),
+    env.DB.prepare(
+      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
+       VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
+    ).bind(fromRepo, toRepo, amount, task, Date.now() - t0, idem),
+  ]);
 
-  const balances = await readBalances(env, fromRepo, toRepo);
-  return json(request, {
+  const payload = {
     ok: true,
     status: "success",
     replayed: false,
@@ -229,8 +235,20 @@ async function handlePay(request, env) {
     amount,
     task,
     latency_ms: Date.now() - t0,
-    balances,
-  });
+    balances: await readBalances(env, fromRepo, toRepo),
+  };
+
+  if (idem && wonLock) {
+    await env.DB.prepare(
+      `UPDATE idempotency
+       SET status = 'success', result_json = ?1, updated_at = datetime('now')
+       WHERE key = ?2`
+    )
+      .bind(JSON.stringify(payload), idem)
+      .run();
+  }
+
+  return json(request, payload);
 }
 
 async function handleFund(request, env) {
