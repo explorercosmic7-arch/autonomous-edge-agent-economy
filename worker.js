@@ -1,10 +1,11 @@
 /**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * Ledger + Google OAuth sessions (HttpOnly cookie)
+ * Ledger + Google OAuth + user default agent repo (pay-as-me)
  */
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
   "https://newhorizons-beyondhorizon.pages.dev",
+  "https://agentpay.pages.dev",
   "https://autonomous-edge-agent-economy.explorercosmic7.workers.dev",
 ]);
 
@@ -82,12 +83,35 @@ function parseCookies(header) {
 }
 
 function sessionCookie(value, maxAgeSec) {
-  // SameSite=None required for cross-site (Pages → Workers)
   return `${COOKIE_NAME}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSec}`;
 }
 
 function clearSessionCookie() {
   return `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`;
+}
+
+/** Resolve logged-in user from session cookie (or null). */
+async function getSessionUser(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const sid = cookies[COOKIE_NAME];
+  if (!sid) return null;
+
+  const row = await env.DB.prepare(
+    `SELECT s.id AS session_id, s.expires_at,
+            u.id, u.email, u.name, u.picture, u.provider, u.default_repo
+     FROM sessions s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.id = ?1`
+  )
+    .bind(sid)
+    .first();
+
+  if (!row) return null;
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
+    return null;
+  }
+  return row;
 }
 
 export default {
@@ -113,6 +137,14 @@ export default {
         return await handleAuthLogout(request, env);
       }
 
+      // ── Me / agent (logged-in) ────────────────────────────────
+      if (request.method === "POST" && url.pathname === "/api/me/agent") {
+        return await handleMeAgent(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/balance") {
+        return await handleMeBalance(request, env);
+      }
+
       // ── Ledger routes ────────────────────────────────────────
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
@@ -127,6 +159,8 @@ export default {
             auth_google: "GET /api/auth/google",
             auth_me: "GET /api/auth/me",
             auth_logout: "POST /api/auth/logout",
+            me_agent: "POST /api/me/agent",
+            me_balance: "GET /api/me/balance",
           },
         });
       }
@@ -176,7 +210,6 @@ function handleAuthGoogleStart(request, env, url) {
     prompt: "select_account",
   });
 
-  // Short-lived state cookie to block CSRF
   const headers = new Headers({
     Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
     "Set-Cookie": `a2a_oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
@@ -209,7 +242,6 @@ async function handleAuthGoogleCallback(request, env, url) {
 
   const redirectUri = `${url.origin}/api/auth/google/callback`;
 
-  // Exchange code → tokens
   const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -226,7 +258,6 @@ async function handleAuthGoogleCallback(request, env, url) {
     return Response.redirect(`${DASHBOARD_URL}?auth_error=token_exchange`, 302);
   }
 
-  // Userinfo
   const userRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
     headers: { Authorization: `Bearer ${tokenData.access_token}` },
   });
@@ -240,7 +271,6 @@ async function handleAuthGoogleCallback(request, env, url) {
   const name = String(profile.name || email.split("@")[0]);
   const picture = profile.picture ? String(profile.picture) : null;
 
-  // Upsert user
   await env.DB.prepare(
     `INSERT INTO users (id, email, name, picture, provider, updated_at)
      VALUES (?1, ?2, ?3, ?4, 'google', datetime('now'))
@@ -253,7 +283,6 @@ async function handleAuthGoogleCallback(request, env, url) {
     .bind(userId, email, name, picture)
     .run();
 
-  // Create session
   const sessionId = randomId(24);
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString();
   await env.DB.prepare(
@@ -263,46 +292,20 @@ async function handleAuthGoogleCallback(request, env, url) {
     .run();
 
   const maxAge = SESSION_DAYS * 86400;
-  const headers = new Headers({
-    Location: DASHBOARD_URL,
-    "Set-Cookie": [
-      sessionCookie(sessionId, maxAge),
-      "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
-    ].join(", "),
-  });
-  // Multiple Set-Cookie: some runtimes need append
-  headers.delete("Set-Cookie");
+  const headers = new Headers({ Location: DASHBOARD_URL });
   headers.append("Set-Cookie", sessionCookie(sessionId, maxAge));
-  headers.append("Set-Cookie", "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+  headers.append(
+    "Set-Cookie",
+    "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+  );
 
   return new Response(null, { status: 302, headers });
 }
 
 async function handleAuthMe(request, env) {
-  const cookies = parseCookies(request.headers.get("Cookie"));
-  const sid = cookies[COOKIE_NAME];
-  if (!sid) {
-    return json(request, { ok: false, authenticated: false });
-  }
-
-  const row = await env.DB.prepare(
-    `SELECT s.id AS session_id, s.expires_at, u.id, u.email, u.name, u.picture, u.provider
-     FROM sessions s
-     JOIN users u ON u.id = s.user_id
-     WHERE s.id = ?1`
-  )
-    .bind(sid)
-    .first();
-
-  if (!row) {
+  const user = await getSessionUser(request, env);
+  if (!user) {
     return json(request, { ok: false, authenticated: false }, 200, {
-      "Set-Cookie": clearSessionCookie(),
-    });
-  }
-
-  if (new Date(row.expires_at).getTime() < Date.now()) {
-    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
-    return json(request, { ok: false, authenticated: false, error: "session_expired" }, 200, {
       "Set-Cookie": clearSessionCookie(),
     });
   }
@@ -311,11 +314,12 @@ async function handleAuthMe(request, env) {
     ok: true,
     authenticated: true,
     user: {
-      id: row.id,
-      email: row.email,
-      name: row.name,
-      picture: row.picture,
-      provider: row.provider,
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      picture: user.picture,
+      provider: user.provider,
+      default_repo: user.default_repo || null,
     },
   });
 }
@@ -335,7 +339,89 @@ async function handleAuthLogout(request, env) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Ledger (unchanged logic)
+   Me / agent repo
+   ═══════════════════════════════════════════════════════════════ */
+
+async function handleMeAgent(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  // null / "" clears; otherwise must be owner/repo
+  let repo = body.repo;
+  if (repo === null || repo === "" || repo === undefined) {
+    repo = null;
+  } else {
+    repo = parseRepo(repo);
+    if (!repo) return bad(request, "repo must be owner/repo or null to clear");
+  }
+
+  await env.DB.prepare(
+    `UPDATE users
+     SET default_repo = ?1, updated_at = datetime('now')
+     WHERE id = ?2`
+  )
+    .bind(repo, user.id)
+    .run();
+
+  if (repo) {
+    await ensureAccount(env, repo);
+  }
+
+  return json(request, {
+    ok: true,
+    default_repo: repo,
+    user_id: user.id,
+  });
+}
+
+async function handleMeBalance(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) {
+    return json(request, {
+      ok: true,
+      default_repo: null,
+      balance: 0,
+      exists: false,
+      error: "no_default_repo",
+    });
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT repo_id, balance, created_at, updated_at FROM accounts WHERE repo_id = ?`
+  )
+    .bind(repo)
+    .first();
+
+  if (!row) {
+    return json(request, {
+      ok: true,
+      default_repo: repo,
+      repo_id: repo,
+      balance: 0,
+      exists: false,
+    });
+  }
+
+  return json(request, {
+    ok: true,
+    default_repo: repo,
+    ...row,
+    exists: true,
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Ledger
    ═══════════════════════════════════════════════════════════════ */
 
 async function ensureAccount(env, repo) {
@@ -386,7 +472,16 @@ async function handlePay(request, env) {
   } catch {
     return bad(request, "Invalid JSON body");
   }
-  const fromRepo = parseRepo(body.from_repo || body.fromRepo);
+
+  // Pay-as-me: if from_repo missing, use logged-in user's default_repo
+  let fromRepo = parseRepo(body.from_repo || body.fromRepo);
+  if (!fromRepo) {
+    const user = await getSessionUser(request, env);
+    if (user?.default_repo) {
+      fromRepo = parseRepo(user.default_repo);
+    }
+  }
+
   const toRepo = parseRepo(body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
   const task = String(body.task || "").slice(0, 500);
@@ -395,7 +490,12 @@ async function handlePay(request, env) {
       .trim()
       .slice(0, 128) || null;
 
-  if (!fromRepo) return bad(request, "from_repo must be owner/repo");
+  if (!fromRepo) {
+    return bad(
+      request,
+      "from_repo must be owner/repo (or sign in and set default agent via POST /api/me/agent)"
+    );
+  }
   if (!toRepo) return bad(request, "to_repo must be owner/repo");
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
