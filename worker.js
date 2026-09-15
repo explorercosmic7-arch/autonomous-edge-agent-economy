@@ -1,6 +1,6 @@
 /**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * Ledger + Google OAuth + user default agent repo (pay-as-me)
+ * Ledger + Google OAuth + default agent + API keys (Bearer pay-as-me)
  */
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
@@ -19,6 +19,7 @@ const FAUCET_ACCOUNT_CAP = 100;
 const SYSTEM_FAUCET = "system/faucet";
 const MIN_AMOUNT = 0.000001;
 const MAX_AMOUNT = 1_000_000;
+const MAX_KEYS_PER_USER = 10;
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
@@ -90,7 +91,13 @@ function clearSessionCookie() {
   return `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`;
 }
 
-/** Resolve logged-in user from session cookie (or null). */
+async function sha256Hex(text) {
+  const data = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Session cookie → user row (or null). */
 async function getSessionUser(request, env) {
   const cookies = parseCookies(request.headers.get("Cookie"));
   const sid = cookies[COOKIE_NAME];
@@ -114,6 +121,45 @@ async function getSessionUser(request, env) {
   return row;
 }
 
+/** Bearer a2a_… → user row (or null). Updates last_used_at. */
+async function getApiKeyUser(request, env) {
+  const auth = request.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(a2a_[A-Fa-f0-9]+)$/i);
+  if (!m) return null;
+
+  const raw = m[1];
+  const hash = await sha256Hex(raw);
+
+  const row = await env.DB.prepare(
+    `SELECT k.id AS key_id, k.user_id, k.revoked_at,
+            u.id, u.email, u.name, u.picture, u.provider, u.default_repo
+     FROM api_keys k
+     JOIN users u ON u.id = k.user_id
+     WHERE k.key_hash = ?1`
+  )
+    .bind(hash)
+    .first();
+
+  if (!row || row.revoked_at) return null;
+
+  // fire-and-forget last used
+  env.DB.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`)
+    .bind(row.key_id)
+    .run()
+    .catch(() => {});
+
+  return row;
+}
+
+/** Cookie session OR API key. Prefer cookie if both present. */
+async function getAuthUser(request, env) {
+  const session = await getSessionUser(request, env);
+  if (session) return { ...session, auth_via: "session" };
+  const keyUser = await getApiKeyUser(request, env);
+  if (keyUser) return { ...keyUser, auth_via: "api_key" };
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -123,7 +169,7 @@ export default {
     }
 
     try {
-      // ── Auth routes ──────────────────────────────────────────
+      // Auth
       if (request.method === "GET" && url.pathname === "/api/auth/google") {
         return handleAuthGoogleStart(request, env, url);
       }
@@ -137,7 +183,7 @@ export default {
         return await handleAuthLogout(request, env);
       }
 
-      // ── Me / agent (logged-in) ────────────────────────────────
+      // Me / agent
       if (request.method === "POST" && url.pathname === "/api/me/agent") {
         return await handleMeAgent(request, env);
       }
@@ -145,7 +191,18 @@ export default {
         return await handleMeBalance(request, env);
       }
 
-      // ── Ledger routes ────────────────────────────────────────
+      // API keys (session only — never create keys with a key)
+      if (request.method === "POST" && url.pathname === "/api/me/keys") {
+        return await handleMeKeysCreate(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/keys") {
+        return await handleMeKeysList(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/keys/revoke") {
+        return await handleMeKeysRevoke(request, env);
+      }
+
+      // Ledger
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
           ok: true,
@@ -161,6 +218,8 @@ export default {
             auth_logout: "POST /api/auth/logout",
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
+            me_keys: "GET|POST /api/me/keys",
+            me_keys_revoke: "POST /api/me/keys/revoke",
           },
         });
       }
@@ -187,9 +246,7 @@ export default {
   },
 };
 
-/* ═══════════════════════════════════════════════════════════════
-   Google OAuth
-   ═══════════════════════════════════════════════════════════════ */
+/* ─── Google OAuth ─── */
 
 function handleAuthGoogleStart(request, env, url) {
   const clientId = env.GOOGLE_CLIENT_ID;
@@ -338,9 +395,7 @@ async function handleAuthLogout(request, env) {
   );
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Me / agent repo
-   ═══════════════════════════════════════════════════════════════ */
+/* ─── Me / agent ─── */
 
 async function handleMeAgent(request, env) {
   const user = await getSessionUser(request, env);
@@ -353,7 +408,6 @@ async function handleMeAgent(request, env) {
     return bad(request, "Invalid JSON body");
   }
 
-  // null / "" clears; otherwise must be owner/repo
   let repo = body.repo;
   if (repo === null || repo === "" || repo === undefined) {
     repo = null;
@@ -363,26 +417,18 @@ async function handleMeAgent(request, env) {
   }
 
   await env.DB.prepare(
-    `UPDATE users
-     SET default_repo = ?1, updated_at = datetime('now')
-     WHERE id = ?2`
+    `UPDATE users SET default_repo = ?1, updated_at = datetime('now') WHERE id = ?2`
   )
     .bind(repo, user.id)
     .run();
 
-  if (repo) {
-    await ensureAccount(env, repo);
-  }
+  if (repo) await ensureAccount(env, repo);
 
-  return json(request, {
-    ok: true,
-    default_repo: repo,
-    user_id: user.id,
-  });
+  return json(request, { ok: true, default_repo: repo, user_id: user.id });
 }
 
 async function handleMeBalance(request, env) {
-  const user = await getSessionUser(request, env);
+  const user = await getAuthUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
 
   const repo = user.default_repo ? parseRepo(user.default_repo) : null;
@@ -412,17 +458,118 @@ async function handleMeBalance(request, env) {
     });
   }
 
+  return json(request, { ok: true, default_repo: repo, ...row, exists: true });
+}
+
+/* ─── API keys ─── */
+
+async function handleMeKeysCreate(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    /* empty body ok */
+  }
+
+  const label = String(body.label || "agent").slice(0, 64);
+
+  const countRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS c FROM api_keys WHERE user_id = ?1 AND revoked_at IS NULL`
+  )
+    .bind(user.id)
+    .first();
+  if ((countRow?.c || 0) >= MAX_KEYS_PER_USER) {
+    return bad(request, "Max " + MAX_KEYS_PER_USER + " active keys per user", 429);
+  }
+
+  const id = randomId(12);
+  const secret = "a2a_" + randomId(24);
+  const keyHash = await sha256Hex(secret);
+  const keyPrefix = secret.slice(0, 12);
+
+  await env.DB.prepare(
+    `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label)
+     VALUES (?1, ?2, ?3, ?4, ?5)`
+  )
+    .bind(id, user.id, keyHash, keyPrefix, label)
+    .run();
+
   return json(request, {
     ok: true,
-    default_repo: repo,
-    ...row,
-    exists: true,
+    id,
+    label,
+    key_prefix: keyPrefix,
+    // shown ONCE — store offline
+    key: secret,
+    hint: "Copy now. The full key is never shown again.",
   });
 }
 
-/* ═══════════════════════════════════════════════════════════════
-   Ledger
-   ═══════════════════════════════════════════════════════════════ */
+async function handleMeKeysList(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const { results } = await env.DB.prepare(
+    `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at
+     FROM api_keys
+     WHERE user_id = ?1
+     ORDER BY created_at DESC
+     LIMIT 50`
+  )
+    .bind(user.id)
+    .all();
+
+  return json(request, {
+    ok: true,
+    count: results.length,
+    keys: results.map((k) => ({
+      id: k.id,
+      key_prefix: k.key_prefix + "…",
+      label: k.label,
+      created_at: k.created_at,
+      revoked: !!k.revoked_at,
+      revoked_at: k.revoked_at,
+      last_used_at: k.last_used_at,
+    })),
+  });
+}
+
+async function handleMeKeysRevoke(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  const row = await env.DB.prepare(
+    `SELECT id, revoked_at FROM api_keys WHERE id = ?1 AND user_id = ?2`
+  )
+    .bind(id, user.id)
+    .first();
+
+  if (!row) return bad(request, "Key not found", 404);
+  if (row.revoked_at) return json(request, { ok: true, id, already_revoked: true });
+
+  await env.DB.prepare(
+    `UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ?1 AND user_id = ?2`
+  )
+    .bind(id, user.id)
+    .run();
+
+  return json(request, { ok: true, id, revoked: true });
+}
+
+/* ─── Ledger ─── */
 
 async function ensureAccount(env, repo) {
   await env.DB.prepare(
@@ -473,10 +620,10 @@ async function handlePay(request, env) {
     return bad(request, "Invalid JSON body");
   }
 
-  // Pay-as-me: if from_repo missing, use logged-in user's default_repo
+  // Pay-as-me: session cookie OR Bearer API key
   let fromRepo = parseRepo(body.from_repo || body.fromRepo);
   if (!fromRepo) {
-    const user = await getSessionUser(request, env);
+    const user = await getAuthUser(request, env);
     if (user?.default_repo) {
       fromRepo = parseRepo(user.default_repo);
     }
@@ -493,7 +640,7 @@ async function handlePay(request, env) {
   if (!fromRepo) {
     return bad(
       request,
-      "from_repo must be owner/repo (or sign in and set default agent via POST /api/me/agent)"
+      "from_repo must be owner/repo (or authenticate and set default agent)"
     );
   }
   if (!toRepo) return bad(request, "to_repo must be owner/repo");
