@@ -16,11 +16,15 @@ const MIN_AMOUNT = 0.000001;
 const MAX_AMOUNT = 1_000_000;
 
 function corsHeaders(request) {
-  // Allow requests from any origin while supporting credentials if needed, 
-  // or completely wildcarded for universal access across any site.
   const origin = request.headers.get("Origin");
+  const allow =
+    origin && ALLOWED_ORIGINS.has(origin)
+      ? origin
+      : origin
+        ? "https://newhorizons-beyondhorizon.pages.dev"
+        : "*";
   return {
-    "Access-Control-Allow-Origin": origin ? origin : "*",
+    "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
     "Access-Control-Max-Age": "86400",
@@ -163,7 +167,7 @@ async function handlePay(request, env) {
   if (idem) {
     const ins = await env.DB.prepare(
       `INSERT INTO idempotency (key, status) VALUES (?1, 'pending')
-        ON CONFLICT(key) DO NOTHING`
+       ON CONFLICT(key) DO NOTHING`
     )
       .bind(idem)
       .run();
