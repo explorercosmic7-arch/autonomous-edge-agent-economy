@@ -2,6 +2,11 @@ name = "autonomous-edge-agent-economy"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
+
+[vars]
+GOOGLE_CLIENT_ID = "99262308475-u3eo6kki1b0lkndrsfbnq3c423pck05n.apps.googleusercontent.com"
+
+ 
 [[d1_databases]]
 binding = "DB"
 database_name = "a2a-ledger"
