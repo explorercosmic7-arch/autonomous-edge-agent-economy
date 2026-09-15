@@ -1,12 +1,16 @@
 /**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * Reserve-before-debit idempotency (parallel same key never 402s)
+ * Ledger + Google OAuth sessions (HttpOnly cookie)
  */
-
 const ALLOWED_ORIGINS = new Set([
-  "https://edgerail.pages.dev/",
+  "https://edgerail.pages.dev",
+  "https://newhorizons-beyondhorizon.pages.dev",
   "https://autonomous-edge-agent-economy.explorercosmic7.workers.dev",
 ]);
+
+const DASHBOARD_URL = "https://edgerail.pages.dev/ai-agents-payment-gateway";
+const COOKIE_NAME = "a2a_session";
+const SESSION_DAYS = 14;
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const FAUCET_MAX_PER_CALL = 10;
@@ -16,26 +20,26 @@ const MIN_AMOUNT = 0.000001;
 const MAX_AMOUNT = 1_000_000;
 
 function corsHeaders(request) {
-  const origin = request.headers.get("Origin");
-  const allow =
-    origin && ALLOWED_ORIGINS.has(origin)
-      ? origin
-      : origin
-        ? "https://edgerail.pages.dev"
-        : "*";
+  const origin = request.headers.get("Origin") || "";
+  const allow = ALLOWED_ORIGINS.has(origin) ? origin : "https://edgerail.pages.dev";
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
+    "Access-Control-Allow-Credentials": "true",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
 }
 
-function json(request, data, status = 200) {
+function json(request, data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(request) },
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...corsHeaders(request),
+      ...extraHeaders,
+    },
   });
 }
 
@@ -58,13 +62,58 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function randomId(bytes = 16) {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return [...arr].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function parseCookies(header) {
+  const out = {};
+  if (!header) return out;
+  header.split(";").forEach((part) => {
+    const i = part.indexOf("=");
+    if (i === -1) return;
+    const k = part.slice(0, i).trim();
+    const v = part.slice(i + 1).trim();
+    out[k] = decodeURIComponent(v);
+  });
+  return out;
+}
+
+function sessionCookie(value, maxAgeSec) {
+  // SameSite=None required for cross-site (Pages → Workers)
+  return `${COOKIE_NAME}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSec}`;
+}
+
+function clearSessionCookie() {
+  return `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
+
     try {
+      // ── Auth routes ──────────────────────────────────────────
+      if (request.method === "GET" && url.pathname === "/api/auth/google") {
+        return handleAuthGoogleStart(request, env, url);
+      }
+      if (request.method === "GET" && url.pathname === "/api/auth/google/callback") {
+        return await handleAuthGoogleCallback(request, env, url);
+      }
+      if (request.method === "GET" && url.pathname === "/api/auth/me") {
+        return await handleAuthMe(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/auth/logout") {
+        return await handleAuthLogout(request, env);
+      }
+
+      // ── Ledger routes ────────────────────────────────────────
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
           ok: true,
@@ -75,6 +124,9 @@ export default {
             fund: "POST /api/fund",
             balance: "GET /api/balance?repo=owner/repo",
             ledger: "GET /api/ledger",
+            auth_google: "GET /api/auth/google",
+            auth_me: "GET /api/auth/me",
+            auth_logout: "POST /api/auth/logout",
           },
         });
       }
@@ -93,12 +145,198 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/ledger") {
         return await handleLedger(request, url, env);
       }
+
       return bad(request, "Not found", 404);
     } catch (err) {
       return bad(request, err.message || "Internal error", 500);
     }
   },
 };
+
+/* ═══════════════════════════════════════════════════════════════
+   Google OAuth
+   ═══════════════════════════════════════════════════════════════ */
+
+function handleAuthGoogleStart(request, env, url) {
+  const clientId = env.GOOGLE_CLIENT_ID;
+  if (!clientId) {
+    return bad(request, "GOOGLE_CLIENT_ID not configured on Worker", 500);
+  }
+
+  const redirectUri = `${url.origin}/api/auth/google/callback`;
+  const state = randomId(16);
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "openid email profile",
+    access_type: "online",
+    include_granted_scopes: "true",
+    state,
+    prompt: "select_account",
+  });
+
+  // Short-lived state cookie to block CSRF
+  const headers = new Headers({
+    Location: `https://accounts.google.com/o/oauth2/v2/auth?${params}`,
+    "Set-Cookie": `a2a_oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
+  });
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleAuthGoogleCallback(request, env, url) {
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const err = url.searchParams.get("error");
+
+  if (err) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=${encodeURIComponent(err)}`, 302);
+  }
+  if (!code || !state) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=missing_code`, 302);
+  }
+
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  if (!cookies.a2a_oauth_state || cookies.a2a_oauth_state !== state) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=bad_state`, 302);
+  }
+
+  const clientId = env.GOOGLE_CLIENT_ID;
+  const clientSecret = env.GOOGLE_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=server_config`, 302);
+  }
+
+  const redirectUri = `${url.origin}/api/auth/google/callback`;
+
+  // Exchange code → tokens
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: clientSecret,
+      redirect_uri: redirectUri,
+      grant_type: "authorization_code",
+    }),
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || !tokenData.access_token) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=token_exchange`, 302);
+  }
+
+  // Userinfo
+  const userRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+    headers: { Authorization: `Bearer ${tokenData.access_token}` },
+  });
+  const profile = await userRes.json();
+  if (!userRes.ok || !profile.sub || !profile.email) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=userinfo`, 302);
+  }
+
+  const userId = "google:" + profile.sub;
+  const email = String(profile.email);
+  const name = String(profile.name || email.split("@")[0]);
+  const picture = profile.picture ? String(profile.picture) : null;
+
+  // Upsert user
+  await env.DB.prepare(
+    `INSERT INTO users (id, email, name, picture, provider, updated_at)
+     VALUES (?1, ?2, ?3, ?4, 'google', datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET
+       email = excluded.email,
+       name = excluded.name,
+       picture = excluded.picture,
+       updated_at = datetime('now')`
+  )
+    .bind(userId, email, name, picture)
+    .run();
+
+  // Create session
+  const sessionId = randomId(24);
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)`
+  )
+    .bind(sessionId, userId, expiresAt)
+    .run();
+
+  const maxAge = SESSION_DAYS * 86400;
+  const headers = new Headers({
+    Location: DASHBOARD_URL,
+    "Set-Cookie": [
+      sessionCookie(sessionId, maxAge),
+      "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+    ].join(", "),
+  });
+  // Multiple Set-Cookie: some runtimes need append
+  headers.delete("Set-Cookie");
+  headers.append("Set-Cookie", sessionCookie(sessionId, maxAge));
+  headers.append("Set-Cookie", "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0");
+
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleAuthMe(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const sid = cookies[COOKIE_NAME];
+  if (!sid) {
+    return json(request, { ok: false, authenticated: false });
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT s.id AS session_id, s.expires_at, u.id, u.email, u.name, u.picture, u.provider
+     FROM sessions s
+     JOIN users u ON u.id = s.user_id
+     WHERE s.id = ?1`
+  )
+    .bind(sid)
+    .first();
+
+  if (!row) {
+    return json(request, { ok: false, authenticated: false }, 200, {
+      "Set-Cookie": clearSessionCookie(),
+    });
+  }
+
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
+    return json(request, { ok: false, authenticated: false, error: "session_expired" }, 200, {
+      "Set-Cookie": clearSessionCookie(),
+    });
+  }
+
+  return json(request, {
+    ok: true,
+    authenticated: true,
+    user: {
+      id: row.id,
+      email: row.email,
+      name: row.name,
+      picture: row.picture,
+      provider: row.provider,
+    },
+  });
+}
+
+async function handleAuthLogout(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const sid = cookies[COOKIE_NAME];
+  if (sid) {
+    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
+  }
+  return json(
+    request,
+    { ok: true, logged_out: true },
+    200,
+    { "Set-Cookie": clearSessionCookie() }
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Ledger (unchanged logic)
+   ═══════════════════════════════════════════════════════════════ */
 
 async function ensureAccount(env, repo) {
   await env.DB.prepare(
@@ -148,7 +386,6 @@ async function handlePay(request, env) {
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const fromRepo = parseRepo(body.from_repo || body.fromRepo);
   const toRepo = parseRepo(body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
@@ -172,7 +409,6 @@ async function handlePay(request, env) {
       .bind(idem)
       .run();
     wonLock = (ins.meta?.changes || 0) === 1;
-
     if (!wonLock) {
       const replay = await waitForIdem(env, idem);
       if (replay && replay.ok) return json(request, replay);
@@ -259,11 +495,9 @@ async function handleFund(request, env) {
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const repo = parseRepo(body.repo || body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
   const task = String(body.task || "faucet").slice(0, 500);
-
   if (!repo) return bad(request, "repo must be owner/repo");
   if (amount == null) return bad(request, "amount must be a positive number");
   if (amount > FAUCET_MAX_PER_CALL) {
@@ -271,7 +505,6 @@ async function handleFund(request, env) {
   }
 
   await ensureAccount(env, repo);
-
   const row = await env.DB.prepare(
     `UPDATE accounts
      SET balance = balance + ?1, updated_at = datetime('now')
