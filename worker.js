@@ -1,6 +1,6 @@
 /**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * Ledger + Google OAuth + default agent + API keys (Bearer pay-as-me)
+ * Ledger + OAuth + API keys + rate limits + escrow (agent banking)
  */
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
@@ -17,9 +17,20 @@ const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const FAUCET_MAX_PER_CALL = 10;
 const FAUCET_ACCOUNT_CAP = 100;
 const SYSTEM_FAUCET = "system/faucet";
+const SYSTEM_ESCROW = "system/escrow";
 const MIN_AMOUNT = 0.000001;
 const MAX_AMOUNT = 1_000_000;
 const MAX_KEYS_PER_USER = 10;
+
+// Rate limits
+const RL_KEY_CREATE_MAX = 3;
+const RL_KEY_CREATE_WINDOW_SEC = 3600; // 1 hour
+const RL_PAY_MAX = 60;
+const RL_PAY_WINDOW_SEC = 60; // 1 minute
+const RL_ESCROW_MAX = 30;
+const RL_ESCROW_WINDOW_SEC = 60;
+
+const ESCROW_DEFAULT_TTL_HOURS = 72;
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
@@ -45,8 +56,8 @@ function json(request, data, status = 200, extraHeaders = {}) {
   });
 }
 
-function bad(request, message, status = 400) {
-  return json(request, { ok: false, error: message }, status);
+function bad(request, message, status = 400, extra = {}) {
+  return json(request, { ok: false, error: message, ...extra }, status);
 }
 
 function parseRepo(v) {
@@ -97,7 +108,64 @@ async function sha256Hex(text) {
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Session cookie → user row (or null). */
+/* ─── Rate limit (D1 fixed window) ─── */
+
+/**
+ * Returns null if allowed, or { retry_after_sec } if limited.
+ * bucketKey example: "pay:google:123" or "keycreate:google:123"
+ */
+async function checkRateLimit(env, bucketKey, max, windowSec) {
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    `SELECT count, window_start FROM rate_limits WHERE bucket_key = ?1`
+  )
+    .bind(bucketKey)
+    .first();
+
+  if (!row) {
+    await env.DB.prepare(
+      `INSERT INTO rate_limits (bucket_key, count, window_start, updated_at)
+       VALUES (?1, 1, datetime('now'), datetime('now'))`
+    )
+      .bind(bucketKey)
+      .run();
+    return null;
+  }
+
+  const startMs = new Date(row.window_start + "Z").getTime();
+  // SQLite datetime may lack Z; fallback parse
+  const start = Number.isFinite(startMs)
+    ? startMs
+    : Date.parse(row.window_start.replace(" ", "T") + "Z");
+
+  if (!Number.isFinite(start) || now - start >= windowSec * 1000) {
+    await env.DB.prepare(
+      `UPDATE rate_limits
+       SET count = 1, window_start = datetime('now'), updated_at = datetime('now')
+       WHERE bucket_key = ?1`
+    )
+      .bind(bucketKey)
+      .run();
+    return null;
+  }
+
+  if (row.count >= max) {
+    const retry = Math.max(1, Math.ceil((windowSec * 1000 - (now - start)) / 1000));
+    return { retry_after_sec: retry };
+  }
+
+  await env.DB.prepare(
+    `UPDATE rate_limits
+     SET count = count + 1, updated_at = datetime('now')
+     WHERE bucket_key = ?1`
+  )
+    .bind(bucketKey)
+    .run();
+  return null;
+}
+
+/* ─── Auth ─── */
+
 async function getSessionUser(request, env) {
   const cookies = parseCookies(request.headers.get("Cookie"));
   const sid = cookies[COOKIE_NAME];
@@ -121,7 +189,6 @@ async function getSessionUser(request, env) {
   return row;
 }
 
-/** Bearer a2a_… → user row (or null). Updates last_used_at. */
 async function getApiKeyUser(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const m = auth.match(/^Bearer\s+(a2a_[A-Fa-f0-9]+)$/i);
@@ -142,7 +209,6 @@ async function getApiKeyUser(request, env) {
 
   if (!row || row.revoked_at) return null;
 
-  // fire-and-forget last used
   env.DB.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`)
     .bind(row.key_id)
     .run()
@@ -151,7 +217,6 @@ async function getApiKeyUser(request, env) {
   return row;
 }
 
-/** Cookie session OR API key. Prefer cookie if both present. */
 async function getAuthUser(request, env) {
   const session = await getSessionUser(request, env);
   if (session) return { ...session, auth_via: "session" };
@@ -169,7 +234,6 @@ export default {
     }
 
     try {
-      // Auth
       if (request.method === "GET" && url.pathname === "/api/auth/google") {
         return handleAuthGoogleStart(request, env, url);
       }
@@ -183,7 +247,6 @@ export default {
         return await handleAuthLogout(request, env);
       }
 
-      // Me / agent
       if (request.method === "POST" && url.pathname === "/api/me/agent") {
         return await handleMeAgent(request, env);
       }
@@ -191,7 +254,6 @@ export default {
         return await handleMeBalance(request, env);
       }
 
-      // API keys (session only — never create keys with a key)
       if (request.method === "POST" && url.pathname === "/api/me/keys") {
         return await handleMeKeysCreate(request, env);
       }
@@ -202,7 +264,20 @@ export default {
         return await handleMeKeysRevoke(request, env);
       }
 
-      // Ledger
+      // Escrow
+      if (request.method === "POST" && url.pathname === "/api/escrow/hold") {
+        return await handleEscrowHold(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/escrow/release") {
+        return await handleEscrowRelease(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/escrow/refund") {
+        return await handleEscrowRefund(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/escrow") {
+        return await handleEscrowList(request, url, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
           ok: true,
@@ -213,13 +288,14 @@ export default {
             fund: "POST /api/fund",
             balance: "GET /api/balance?repo=owner/repo",
             ledger: "GET /api/ledger",
-            auth_google: "GET /api/auth/google",
             auth_me: "GET /api/auth/me",
-            auth_logout: "POST /api/auth/logout",
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
             me_keys: "GET|POST /api/me/keys",
-            me_keys_revoke: "POST /api/me/keys/revoke",
+            escrow_hold: "POST /api/escrow/hold",
+            escrow_release: "POST /api/escrow/release",
+            escrow_refund: "POST /api/escrow/refund",
+            escrow_list: "GET /api/escrow",
           },
         });
       }
@@ -250,9 +326,7 @@ export default {
 
 function handleAuthGoogleStart(request, env, url) {
   const clientId = env.GOOGLE_CLIENT_ID;
-  if (!clientId) {
-    return bad(request, "GOOGLE_CLIENT_ID not configured on Worker", 500);
-  }
+  if (!clientId) return bad(request, "GOOGLE_CLIENT_ID not configured on Worker", 500);
 
   const redirectUri = `${url.origin}/api/auth/google/callback`;
   const state = randomId(16);
@@ -298,7 +372,6 @@ async function handleAuthGoogleCallback(request, env, url) {
   }
 
   const redirectUri = `${url.origin}/api/auth/google/callback`;
-
   const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -355,7 +428,6 @@ async function handleAuthGoogleCallback(request, env, url) {
     "Set-Cookie",
     "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
   );
-
   return new Response(null, { status: 302, headers });
 }
 
@@ -366,7 +438,6 @@ async function handleAuthMe(request, env) {
       "Set-Cookie": clearSessionCookie(),
     });
   }
-
   return json(request, {
     ok: true,
     authenticated: true,
@@ -387,12 +458,9 @@ async function handleAuthLogout(request, env) {
   if (sid) {
     await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
   }
-  return json(
-    request,
-    { ok: true, logged_out: true },
-    200,
-    { "Set-Cookie": clearSessionCookie() }
-  );
+  return json(request, { ok: true, logged_out: true }, 200, {
+    "Set-Cookie": clearSessionCookie(),
+  });
 }
 
 /* ─── Me / agent ─── */
@@ -423,7 +491,6 @@ async function handleMeAgent(request, env) {
     .run();
 
   if (repo) await ensureAccount(env, repo);
-
   return json(request, { ok: true, default_repo: repo, user_id: user.id });
 }
 
@@ -457,7 +524,6 @@ async function handleMeBalance(request, env) {
       exists: false,
     });
   }
-
   return json(request, { ok: true, default_repo: repo, ...row, exists: true });
 }
 
@@ -467,13 +533,24 @@ async function handleMeKeysCreate(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
 
+  const limited = await checkRateLimit(
+    env,
+    "keycreate:" + user.id,
+    RL_KEY_CREATE_MAX,
+    RL_KEY_CREATE_WINDOW_SEC
+  );
+  if (limited) {
+    return bad(request, "Rate limit: max " + RL_KEY_CREATE_MAX + " keys per hour", 429, {
+      retry_after_sec: limited.retry_after_sec,
+    });
+  }
+
   let body = {};
   try {
     body = await request.json();
   } catch {
-    /* empty body ok */
+    /* ok */
   }
-
   const label = String(body.label || "agent").slice(0, 64);
 
   const countRow = await env.DB.prepare(
@@ -502,7 +579,6 @@ async function handleMeKeysCreate(request, env) {
     id,
     label,
     key_prefix: keyPrefix,
-    // shown ONCE — store offline
     key: secret,
     hint: "Copy now. The full key is never shown again.",
   });
@@ -514,10 +590,7 @@ async function handleMeKeysList(request, env) {
 
   const { results } = await env.DB.prepare(
     `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at
-     FROM api_keys
-     WHERE user_id = ?1
-     ORDER BY created_at DESC
-     LIMIT 50`
+     FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
   )
     .bind(user.id)
     .all();
@@ -569,7 +642,7 @@ async function handleMeKeysRevoke(request, env) {
   return json(request, { ok: true, id, revoked: true });
 }
 
-/* ─── Ledger ─── */
+/* ─── Ledger helpers ─── */
 
 async function ensureAccount(env, repo) {
   await env.DB.prepare(
@@ -611,6 +684,8 @@ async function waitForIdem(env, key) {
   return { ok: false, error: "Payment still in flight", pending: true };
 }
 
+/* ─── Pay ─── */
+
 async function handlePay(request, env) {
   const t0 = Date.now();
   let body;
@@ -620,13 +695,25 @@ async function handlePay(request, env) {
     return bad(request, "Invalid JSON body");
   }
 
-  // Pay-as-me: session cookie OR Bearer API key
+  const authUser = await getAuthUser(request, env);
+
+  // Rate limit by user or anonymous IP-ish bucket
+  const rlId = authUser
+    ? authUser.auth_via === "api_key"
+      ? "pay:key:" + (authUser.key_id || authUser.id)
+      : "pay:user:" + authUser.id
+    : "pay:anon:" + (request.headers.get("CF-Connecting-IP") || "x").slice(0, 64);
+
+  const limited = await checkRateLimit(env, rlId, RL_PAY_MAX, RL_PAY_WINDOW_SEC);
+  if (limited) {
+    return bad(request, "Rate limit: too many payments", 429, {
+      retry_after_sec: limited.retry_after_sec,
+    });
+  }
+
   let fromRepo = parseRepo(body.from_repo || body.fromRepo);
-  if (!fromRepo) {
-    const user = await getAuthUser(request, env);
-    if (user?.default_repo) {
-      fromRepo = parseRepo(user.default_repo);
-    }
+  if (!fromRepo && authUser?.default_repo) {
+    fromRepo = parseRepo(authUser.default_repo);
   }
 
   const toRepo = parseRepo(body.to_repo || body.toRepo);
@@ -734,6 +821,8 @@ async function handlePay(request, env) {
   return json(request, payload);
 }
 
+/* ─── Fund ─── */
+
 async function handleFund(request, env) {
   const t0 = Date.now();
   let body;
@@ -815,4 +904,259 @@ async function handleLedger(request, url, env) {
   }
   const { results } = await stmt.all();
   return json(request, { ok: true, count: results.length, transactions: results });
+}
+
+/* ─── Escrow (agent banking) ─── */
+
+async function handleEscrowHold(request, env) {
+  const t0 = Date.now();
+  const authUser = await getAuthUser(request, env);
+  if (!authUser) return bad(request, "Sign in or API key required", 401);
+
+  const rlId =
+    authUser.auth_via === "api_key"
+      ? "escrow:key:" + (authUser.key_id || authUser.id)
+      : "escrow:user:" + authUser.id;
+  const limited = await checkRateLimit(env, rlId, RL_ESCROW_MAX, RL_ESCROW_WINDOW_SEC);
+  if (limited) {
+    return bad(request, "Rate limit: too many escrow ops", 429, {
+      retry_after_sec: limited.retry_after_sec,
+    });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  let fromRepo = parseRepo(body.from_repo || body.fromRepo);
+  if (!fromRepo && authUser.default_repo) {
+    fromRepo = parseRepo(authUser.default_repo);
+  }
+  const toRepo = parseRepo(body.to_repo || body.toRepo);
+  const amount = parseAmount(body.amount);
+  const task = String(body.task || "escrow").slice(0, 500);
+  const ttlHours = Math.min(Math.max(Number(body.ttl_hours) || ESCROW_DEFAULT_TTL_HOURS, 1), 720);
+  const idem =
+    String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
+      .trim()
+      .slice(0, 128) || null;
+
+  if (!fromRepo) return bad(request, "from_repo required (or set default agent)");
+  if (!toRepo) return bad(request, "to_repo required");
+  if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
+  if (amount == null) return bad(request, "invalid amount");
+
+  if (idem) {
+    const existing = await env.DB.prepare(
+      `SELECT * FROM escrows WHERE idempotency_key = ?1`
+    )
+      .bind(idem)
+      .first();
+    if (existing) {
+      return json(request, {
+        ok: true,
+        replayed: true,
+        escrow: existing,
+      });
+    }
+  }
+
+  await ensureAccount(env, fromRepo);
+  await ensureAccount(env, toRepo);
+
+  // Debit payer now (funds locked out of spendable balance)
+  const debit = await env.DB.prepare(
+    `UPDATE accounts
+     SET balance = balance - ?1, updated_at = datetime('now')
+     WHERE repo_id = ?2 AND balance >= ?1
+     RETURNING balance`
+  )
+    .bind(amount, fromRepo)
+    .first();
+
+  if (!debit) return bad(request, "Insufficient funds", 402);
+
+  const id = "esc_" + randomId(12);
+  const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000).toISOString();
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO escrows (
+         id, from_repo, to_repo, amount, task, status, created_by,
+         idempotency_key, expires_at, created_at, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, 'held', ?6, ?7, ?8, datetime('now'), datetime('now'))`
+    ).bind(id, fromRepo, toRepo, amount, task, authUser.id, idem, expiresAt),
+    env.DB.prepare(
+      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
+       VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
+    ).bind(fromRepo, SYSTEM_ESCROW, amount, "escrow-hold:" + id, Date.now() - t0, idem),
+  ]);
+
+  return json(request, {
+    ok: true,
+    status: "held",
+    escrow: {
+      id,
+      from_repo: fromRepo,
+      to_repo: toRepo,
+      amount,
+      task,
+      status: "held",
+      expires_at: expiresAt,
+    },
+    balance_from: debit.balance,
+    latency_ms: Date.now() - t0,
+  });
+}
+
+async function handleEscrowRelease(request, env) {
+  const t0 = Date.now();
+  const authUser = await getAuthUser(request, env);
+  if (!authUser) return bad(request, "Sign in or API key required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  const esc = await env.DB.prepare(`SELECT * FROM escrows WHERE id = ?1`).bind(id).first();
+  if (!esc) return bad(request, "Escrow not found", 404);
+  if (esc.status !== "held") {
+    return bad(request, "Escrow is not held (status=" + esc.status + ")");
+  }
+
+  // Payer or payee (or key owner matching created_by) can release
+  const allowed =
+    authUser.id === esc.created_by ||
+    (authUser.default_repo &&
+      (authUser.default_repo === esc.from_repo || authUser.default_repo === esc.to_repo));
+  if (!allowed) return bad(request, "Not authorized to release this escrow", 403);
+
+  await ensureAccount(env, esc.to_repo);
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE accounts
+       SET balance = balance + ?1, updated_at = datetime('now')
+       WHERE repo_id = ?2`
+    ).bind(esc.amount, esc.to_repo),
+    env.DB.prepare(
+      `UPDATE escrows
+       SET status = 'released', released_at = datetime('now'), updated_at = datetime('now')
+       WHERE id = ?1 AND status = 'held'`
+    ).bind(id),
+    env.DB.prepare(
+      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+       VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+    ).bind(SYSTEM_ESCROW, esc.to_repo, esc.amount, "escrow-release:" + id, Date.now() - t0),
+  ]);
+
+  return json(request, {
+    ok: true,
+    status: "released",
+    id,
+    to_repo: esc.to_repo,
+    amount: esc.amount,
+    latency_ms: Date.now() - t0,
+  });
+}
+
+async function handleEscrowRefund(request, env) {
+  const t0 = Date.now();
+  const authUser = await getAuthUser(request, env);
+  if (!authUser) return bad(request, "Sign in or API key required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  const esc = await env.DB.prepare(`SELECT * FROM escrows WHERE id = ?1`).bind(id).first();
+  if (!esc) return bad(request, "Escrow not found", 404);
+  if (esc.status !== "held") {
+    return bad(request, "Escrow is not held (status=" + esc.status + ")");
+  }
+
+  const allowed =
+    authUser.id === esc.created_by ||
+    (authUser.default_repo && authUser.default_repo === esc.from_repo);
+  if (!allowed) return bad(request, "Not authorized to refund this escrow", 403);
+
+  await ensureAccount(env, esc.from_repo);
+
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE accounts
+       SET balance = balance + ?1, updated_at = datetime('now')
+       WHERE repo_id = ?2`
+    ).bind(esc.amount, esc.from_repo),
+    env.DB.prepare(
+      `UPDATE escrows
+       SET status = 'refunded', refunded_at = datetime('now'), updated_at = datetime('now')
+       WHERE id = ?1 AND status = 'held'`
+    ).bind(id),
+    env.DB.prepare(
+      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+       VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+    ).bind(SYSTEM_ESCROW, esc.from_repo, esc.amount, "escrow-refund:" + id, Date.now() - t0),
+  ]);
+
+  return json(request, {
+    ok: true,
+    status: "refunded",
+    id,
+    from_repo: esc.from_repo,
+    amount: esc.amount,
+    latency_ms: Date.now() - t0,
+  });
+}
+
+async function handleEscrowList(request, url, env) {
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 25), 1), 100);
+  const repo = (url.searchParams.get("repo") || "").trim();
+  const status = (url.searchParams.get("status") || "").trim();
+
+  let sql = `SELECT id, from_repo, to_repo, amount, task, status, created_by,
+                    expires_at, released_at, refunded_at, created_at
+             FROM escrows WHERE 1=1`;
+  const binds = [];
+
+  if (repo) {
+    if (!parseRepo(repo)) return bad(request, "repo must be owner/repo");
+    sql += ` AND (from_repo = ? OR to_repo = ?)`;
+    binds.push(repo, repo);
+  }
+  if (status && ["held", "released", "refunded", "expired"].includes(status)) {
+    sql += ` AND status = ?`;
+    binds.push(status);
+  }
+  sql += ` ORDER BY created_at DESC LIMIT ?`;
+  binds.push(limit);
+
+  let stmt = env.DB.prepare(sql);
+  for (let i = 0; i < binds.length; i++) {
+    stmt = stmt.bind(...(i === 0 ? binds : []));
+  }
+  // re-bind properly
+  stmt = env.DB.prepare(sql);
+  binds.forEach((b, i) => {
+    /* D1 bind is positional in one call */
+  });
+  const bound = env.DB.prepare(sql).bind(...binds);
+  const { results } = await bound.all();
+
+  return json(request, { ok: true, count: results.length, escrows: results });
 }
