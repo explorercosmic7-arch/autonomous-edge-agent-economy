@@ -4,7 +4,7 @@
  */
 
 const ALLOWED_ORIGINS = new Set([
-  "https://newhorizons-beyondhorizon.pages.dev",
+  "https://edgerail.pages.dev/",
   "https://autonomous-edge-agent-economy.explorercosmic7.workers.dev",
 ]);
 
@@ -21,7 +21,7 @@ function corsHeaders(request) {
     origin && ALLOWED_ORIGINS.has(origin)
       ? origin
       : origin
-        ? "https://newhorizons-beyondhorizon.pages.dev"
+        ? "https://edgerail.pages.dev"
         : "*";
   return {
     "Access-Control-Allow-Origin": allow,
