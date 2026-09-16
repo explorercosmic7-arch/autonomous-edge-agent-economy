@@ -980,12 +980,38 @@ async function handleAuthMe(request, env) {
 async function handleAuthLogout(request, env) {
   const cookies = parseCookies(request.headers.get("Cookie"));
   const sid = cookies[COOKIE_NAME];
+  let githubCleared = false;
   if (sid) {
+    // Clear GitHub token before dropping session (security: no lingering token after logout)
+    try {
+      const sess = await env.DB.prepare(
+        `SELECT user_id FROM sessions WHERE id = ?1`
+      )
+        .bind(sid)
+        .first();
+      if (sess && sess.user_id) {
+        await env.DB.prepare(
+          `UPDATE users
+           SET github_access_token = NULL,
+               github_login = NULL,
+               updated_at = datetime('now')
+           WHERE id = ?1`
+        )
+          .bind(sess.user_id)
+          .run();
+        githubCleared = true;
+      }
+    } catch (_) {
+      /* columns optional */
+    }
     await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
   }
-  return json(request, { ok: true, logged_out: true }, 200, {
-    "Set-Cookie": clearSessionCookie(),
-  });
+  return json(
+    request,
+    { ok: true, logged_out: true, github_token_cleared: githubCleared },
+    200,
+    { "Set-Cookie": clearSessionCookie() }
+  );
 }
 
 /* ─── Me / agent ─── */
