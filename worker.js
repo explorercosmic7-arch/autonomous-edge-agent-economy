@@ -6,7 +6,8 @@
  * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
  *           GET /api/auth/github, GET /api/auth/github/callback,
  *           GET /api/auth/me, POST /api/auth/logout
- * Me:       POST /api/me/agent, GET /api/me/balance
+ * Me:       POST /api/me/agent, GET /api/me/balance,
+ *           GET /api/me/github/repos
  * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
  * Webhook:  GET|POST /api/me/webhook, POST /api/me/webhook/clear
  *           GET /api/me/webhook/deliveries
@@ -14,6 +15,7 @@
  * Escrow:   POST /api/escrow/hold|release|refund, GET /api/escrow,
  *           POST /api/escrow/expire-now
  * Cron:     scheduled() → expireHeldEscrows (+ webhook escrow.expired)
+ * D1 users: github_access_token, github_login (optional ALTER)
  */
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
@@ -500,6 +502,9 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/me/balance") {
         return await handleMeBalance(request, env);
       }
+      if (request.method === "GET" && url.pathname === "/api/me/github/repos") {
+        return await handleMeGithubRepos(request, env);
+      }
 
       if (request.method === "POST" && url.pathname === "/api/me/keys") {
         return await handleMeKeysCreate(request, env);
@@ -558,6 +563,7 @@ export default {
             auth_github: "GET /api/auth/github",
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
+            me_github_repos: "GET /api/me/github/repos",
             me_keys: "GET|POST /api/me/keys",
             me_webhook: "GET|POST /api/me/webhook",
             me_webhook_clear: "POST /api/me/webhook/clear",
@@ -876,13 +882,16 @@ async function handleAuthGithubCallback(request, env, url) {
     .bind(githubUserId)
     .first();
 
+  const ghLogin = profile.login ? String(profile.login) : null;
+
   if (byGithub) {
     await env.DB.prepare(
       `UPDATE users
-       SET email = ?1, name = ?2, picture = ?3, provider = 'github', updated_at = datetime('now')
-       WHERE id = ?4`
+       SET email = ?1, name = ?2, picture = ?3, provider = 'github',
+           github_access_token = ?4, github_login = ?5, updated_at = datetime('now')
+       WHERE id = ?6`
     )
-      .bind(email, name, picture, githubUserId)
+      .bind(email, name, picture, accessToken, ghLogin, githubUserId)
       .run();
     sessionUserId = githubUserId;
   } else {
@@ -895,18 +904,20 @@ async function handleAuthGithubCallback(request, env, url) {
         `UPDATE users
          SET name = COALESCE(NULLIF(?1, ''), name),
              picture = COALESCE(?2, picture),
+             github_access_token = ?3,
+             github_login = ?4,
              updated_at = datetime('now')
-         WHERE id = ?3`
+         WHERE id = ?5`
       )
-        .bind(name, picture, byEmail.id)
+        .bind(name, picture, accessToken, ghLogin, byEmail.id)
         .run();
       sessionUserId = byEmail.id;
     } else {
       await env.DB.prepare(
-        `INSERT INTO users (id, email, name, picture, provider, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'github', datetime('now'))`
+        `INSERT INTO users (id, email, name, picture, provider, github_access_token, github_login, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'github', ?5, ?6, datetime('now'))`
       )
-        .bind(githubUserId, email, name, picture)
+        .bind(githubUserId, email, name, picture, accessToken, ghLogin)
         .run();
       sessionUserId = githubUserId;
     }
@@ -937,6 +948,19 @@ async function handleAuthMe(request, env) {
       "Set-Cookie": clearSessionCookie(),
     });
   }
+  let hasGithub = false;
+  let githubLogin = null;
+  try {
+    const g = await env.DB.prepare(
+      `SELECT github_access_token, github_login FROM users WHERE id = ?1`
+    )
+      .bind(user.id)
+      .first();
+    hasGithub = !!(g && g.github_access_token);
+    githubLogin = g?.github_login || null;
+  } catch (_) {
+    /* columns may be missing until ALTER */
+  }
   return json(request, {
     ok: true,
     authenticated: true,
@@ -947,6 +971,8 @@ async function handleAuthMe(request, env) {
       picture: user.picture,
       provider: user.provider,
       default_repo: user.default_repo || null,
+      has_github: hasGithub,
+      github_login: githubLogin,
     },
   });
 }
@@ -991,6 +1017,85 @@ async function handleMeAgent(request, env) {
 
   if (repo) await ensureAccount(env, repo);
   return json(request, { ok: true, default_repo: repo, user_id: user.id });
+}
+
+/** List GitHub repos for signed-in user (requires prior GitHub OAuth with read:user). */
+async function handleMeGithubRepos(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `SELECT github_access_token, github_login FROM users WHERE id = ?1`
+    )
+      .bind(user.id)
+      .first();
+  } catch (e) {
+    return bad(
+      request,
+      "D1 missing github_access_token / github_login — run ALTER TABLE",
+      500
+    );
+  }
+
+  const token = row?.github_access_token;
+  if (!token) {
+    return bad(
+      request,
+      "GitHub not linked. Log out, then Sign in with GitHub once to enable repo picker.",
+      400,
+      { code: "github_not_linked" }
+    );
+  }
+
+  const all = [];
+  let page = 1;
+  const maxPages = 3;
+  while (page <= maxPages) {
+    const res = await fetch(
+      `https://api.github.com/user/repos?per_page=100&page=${page}&sort=updated&affiliation=owner,collaborator,organization_member`,
+      {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "AgentPay-Worker",
+        },
+      }
+    );
+    if (res.status === 401 || res.status === 403) {
+      return bad(
+        request,
+        "GitHub token expired or revoked. Log out and Sign in with GitHub again.",
+        401,
+        { code: "github_token_invalid" }
+      );
+    }
+    if (!res.ok) {
+      return bad(request, "GitHub API error HTTP " + res.status, 502);
+    }
+    const batch = await res.json();
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    for (const r of batch) {
+      if (r && r.full_name) {
+        all.push({
+          full_name: String(r.full_name),
+          private: !!r.private,
+          description: r.description ? String(r.description).slice(0, 120) : null,
+          updated_at: r.updated_at || null,
+        });
+      }
+    }
+    if (batch.length < 100) break;
+    page += 1;
+  }
+
+  return json(request, {
+    ok: true,
+    github_login: row.github_login || null,
+    count: all.length,
+    repos: all,
+  });
 }
 
 async function handleMeBalance(request, env) {
