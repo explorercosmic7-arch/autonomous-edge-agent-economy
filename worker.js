@@ -1,16 +1,18 @@
 /**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * Ledger + OAuth + API keys + rate limits + escrow + auto-expire (cron)
+ * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
  *
  * INVENTORY (do not delete):
  * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance
  * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
+ * Webhook:  GET|POST /api/me/webhook, POST /api/me/webhook/clear
+ *           GET /api/me/webhook/deliveries
  * Ledger:   POST /api/pay, POST /api/fund, GET /api/balance, GET /api/ledger
  * Escrow:   POST /api/escrow/hold|release|refund, GET /api/escrow,
  *           POST /api/escrow/expire-now
- * Cron:     scheduled() → expireHeldEscrows
+ * Cron:     scheduled() → expireHeldEscrows (+ webhook escrow.expired)
  */
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
@@ -43,6 +45,9 @@ const ESCROW_DEFAULT_TTL_HOURS = 72;
 const ESCROW_MIN_TTL_SEC = 10;
 const ESCROW_MAX_TTL_SEC = 720 * 3600;
 const EXPIRE_BATCH_LIMIT = 50;
+const WEBHOOK_TIMEOUT_MS = 5000;
+const RL_WEBHOOK_SET_MAX = 10;
+const RL_WEBHOOK_SET_WINDOW_SEC = 3600;
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
@@ -120,6 +125,18 @@ async function sha256Hex(text) {
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function parseTtlSeconds(body) {
   const sec = Number(body.ttl_seconds);
   if (Number.isFinite(sec)) {
@@ -131,6 +148,18 @@ function parseTtlSeconds(body) {
   const out = Math.floor(h * 3600);
   if (out < ESCROW_MIN_TTL_SEC || out > ESCROW_MAX_TTL_SEC) return null;
   return out;
+}
+
+/** HTTPS only public webhook URL */
+function parseWebhookUrl(v) {
+  try {
+    const u = new URL(String(v || "").trim());
+    if (u.protocol !== "https:") return null;
+    if (!u.hostname || u.hostname === "localhost") return null;
+    return u.toString();
+  } catch {
+    return null;
+  }
 }
 
 /* ─── Rate limit (D1 fixed window) ─── */
@@ -245,17 +274,116 @@ async function getAuthUser(request, env) {
   return null;
 }
 
-/* ─── Auto-expire held escrows (cron) ─── */
+/* ─── Webhooks ─── */
 
 /**
- * Refund from_repo for held escrows past expires_at.
- * Claim with UPDATE ... WHERE status='held' so two ticks cannot double-credit.
- * expires_at is stored as SQLite datetime so comparison with datetime('now') works.
+ * POST signed event to user's webhook_url.
+ * webhook_secret_hash stores the raw signing secret (whsec_…) for HMAC outbound.
+ * Failures are logged; never throw into ledger path.
  */
-async function expireHeldEscrows(env) {
+async function dispatchWebhook(env, userId, event, data) {
+  if (!userId || !event) return { skipped: true, reason: "no_user" };
+
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `SELECT webhook_url, webhook_secret_hash FROM users WHERE id = ?1`
+    )
+      .bind(userId)
+      .first();
+  } catch (e) {
+    console.log("webhook_lookup_error", e && e.message);
+    return { skipped: true, reason: "lookup_error" };
+  }
+
+  const url = row?.webhook_url;
+  const secret = row?.webhook_secret_hash;
+  if (!url || !secret) return { skipped: true, reason: "not_configured" };
+
+  const payload = {
+    id: "evt_" + randomId(12),
+    event,
+    created_at: new Date().toISOString(),
+    data: data || {},
+  };
+  const body = JSON.stringify(payload);
+
+  let statusCode = null;
+  let ok = 0;
+  let error = null;
+
+  try {
+    const sig = await hmacSha256Hex(secret, body);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-AgentPay-Signature": "sha256=" + sig,
+          "X-AgentPay-Event": event,
+          "User-Agent": "AgentPay-Webhooks/1.0",
+        },
+        body,
+        signal: controller.signal,
+      });
+      statusCode = res.status;
+      ok = res.ok ? 1 : 0;
+      if (!res.ok) error = "HTTP " + res.status;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    error =
+      (e && e.name === "AbortError" ? "timeout" : null) ||
+      (e && e.message) ||
+      "fetch failed";
+  }
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO webhook_deliveries (
+         id, user_id, event, escrow_id, url, payload_json,
+         status_code, ok, error, attempts, created_at
+       ) VALUES (
+         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, datetime('now')
+       )`
+    )
+      .bind(
+        randomId(12),
+        userId,
+        event,
+        (data && (data.escrow_id || data.id)) || null,
+        url,
+        body,
+        statusCode,
+        ok,
+        error
+      )
+      .run();
+  } catch (e) {
+    console.log("webhook_log_error", e && e.message);
+  }
+
+  return { ok: !!ok, status_code: statusCode, error };
+}
+
+/** Fire webhook without blocking the HTTP response when ctx is available. */
+function scheduleWebhook(ctx, env, userId, event, data) {
+  const p = dispatchWebhook(env, userId, event, data).catch((e) => {
+    console.log("webhook_bg_error", e && e.message);
+  });
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(p);
+  return p;
+}
+
+/* ─── Auto-expire held escrows (cron) ─── */
+
+async function expireHeldEscrows(env, ctx) {
   const t0 = Date.now();
   const { results } = await env.DB.prepare(
-    `SELECT id, from_repo, to_repo, amount, task
+    `SELECT id, from_repo, to_repo, amount, task, created_by
      FROM escrows
      WHERE status = 'held'
        AND expires_at IS NOT NULL
@@ -302,6 +430,18 @@ async function expireHeldEscrows(env) {
         ),
       ]);
       expired += 1;
+
+      if (esc.created_by) {
+        scheduleWebhook(ctx, env, esc.created_by, "escrow.expired", {
+          id: esc.id,
+          escrow_id: esc.id,
+          from_repo: esc.from_repo,
+          to_repo: esc.to_repo,
+          amount: esc.amount,
+          task: esc.task,
+          status: "expired",
+        });
+      }
     } catch (e) {
       console.log("expire_error", esc.id, e && e.message);
     }
@@ -311,7 +451,7 @@ async function expireHeldEscrows(env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -349,14 +489,27 @@ export default {
         return await handleMeKeysRevoke(request, env);
       }
 
+      if (request.method === "GET" && url.pathname === "/api/me/webhook") {
+        return await handleMeWebhookGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/webhook") {
+        return await handleMeWebhookSet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/webhook/clear") {
+        return await handleMeWebhookClear(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/webhook/deliveries") {
+        return await handleMeWebhookDeliveries(request, env, url);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/escrow/hold") {
         return await handleEscrowHold(request, env);
       }
       if (request.method === "POST" && url.pathname === "/api/escrow/release") {
-        return await handleEscrowRelease(request, env);
+        return await handleEscrowRelease(request, env, ctx);
       }
       if (request.method === "POST" && url.pathname === "/api/escrow/refund") {
-        return await handleEscrowRefund(request, env);
+        return await handleEscrowRefund(request, env, ctx);
       }
       if (request.method === "GET" && url.pathname === "/api/escrow") {
         return await handleEscrowList(request, url, env);
@@ -364,7 +517,7 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/escrow/expire-now") {
         const authUser = await getAuthUser(request, env);
         if (!authUser) return bad(request, "Sign in or API key required", 401);
-        const result = await expireHeldEscrows(env);
+        const result = await expireHeldEscrows(env, ctx);
         return json(request, { ok: true, ...result });
       }
 
@@ -382,6 +535,9 @@ export default {
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
             me_keys: "GET|POST /api/me/keys",
+            me_webhook: "GET|POST /api/me/webhook",
+            me_webhook_clear: "POST /api/me/webhook/clear",
+            me_webhook_deliveries: "GET /api/me/webhook/deliveries",
             escrow_hold: "POST /api/escrow/hold",
             escrow_release: "POST /api/escrow/release",
             escrow_refund: "POST /api/escrow/refund",
@@ -416,7 +572,7 @@ export default {
     ctx.waitUntil(
       (async () => {
         try {
-          const result = await expireHeldEscrows(env);
+          const result = await expireHeldEscrows(env, ctx);
           console.log(
             JSON.stringify({
               cron: "escrow-expire",
@@ -750,6 +906,124 @@ async function handleMeKeysRevoke(request, env) {
     .run();
 
   return json(request, { ok: true, id, revoked: true });
+}
+
+/* ─── Me / webhook ─── */
+
+async function handleMeWebhookGet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const row = await env.DB.prepare(
+    `SELECT webhook_url, webhook_secret_prefix FROM users WHERE id = ?1`
+  )
+    .bind(user.id)
+    .first();
+
+  return json(request, {
+    ok: true,
+    configured: !!(row && row.webhook_url),
+    url: row?.webhook_url || null,
+    secret_prefix: row?.webhook_secret_prefix ? row.webhook_secret_prefix + "…" : null,
+    events: ["escrow.released", "escrow.refunded", "escrow.expired"],
+  });
+}
+
+async function handleMeWebhookSet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const limited = await checkRateLimit(
+    env,
+    "webhookset:" + user.id,
+    RL_WEBHOOK_SET_MAX,
+    RL_WEBHOOK_SET_WINDOW_SEC
+  );
+  if (limited) {
+    return bad(
+      request,
+      "Rate limit: max " + RL_WEBHOOK_SET_MAX + " webhook updates per hour",
+      429,
+      { retry_after_sec: limited.retry_after_sec }
+    );
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  const url = parseWebhookUrl(body.url || body.webhook_url);
+  if (!url) {
+    return bad(request, "url must be a public https:// endpoint");
+  }
+
+  // Raw secret for HMAC signing stored in webhook_secret_hash column.
+  // Shown once — copy offline.
+  const secret = "whsec_" + randomId(24);
+  const prefix = secret.slice(0, 12);
+
+  await env.DB.prepare(
+    `UPDATE users
+     SET webhook_url = ?1,
+         webhook_secret_hash = ?2,
+         webhook_secret_prefix = ?3,
+         updated_at = datetime('now')
+     WHERE id = ?4`
+  )
+    .bind(url, secret, prefix, user.id)
+    .run();
+
+  return json(request, {
+    ok: true,
+    url,
+    secret_prefix: prefix + "…",
+    secret,
+    events: ["escrow.released", "escrow.refunded", "escrow.expired"],
+    hint: "Copy secret now. Verify X-AgentPay-Signature: sha256=<hmac-sha256(secret, rawBody)>.",
+  });
+}
+
+async function handleMeWebhookClear(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  await env.DB.prepare(
+    `UPDATE users
+     SET webhook_url = NULL,
+         webhook_secret_hash = NULL,
+         webhook_secret_prefix = NULL,
+         updated_at = datetime('now')
+     WHERE id = ?1`
+  )
+    .bind(user.id)
+    .run();
+
+  return json(request, { ok: true, cleared: true });
+}
+
+async function handleMeWebhookDeliveries(request, env, url) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 25), 1), 100);
+  const { results } = await env.DB.prepare(
+    `SELECT id, event, escrow_id, url, status_code, ok, error, attempts, created_at
+     FROM webhook_deliveries
+     WHERE user_id = ?1
+     ORDER BY created_at DESC
+     LIMIT ?2`
+  )
+    .bind(user.id, limit)
+    .all();
+
+  return json(request, {
+    ok: true,
+    count: results.length,
+    deliveries: results,
+  });
 }
 
 /* ─── Ledger helpers ─── */
@@ -1133,7 +1407,7 @@ async function handleEscrowHold(request, env) {
   });
 }
 
-async function handleEscrowRelease(request, env) {
+async function handleEscrowRelease(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
@@ -1184,6 +1458,19 @@ async function handleEscrowRelease(request, env) {
     ).bind(SYSTEM_ESCROW, esc.to_repo, esc.amount, "escrow-release:" + id, Date.now() - t0),
   ]);
 
+  if (esc.created_by) {
+    scheduleWebhook(ctx, env, esc.created_by, "escrow.released", {
+      id: esc.id,
+      escrow_id: esc.id,
+      from_repo: esc.from_repo,
+      to_repo: esc.to_repo,
+      amount: esc.amount,
+      task: esc.task,
+      status: "released",
+      released_by: authUser.id,
+    });
+  }
+
   return json(request, {
     ok: true,
     status: "released",
@@ -1194,7 +1481,7 @@ async function handleEscrowRelease(request, env) {
   });
 }
 
-async function handleEscrowRefund(request, env) {
+async function handleEscrowRefund(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
@@ -1243,6 +1530,19 @@ async function handleEscrowRefund(request, env) {
        VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
     ).bind(SYSTEM_ESCROW, esc.from_repo, esc.amount, "escrow-refund:" + id, Date.now() - t0),
   ]);
+
+  if (esc.created_by) {
+    scheduleWebhook(ctx, env, esc.created_by, "escrow.refunded", {
+      id: esc.id,
+      escrow_id: esc.id,
+      from_repo: esc.from_repo,
+      to_repo: esc.to_repo,
+      amount: esc.amount,
+      task: esc.task,
+      status: "refunded",
+      refunded_by: authUser.id,
+    });
+  }
 
   return json(request, {
     ok: true,
