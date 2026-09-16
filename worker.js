@@ -1,6 +1,16 @@
 /**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
- * Ledger + OAuth + API keys + rate limits + escrow (agent banking)
+ * Ledger + OAuth + API keys + rate limits + escrow + auto-expire (cron)
+ *
+ * INVENTORY (do not delete):
+ * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
+ *           GET /api/auth/me, POST /api/auth/logout
+ * Me:       POST /api/me/agent, GET /api/me/balance
+ * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
+ * Ledger:   POST /api/pay, POST /api/fund, GET /api/balance, GET /api/ledger
+ * Escrow:   POST /api/escrow/hold|release|refund, GET /api/escrow,
+ *           POST /api/escrow/expire-now
+ * Cron:     scheduled() → expireHeldEscrows
  */
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
@@ -22,15 +32,17 @@ const MIN_AMOUNT = 0.000001;
 const MAX_AMOUNT = 1_000_000;
 const MAX_KEYS_PER_USER = 10;
 
-// Rate limits
 const RL_KEY_CREATE_MAX = 3;
-const RL_KEY_CREATE_WINDOW_SEC = 3600; // 1 hour
+const RL_KEY_CREATE_WINDOW_SEC = 3600;
 const RL_PAY_MAX = 60;
-const RL_PAY_WINDOW_SEC = 60; // 1 minute
+const RL_PAY_WINDOW_SEC = 60;
 const RL_ESCROW_MAX = 30;
 const RL_ESCROW_WINDOW_SEC = 60;
 
 const ESCROW_DEFAULT_TTL_HOURS = 72;
+const ESCROW_MIN_TTL_SEC = 10;
+const ESCROW_MAX_TTL_SEC = 720 * 3600;
+const EXPIRE_BATCH_LIMIT = 50;
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
@@ -108,12 +120,21 @@ async function sha256Hex(text) {
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function parseTtlSeconds(body) {
+  const sec = Number(body.ttl_seconds);
+  if (Number.isFinite(sec)) {
+    if (sec < ESCROW_MIN_TTL_SEC || sec > ESCROW_MAX_TTL_SEC) return null;
+    return Math.floor(sec);
+  }
+  const hours = Number(body.ttl_hours);
+  const h = Number.isFinite(hours) && hours > 0 ? hours : ESCROW_DEFAULT_TTL_HOURS;
+  const out = Math.floor(h * 3600);
+  if (out < ESCROW_MIN_TTL_SEC || out > ESCROW_MAX_TTL_SEC) return null;
+  return out;
+}
+
 /* ─── Rate limit (D1 fixed window) ─── */
 
-/**
- * Returns null if allowed, or { retry_after_sec } if limited.
- * bucketKey example: "pay:google:123" or "keycreate:google:123"
- */
 async function checkRateLimit(env, bucketKey, max, windowSec) {
   const now = Date.now();
   const row = await env.DB.prepare(
@@ -133,10 +154,9 @@ async function checkRateLimit(env, bucketKey, max, windowSec) {
   }
 
   const startMs = new Date(row.window_start + "Z").getTime();
-  // SQLite datetime may lack Z; fallback parse
   const start = Number.isFinite(startMs)
     ? startMs
-    : Date.parse(row.window_start.replace(" ", "T") + "Z");
+    : Date.parse(String(row.window_start).replace(" ", "T") + "Z");
 
   if (!Number.isFinite(start) || now - start >= windowSec * 1000) {
     await env.DB.prepare(
@@ -225,6 +245,71 @@ async function getAuthUser(request, env) {
   return null;
 }
 
+/* ─── Auto-expire held escrows (cron) ─── */
+
+/**
+ * Refund from_repo for held escrows past expires_at.
+ * Claim with UPDATE ... WHERE status='held' so two ticks cannot double-credit.
+ * expires_at is stored as SQLite datetime so comparison with datetime('now') works.
+ */
+async function expireHeldEscrows(env) {
+  const t0 = Date.now();
+  const { results } = await env.DB.prepare(
+    `SELECT id, from_repo, to_repo, amount, task
+     FROM escrows
+     WHERE status = 'held'
+       AND expires_at IS NOT NULL
+       AND expires_at < datetime('now')
+     ORDER BY expires_at ASC
+     LIMIT ?1`
+  )
+    .bind(EXPIRE_BATCH_LIMIT)
+    .all();
+
+  if (!results || results.length === 0) {
+    return { expired: 0, scanned: 0, latency_ms: Date.now() - t0 };
+  }
+
+  let expired = 0;
+  for (const esc of results) {
+    try {
+      await ensureAccount(env, esc.from_repo);
+      const claim = await env.DB.prepare(
+        `UPDATE escrows
+         SET status = 'expired', refunded_at = datetime('now'), updated_at = datetime('now')
+         WHERE id = ?1 AND status = 'held'
+         RETURNING id`
+      )
+        .bind(esc.id)
+        .first();
+      if (!claim) continue;
+
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE accounts
+           SET balance = balance + ?1, updated_at = datetime('now')
+           WHERE repo_id = ?2`
+        ).bind(esc.amount, esc.from_repo),
+        env.DB.prepare(
+          `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+           VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+        ).bind(
+          SYSTEM_ESCROW,
+          esc.from_repo,
+          esc.amount,
+          "escrow-expire:" + esc.id,
+          Date.now() - t0
+        ),
+      ]);
+      expired += 1;
+    } catch (e) {
+      console.log("expire_error", esc.id, e && e.message);
+    }
+  }
+
+  return { expired, scanned: results.length, latency_ms: Date.now() - t0 };
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -264,7 +349,6 @@ export default {
         return await handleMeKeysRevoke(request, env);
       }
 
-      // Escrow
       if (request.method === "POST" && url.pathname === "/api/escrow/hold") {
         return await handleEscrowHold(request, env);
       }
@@ -276,6 +360,12 @@ export default {
       }
       if (request.method === "GET" && url.pathname === "/api/escrow") {
         return await handleEscrowList(request, url, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/escrow/expire-now") {
+        const authUser = await getAuthUser(request, env);
+        if (!authUser) return bad(request, "Sign in or API key required", 401);
+        const result = await expireHeldEscrows(env);
+        return json(request, { ok: true, ...result });
       }
 
       if (request.method === "GET" && url.pathname === "/") {
@@ -296,6 +386,7 @@ export default {
             escrow_release: "POST /api/escrow/release",
             escrow_refund: "POST /api/escrow/refund",
             escrow_list: "GET /api/escrow",
+            escrow_expire_now: "POST /api/escrow/expire-now",
           },
         });
       }
@@ -319,6 +410,25 @@ export default {
     } catch (err) {
       return bad(request, err.message || "Internal error", 500);
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const result = await expireHeldEscrows(env);
+          console.log(
+            JSON.stringify({
+              cron: "escrow-expire",
+              scheduledTime: event.scheduledTime,
+              ...result,
+            })
+          );
+        } catch (err) {
+          console.error("escrow-expire failed:", err && err.message ? err.message : err);
+        }
+      })()
+    );
   },
 };
 
@@ -697,7 +807,6 @@ async function handlePay(request, env) {
 
   const authUser = await getAuthUser(request, env);
 
-  // Rate limit by user or anonymous IP-ish bucket
   const rlId = authUser
     ? authUser.auth_via === "api_key"
       ? "pay:key:" + (authUser.key_id || authUser.id)
@@ -938,7 +1047,7 @@ async function handleEscrowHold(request, env) {
   const toRepo = parseRepo(body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
   const task = String(body.task || "escrow").slice(0, 500);
-  const ttlHours = Math.min(Math.max(Number(body.ttl_hours) || ESCROW_DEFAULT_TTL_HOURS, 1), 720);
+  const ttlSec = parseTtlSeconds(body);
   const idem =
     String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
       .trim()
@@ -948,6 +1057,9 @@ async function handleEscrowHold(request, env) {
   if (!toRepo) return bad(request, "to_repo required");
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
   if (amount == null) return bad(request, "invalid amount");
+  if (ttlSec == null) {
+    return bad(request, "ttl_hours / ttl_seconds out of range (min 10s, max 720h)");
+  }
 
   if (idem) {
     const existing = await env.DB.prepare(
@@ -967,7 +1079,6 @@ async function handleEscrowHold(request, env) {
   await ensureAccount(env, fromRepo);
   await ensureAccount(env, toRepo);
 
-  // Debit payer now (funds locked out of spendable balance)
   const debit = await env.DB.prepare(
     `UPDATE accounts
      SET balance = balance - ?1, updated_at = datetime('now')
@@ -980,20 +1091,29 @@ async function handleEscrowHold(request, env) {
   if (!debit) return bad(request, "Insufficient funds", 402);
 
   const id = "esc_" + randomId(12);
-  const expiresAt = new Date(Date.now() + ttlHours * 3600 * 1000).toISOString();
+  const modifier = "+" + ttlSec + " seconds";
 
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO escrows (
          id, from_repo, to_repo, amount, task, status, created_by,
          idempotency_key, expires_at, created_at, updated_at
-       ) VALUES (?1, ?2, ?3, ?4, ?5, 'held', ?6, ?7, ?8, datetime('now'), datetime('now'))`
-    ).bind(id, fromRepo, toRepo, amount, task, authUser.id, idem, expiresAt),
+       ) VALUES (
+         ?1, ?2, ?3, ?4, ?5, 'held', ?6, ?7,
+         datetime('now', ?8), datetime('now'), datetime('now')
+       )`
+    ).bind(id, fromRepo, toRepo, amount, task, authUser.id, idem, modifier),
     env.DB.prepare(
       `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
        VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
     ).bind(fromRepo, SYSTEM_ESCROW, amount, "escrow-hold:" + id, Date.now() - t0, idem),
   ]);
+
+  const stored = await env.DB.prepare(
+    `SELECT expires_at FROM escrows WHERE id = ?1`
+  )
+    .bind(id)
+    .first();
 
   return json(request, {
     ok: true,
@@ -1005,7 +1125,8 @@ async function handleEscrowHold(request, env) {
       amount,
       task,
       status: "held",
-      expires_at: expiresAt,
+      expires_at: stored?.expires_at || null,
+      ttl_seconds: ttlSec,
     },
     balance_from: debit.balance,
     latency_ms: Date.now() - t0,
@@ -1033,7 +1154,6 @@ async function handleEscrowRelease(request, env) {
     return bad(request, "Escrow is not held (status=" + esc.status + ")");
   }
 
-  // Payer or payee (or key owner matching created_by) can release
   const allowed =
     authUser.id === esc.created_by ||
     (authUser.default_repo &&
@@ -1042,17 +1162,22 @@ async function handleEscrowRelease(request, env) {
 
   await ensureAccount(env, esc.to_repo);
 
+  const claim = await env.DB.prepare(
+    `UPDATE escrows
+     SET status = 'released', released_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?1 AND status = 'held'
+     RETURNING id`
+  )
+    .bind(id)
+    .first();
+  if (!claim) return bad(request, "Escrow is not held (race)");
+
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE accounts
        SET balance = balance + ?1, updated_at = datetime('now')
        WHERE repo_id = ?2`
     ).bind(esc.amount, esc.to_repo),
-    env.DB.prepare(
-      `UPDATE escrows
-       SET status = 'released', released_at = datetime('now'), updated_at = datetime('now')
-       WHERE id = ?1 AND status = 'held'`
-    ).bind(id),
     env.DB.prepare(
       `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
        VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
@@ -1097,17 +1222,22 @@ async function handleEscrowRefund(request, env) {
 
   await ensureAccount(env, esc.from_repo);
 
+  const claim = await env.DB.prepare(
+    `UPDATE escrows
+     SET status = 'refunded', refunded_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?1 AND status = 'held'
+     RETURNING id`
+  )
+    .bind(id)
+    .first();
+  if (!claim) return bad(request, "Escrow is not held (race)");
+
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE accounts
        SET balance = balance + ?1, updated_at = datetime('now')
        WHERE repo_id = ?2`
     ).bind(esc.amount, esc.from_repo),
-    env.DB.prepare(
-      `UPDATE escrows
-       SET status = 'refunded', refunded_at = datetime('now'), updated_at = datetime('now')
-       WHERE id = ?1 AND status = 'held'`
-    ).bind(id),
     env.DB.prepare(
       `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
        VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
@@ -1146,17 +1276,6 @@ async function handleEscrowList(request, url, env) {
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   binds.push(limit);
 
-  let stmt = env.DB.prepare(sql);
-  for (let i = 0; i < binds.length; i++) {
-    stmt = stmt.bind(...(i === 0 ? binds : []));
-  }
-  // re-bind properly
-  stmt = env.DB.prepare(sql);
-  binds.forEach((b, i) => {
-    /* D1 bind is positional in one call */
-  });
-  const bound = env.DB.prepare(sql).bind(...binds);
-  const { results } = await bound.all();
-
+  const { results } = await env.DB.prepare(sql).bind(...binds).all();
   return json(request, { ok: true, count: results.length, escrows: results });
 }
