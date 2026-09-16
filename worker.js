@@ -4,6 +4,7 @@
  *
  * INVENTORY (do not delete):
  * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
+ *           GET /api/auth/github, GET /api/auth/github/callback,
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance
  * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
@@ -465,6 +466,12 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/auth/google/callback") {
         return await handleAuthGoogleCallback(request, env, url);
       }
+      if (request.method === "GET" && url.pathname === "/api/auth/github") {
+        return handleAuthGithubStart(request, env, url);
+      }
+      if (request.method === "GET" && url.pathname === "/api/auth/github/callback") {
+        return await handleAuthGithubCallback(request, env, url);
+      }
       if (request.method === "GET" && url.pathname === "/api/auth/me") {
         return await handleAuthMe(request, env);
       }
@@ -532,6 +539,8 @@ export default {
             balance: "GET /api/balance?repo=owner/repo",
             ledger: "GET /api/ledger",
             auth_me: "GET /api/auth/me",
+            auth_google: "GET /api/auth/google",
+            auth_github: "GET /api/auth/github",
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
             me_keys: "GET|POST /api/me/keys",
@@ -674,6 +683,146 @@ async function handleAuthGoogleCallback(request, env, url) {
        email = excluded.email,
        name = excluded.name,
        picture = excluded.picture,
+       updated_at = datetime('now')`
+  )
+    .bind(userId, email, name, picture)
+    .run();
+
+  const sessionId = randomId(24);
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)`
+  )
+    .bind(sessionId, userId, expiresAt)
+    .run();
+
+  const maxAge = SESSION_DAYS * 86400;
+  const headers = new Headers({ Location: DASHBOARD_URL });
+  headers.append("Set-Cookie", sessionCookie(sessionId, maxAge));
+  headers.append(
+    "Set-Cookie",
+    "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+  );
+  return new Response(null, { status: 302, headers });
+}
+
+/* ─── GitHub OAuth ─── */
+
+function handleAuthGithubStart(request, env, url) {
+  const clientId = env.GITHUB_CLIENT_ID;
+  if (!clientId) return bad(request, "GITHUB_CLIENT_ID not configured on Worker", 500);
+
+  const redirectUri = `${url.origin}/api/auth/github/callback`;
+  const state = randomId(16);
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: "read:user user:email",
+    state,
+    allow_signup: "true",
+  });
+  const headers = new Headers({
+    Location: `https://github.com/login/oauth/authorize?${params}`,
+    "Set-Cookie": `a2a_oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
+  });
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleAuthGithubCallback(request, env, url) {
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const err = url.searchParams.get("error");
+  if (err) {
+    return Response.redirect(
+      `${DASHBOARD_URL}?auth_error=${encodeURIComponent(err)}`,
+      302
+    );
+  }
+  if (!code || !state) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=missing_code`, 302);
+  }
+
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  if (!cookies.a2a_oauth_state || cookies.a2a_oauth_state !== state) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=bad_state`, 302);
+  }
+
+  const clientId = env.GITHUB_CLIENT_ID;
+  const clientSecret = env.GITHUB_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=server_config`, 302);
+  }
+
+  const redirectUri = `${url.origin}/api/auth/github/callback`;
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      code,
+      redirect_uri: redirectUri,
+    }),
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || !tokenData.access_token) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=token_exchange`, 302);
+  }
+
+  const accessToken = tokenData.access_token;
+  const userRes = await fetch("https://api.github.com/user", {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "AgentPay-Worker",
+    },
+  });
+  const profile = await userRes.json();
+  if (!userRes.ok || !profile.id) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=userinfo`, 302);
+  }
+
+  let email = profile.email ? String(profile.email) : null;
+  if (!email) {
+    try {
+      const emailRes = await fetch("https://api.github.com/user/emails", {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "AgentPay-Worker",
+        },
+      });
+      if (emailRes.ok) {
+        const emails = await emailRes.json();
+        const primary =
+          (Array.isArray(emails) && emails.find((e) => e.primary && e.verified)) ||
+          (Array.isArray(emails) && emails.find((e) => e.verified)) ||
+          (Array.isArray(emails) && emails[0]);
+        if (primary && primary.email) email = String(primary.email);
+      }
+    } catch (_) {
+      /* optional */
+    }
+  }
+  if (!email) {
+    email = `${profile.login}@users.noreply.github.com`;
+  }
+
+  const userId = "github:" + profile.id;
+  const name = String(profile.name || profile.login || email.split("@")[0]);
+  const picture = profile.avatar_url ? String(profile.avatar_url) : null;
+
+  await env.DB.prepare(
+    `INSERT INTO users (id, email, name, picture, provider, updated_at)
+     VALUES (?1, ?2, ?3, ?4, 'github', datetime('now'))
+     ON CONFLICT(id) DO UPDATE SET
+       email = excluded.email,
+       name = excluded.name,
+       picture = excluded.picture,
+       provider = 'github',
        updated_at = datetime('now')`
   )
     .bind(userId, email, name, picture)
