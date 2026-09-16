@@ -11,3 +11,7 @@ GOOGLE_CLIENT_ID = "99262308475-u3eo6kki1b0lkndrsfbnq3c423pck05n.apps.googleuser
 binding = "DB"
 database_name = "a2a-ledger"
 database_id = "75d9a918-0d02-4db1-99ca-307631be7eaf"
+
+# Run every 15 minutes — expire held escrows past expires_at
+[triggers]
+crons = ["*/15 * * * *"]
