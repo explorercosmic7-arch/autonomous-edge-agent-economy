@@ -51,6 +51,8 @@ const EXPIRE_BATCH_LIMIT = 50;
 const WEBHOOK_TIMEOUT_MS = 5000;
 const RL_WEBHOOK_SET_MAX = 10;
 const RL_WEBHOOK_SET_WINDOW_SEC = 3600;
+const RL_GITHUB_REPOS_MAX = 12;
+const RL_GITHUB_REPOS_WINDOW_SEC = 3600;
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
@@ -1049,6 +1051,26 @@ async function handleMeAgent(request, env) {
 async function handleMeGithubRepos(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
+
+  const limited = await checkRateLimit(
+    env,
+    "githubrepos:" + user.id,
+    RL_GITHUB_REPOS_MAX,
+    RL_GITHUB_REPOS_WINDOW_SEC
+  );
+  if (limited) {
+    return bad(
+      request,
+      "Rate limit: max " +
+        RL_GITHUB_REPOS_MAX +
+        " GitHub repo fetches per hour",
+      429,
+      {
+        code: "rate_limited",
+        retry_after_sec: limited.retry_after_sec,
+      }
+    );
+  }
 
   let row;
   try {
