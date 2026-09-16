@@ -239,6 +239,21 @@ async function getSessionUser(request, env) {
   return row;
 }
 
+/**
+ * Security: if a valid session already exists, OAuth callbacks must not
+ * silently switch identity. User must POST /api/auth/logout first, then
+ * sign in with the other provider.
+ * Returns Response redirect when blocked; null when OK to continue OAuth.
+ */
+async function rejectIfAlreadySignedIn(request, env) {
+  const existing = await getSessionUser(request, env);
+  if (!existing) return null;
+  return Response.redirect(
+    `${DASHBOARD_URL}?auth_error=${encodeURIComponent("already_signed_in")}`,
+    302
+  );
+}
+
 async function getApiKeyUser(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const m = auth.match(/^Bearer\s+(a2a_[A-Fa-f0-9]+)$/i);
@@ -635,6 +650,10 @@ async function handleAuthGoogleCallback(request, env, url) {
     return Response.redirect(`${DASHBOARD_URL}?auth_error=missing_code`, 302);
   }
 
+  // Must log out before switching provider / re-auth while session active
+  const blocked = await rejectIfAlreadySignedIn(request, env);
+  if (blocked) return blocked;
+
   const cookies = parseCookies(request.headers.get("Cookie"));
   if (!cookies.a2a_oauth_state || cookies.a2a_oauth_state !== state) {
     return Response.redirect(`${DASHBOARD_URL}?auth_error=bad_state`, 302);
@@ -671,29 +690,58 @@ async function handleAuthGoogleCallback(request, env, url) {
     return Response.redirect(`${DASHBOARD_URL}?auth_error=userinfo`, 302);
   }
 
-  const userId = "google:" + profile.sub;
+  const googleUserId = "google:" + profile.sub;
   const email = String(profile.email);
   const name = String(profile.name || email.split("@")[0]);
   const picture = profile.picture ? String(profile.picture) : null;
 
-  await env.DB.prepare(
-    `INSERT INTO users (id, email, name, picture, provider, updated_at)
-     VALUES (?1, ?2, ?3, ?4, 'google', datetime('now'))
-     ON CONFLICT(id) DO UPDATE SET
-       email = excluded.email,
-       name = excluded.name,
-       picture = excluded.picture,
-       updated_at = datetime('now')`
-  )
-    .bind(userId, email, name, picture)
-    .run();
+  // Same email may already exist from GitHub — link session to that row
+  let sessionUserId = googleUserId;
+  const byGoogle = await env.DB.prepare(`SELECT id FROM users WHERE id = ?1`)
+    .bind(googleUserId)
+    .first();
+
+  if (byGoogle) {
+    await env.DB.prepare(
+      `UPDATE users
+       SET email = ?1, name = ?2, picture = ?3, provider = 'google', updated_at = datetime('now')
+       WHERE id = ?4`
+    )
+      .bind(email, name, picture, googleUserId)
+      .run();
+    sessionUserId = googleUserId;
+  } else {
+    const byEmail = await env.DB.prepare(`SELECT id FROM users WHERE email = ?1`)
+      .bind(email)
+      .first();
+    if (byEmail) {
+      await env.DB.prepare(
+        `UPDATE users
+         SET name = COALESCE(NULLIF(?1, ''), name),
+             picture = COALESCE(?2, picture),
+             updated_at = datetime('now')
+         WHERE id = ?3`
+      )
+        .bind(name, picture, byEmail.id)
+        .run();
+      sessionUserId = byEmail.id;
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO users (id, email, name, picture, provider, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'google', datetime('now'))`
+      )
+        .bind(googleUserId, email, name, picture)
+        .run();
+      sessionUserId = googleUserId;
+    }
+  }
 
   const sessionId = randomId(24);
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString();
   await env.DB.prepare(
     `INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)`
   )
-    .bind(sessionId, userId, expiresAt)
+    .bind(sessionId, sessionUserId, expiresAt)
     .run();
 
   const maxAge = SESSION_DAYS * 86400;
@@ -741,6 +789,10 @@ async function handleAuthGithubCallback(request, env, url) {
   if (!code || !state) {
     return Response.redirect(`${DASHBOARD_URL}?auth_error=missing_code`, 302);
   }
+
+  // Must log out before switching provider / re-auth while session active
+  const blocked = await rejectIfAlreadySignedIn(request, env);
+  if (blocked) return blocked;
 
   const cookies = parseCookies(request.headers.get("Cookie"));
   if (!cookies.a2a_oauth_state || cookies.a2a_oauth_state !== state) {
@@ -811,29 +863,61 @@ async function handleAuthGithubCallback(request, env, url) {
     email = `${profile.login}@users.noreply.github.com`;
   }
 
-  const userId = "github:" + profile.id;
+  const githubUserId = "github:" + profile.id;
   const name = String(profile.name || profile.login || email.split("@")[0]);
   const picture = profile.avatar_url ? String(profile.avatar_url) : null;
 
-  await env.DB.prepare(
-    `INSERT INTO users (id, email, name, picture, provider, updated_at)
-     VALUES (?1, ?2, ?3, ?4, 'github', datetime('now'))
-     ON CONFLICT(id) DO UPDATE SET
-       email = excluded.email,
-       name = excluded.name,
-       picture = excluded.picture,
-       provider = 'github',
-       updated_at = datetime('now')`
-  )
-    .bind(userId, email, name, picture)
-    .run();
+  // Resolve account:
+  // 1) existing github:id
+  // 2) same email already used (e.g. Google) → link session to that user
+  // 3) else create new github user
+  let sessionUserId = githubUserId;
+  const byGithub = await env.DB.prepare(`SELECT id FROM users WHERE id = ?1`)
+    .bind(githubUserId)
+    .first();
+
+  if (byGithub) {
+    await env.DB.prepare(
+      `UPDATE users
+       SET email = ?1, name = ?2, picture = ?3, provider = 'github', updated_at = datetime('now')
+       WHERE id = ?4`
+    )
+      .bind(email, name, picture, githubUserId)
+      .run();
+    sessionUserId = githubUserId;
+  } else {
+    const byEmail = await env.DB.prepare(`SELECT id FROM users WHERE email = ?1`)
+      .bind(email)
+      .first();
+    if (byEmail) {
+      // Same person logged in via Google before — reuse that row (email UNIQUE)
+      await env.DB.prepare(
+        `UPDATE users
+         SET name = COALESCE(NULLIF(?1, ''), name),
+             picture = COALESCE(?2, picture),
+             updated_at = datetime('now')
+         WHERE id = ?3`
+      )
+        .bind(name, picture, byEmail.id)
+        .run();
+      sessionUserId = byEmail.id;
+    } else {
+      await env.DB.prepare(
+        `INSERT INTO users (id, email, name, picture, provider, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'github', datetime('now'))`
+      )
+        .bind(githubUserId, email, name, picture)
+        .run();
+      sessionUserId = githubUserId;
+    }
+  }
 
   const sessionId = randomId(24);
   const expiresAt = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString();
   await env.DB.prepare(
     `INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)`
   )
-    .bind(sessionId, userId, expiresAt)
+    .bind(sessionId, sessionUserId, expiresAt)
     .run();
 
   const maxAge = SESSION_DAYS * 86400;
