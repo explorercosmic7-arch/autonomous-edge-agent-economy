@@ -19,8 +19,9 @@
  * D1 users: github_access_token, github_login (optional ALTER)
  * D1:       streams table (d1-stream-migration.sql)
  * D1:       agent_limits, velocity_events, safety_events; api_keys.suspended_at
- * Safety:   helpers (step 2) — lock / velocity / daily budget / key suspend
+ * Safety:   helpers + gate on pay / escrow hold / stream start (step 3)
  */
+
 
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
@@ -1918,6 +1919,23 @@ async function handlePay(request, env) {
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
 
+  // Safety: suspended key / wallet lock / daily budget / velocity
+  if (authUser) {
+    const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
+    if (blocked) return blocked;
+  } else {
+    // Anonymous pay: still enforce wallet lock + velocity defaults
+    const locked = await checkWalletLocked(env, fromRepo);
+    if (locked) return bad(request, locked.reason, 403, { code: "wallet_locked" });
+    const vel = await checkVelocity(env, fromRepo, amount, null);
+    if (vel) {
+      return bad(request, vel.error, 429, {
+        code: vel.code,
+        retry_after_sec: vel.retry_after_sec,
+      });
+    }
+  }
+
   let wonLock = false;
   if (idem) {
     const ins = await env.DB.prepare(
@@ -2001,6 +2019,8 @@ async function handlePay(request, env) {
       .bind(JSON.stringify(payload), idem)
       .run();
   }
+
+  await safetyRecordSpend(env, authUser, fromRepo, amount);
 
   return json(request, payload);
 }
@@ -2136,6 +2156,11 @@ async function handleEscrowHold(request, env) {
     return bad(request, "ttl_hours / ttl_seconds out of range (min 10s, max 720h)");
   }
 
+  {
+    const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
+    if (blocked) return blocked;
+  }
+
   if (idem) {
     const existing = await env.DB.prepare(
       `SELECT * FROM escrows WHERE idempotency_key = ?1`
@@ -2189,6 +2214,8 @@ async function handleEscrowHold(request, env) {
   )
     .bind(id)
     .first();
+
+  await safetyRecordSpend(env, authUser, fromRepo, amount);
 
   return json(request, {
     ok: true,
@@ -2434,6 +2461,11 @@ async function handleStreamStart(request, env) {
   if (rate == null || rate <= 0) return bad(request, "rate_per_unit must be > 0");
   if (rate > budget) return bad(request, "rate_per_unit cannot exceed budget");
 
+  {
+    const blocked = await safetyGate(request, env, authUser, fromRepo, budget);
+    if (blocked) return blocked;
+  }
+
   if (idem) {
     try {
       const existing = await env.DB.prepare(
@@ -2506,6 +2538,8 @@ async function handleStreamStart(request, env) {
       .run();
     return bad(request, "Stream create failed: " + (e.message || e), 500);
   }
+
+  await safetyRecordSpend(env, authUser, fromRepo, budget);
 
   return json(request, {
     ok: true,
