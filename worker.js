@@ -27,9 +27,6 @@
  * D1:       payment_receipts (d1-receipts-migration.sql)
  * Policy:   GET|POST /api/me/policy — allow/deny to, max_amount, task prefix
  * D1:       agent_policies (d1-policy-migration.sql)
- * Netting:  POST /api/netting/run, GET /api/netting
- * D1:       netting_runs + netting_settlements (d1-netting-migration.sql)
- * Traces:   GET /api/trace/:id ; optional trace_id on pay
  */
 
 
@@ -84,14 +81,6 @@ const SUBWALLET_MAX_TTL_SEC = 72 * 3600; // 72h
 const RL_SUBWALLET_MAX = 40;
 const RL_SUBWALLET_WINDOW_SEC = 60;
 const EXPIRE_SUBWALLET_BATCH = 50;
-
-const SYSTEM_NETTING = "system/netting";
-const NETTING_DEFAULT_WINDOW_HOURS = 24;
-const NETTING_MIN_WINDOW_HOURS = 1;
-const NETTING_MAX_WINDOW_HOURS = 168;
-const NETTING_MAX_PAIRS = 200;
-const RL_NETTING_MAX = 5;
-const RL_NETTING_WINDOW_SEC = 3600;
 
 /* Safety defaults (override per-repo via agent_limits) */
 const SAFETY_DEFAULT_VELOCITY_MAX_TX = 50;       // max txs in window
@@ -1112,18 +1101,6 @@ export default {
         return await handleMePolicySet(request, env);
       }
 
-      if (request.method === "GET" && url.pathname.startsWith("/api/trace/")) {
-        const tid = url.pathname.slice("/api/trace/".length).replace(/\/$/, "");
-        if (tid && tid !== "verify") return await handleTraceGet(request, env, tid);
-      }
-
-      if (request.method === "POST" && url.pathname === "/api/netting/run") {
-        return await handleNettingRun(request, env);
-      }
-      if (request.method === "GET" && url.pathname === "/api/netting") {
-        return await handleNettingList(request, url, env);
-      }
-
       if (request.method === "GET" && url.pathname === "/api/me/safety") {
         return await handleMeSafetyGet(request, env);
       }
@@ -1176,9 +1153,6 @@ export default {
             receipt_get: "GET /api/receipt/:id",
             receipt_verify: "POST /api/receipt/verify",
             me_policy: "GET|POST /api/me/policy",
-            netting_run: "POST /api/netting/run",
-            netting_list: "GET /api/netting",
-            trace_get: "GET /api/trace/:id",
           },
         });
       }
@@ -3606,346 +3580,6 @@ async function handleReceiptVerify(request, env) {
 
 
 
-
-
-function parseTraceId(v) {
-  const s = String(v || "").trim().slice(0, 128);
-  if (!s) return null;
-  if (!/^[A-Za-z0-9_.:\-]+$/.test(s)) return null;
-  return s;
-}
-
-async function ensureTrace(env, traceId, { label, created_by } = {}) {
-  if (!traceId) return;
-  try {
-    await env.DB.prepare(
-      `INSERT INTO payment_traces (id, label, created_by, created_at)
-       VALUES (?1, ?2, ?3, datetime('now'))
-       ON CONFLICT(id) DO NOTHING`
-    )
-      .bind(traceId, label || null, created_by || null)
-      .run();
-  } catch (e) {
-    console.log("ensure_trace", e && e.message);
-  }
-}
-
-async function handleTraceGet(request, env, id) {
-  id = parseTraceId(id);
-  if (!id) return bad(request, "invalid trace id", 400);
-  let txs = [];
-  try {
-    const { results } = await env.DB.prepare(
-      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at, trace_id
-       FROM transactions WHERE trace_id = ?1 ORDER BY id ASC LIMIT 200`
-    )
-      .bind(id)
-      .all();
-    txs = results || [];
-  } catch (e) {
-    return bad(
-      request,
-      "trace column/table missing — run d1-trace-migration.sql: " + (e.message || e),
-      500
-    );
-  }
-  let meta = null;
-  try {
-    meta = await env.DB.prepare(`SELECT * FROM payment_traces WHERE id = ?1`).bind(id).first();
-  } catch (_) {}
-  const vol = txs
-    .filter((t) => t.status === "success")
-    .reduce((s, t) => s + Number(t.amount || 0), 0);
-  return json(request, {
-    ok: true,
-    trace_id: id,
-    meta: meta || null,
-    count: txs.length,
-    volume: Math.round(vol * 1e6) / 1e6,
-    transactions: txs,
-  });
-}
-
-/* ─── Obligation netting (bilateral batch settlement) ───
- * For each unordered pair (A,B) with success pays in the window:
- *   gross_ab = sum(A→B), gross_ba = sum(B→A)
- *   net = gross_ab - gross_ba
- * If |net| >= MIN_AMOUNT: one settlement ledger line via system/netting
- *   (informational + optional real balance move is OFF by default — report only).
- * Algorithm is O(pairs) after a single group-by query; caps pairs for safety.
- */
-async function handleNettingRun(request, env) {
-  const t0 = Date.now();
-  const authUser = await getAuthUser(request, env);
-  if (!authUser) return bad(request, "Sign in or API key required", 401);
-
-  const rlId =
-    authUser.auth_via === "api_key"
-      ? "net:key:" + (authUser.key_id || authUser.id)
-      : "net:user:" + authUser.id;
-  const limited = await checkRateLimit(env, rlId, RL_NETTING_MAX, RL_NETTING_WINDOW_SEC);
-  if (limited) {
-    return bad(request, "Rate limit: netting runs", 429, {
-      retry_after_sec: limited.retry_after_sec,
-    });
-  }
-
-  let body = {};
-  try {
-    if (request.headers.get("Content-Type")?.includes("json")) {
-      body = await request.json();
-    }
-  } catch {
-    body = {};
-  }
-
-  let windowHours = Number(body.window_hours ?? body.window ?? NETTING_DEFAULT_WINDOW_HOURS);
-  if (!Number.isFinite(windowHours)) windowHours = NETTING_DEFAULT_WINDOW_HOURS;
-  windowHours = Math.max(NETTING_MIN_WINDOW_HOURS, Math.min(NETTING_MAX_WINDOW_HOURS, Math.floor(windowHours)));
-  const applyBalances = !!body.apply_balances; // default false: soft net (report + ledger annotation)
-  const repoFilter = body.repo ? parseRepo(body.repo) : (authUser.default_repo ? parseRepo(authUser.default_repo) : null);
-
-  // Aggregate bilateral success flows in window
-  let rows;
-  try {
-    let sql = `
-      SELECT from_repo, to_repo, SUM(amount) AS gross, COUNT(*) AS n
-      FROM transactions
-      WHERE status = 'success'
-        AND created_at >= datetime('now', ?)
-        AND from_repo NOT LIKE 'system/%'
-        AND to_repo NOT LIKE 'system/%'
-        AND from_repo != to_repo
-    `;
-    const binds = ["-" + windowHours + " hours"];
-    if (repoFilter) {
-      sql += ` AND (from_repo = ? OR to_repo = ?)`;
-      binds.push(repoFilter, repoFilter);
-    }
-    sql += ` GROUP BY from_repo, to_repo`;
-    const q = await env.DB.prepare(sql).bind(...binds).all();
-    rows = q.results || [];
-  } catch (e) {
-    return bad(request, "ledger query failed: " + (e.message || e), 500);
-  }
-
-  // Build undirected pair map: key = sorted(a|b)
-  const pairMap = new Map();
-  for (const r of rows) {
-    const a = r.from_repo;
-    const b = r.to_repo;
-    const gross = Number(r.gross) || 0;
-    const n = Number(r.n) || 0;
-    if (!a || !b || gross <= 0) continue;
-    const [lo, hi] = a < b ? [a, b] : [b, a];
-    const key = lo + "\0" + hi;
-    let p = pairMap.get(key);
-    if (!p) {
-      p = {
-        party_a: lo,
-        party_b: hi,
-        gross_a_to_b: 0,
-        gross_b_to_a: 0,
-        tx_count_a_to_b: 0,
-        tx_count_b_to_a: 0,
-      };
-      pairMap.set(key, p);
-    }
-    if (a === lo && b === hi) {
-      p.gross_a_to_b += gross;
-      p.tx_count_a_to_b += n;
-    } else {
-      p.gross_b_to_a += gross;
-      p.tx_count_b_to_a += n;
-    }
-  }
-
-  const pairs = [...pairMap.values()].slice(0, NETTING_MAX_PAIRS);
-  const runId = "net_" + randomId(12);
-  let pairsNetted = 0;
-  let volumeGross = 0;
-  let volumeNetted = 0;
-  const settlements = [];
-
-  for (const p of pairs) {
-    const gab = Math.round(p.gross_a_to_b * 1e6) / 1e6;
-    const gba = Math.round(p.gross_b_to_a * 1e6) / 1e6;
-    volumeGross += gab + gba;
-    const net = Math.round((gab - gba) * 1e6) / 1e6;
-    if (Math.abs(net) < MIN_AMOUNT) continue;
-    // Only net when both directions had flow (true bilateral obligation)
-    if (gab < MIN_AMOUNT || gba < MIN_AMOUNT) continue;
-
-    const netFrom = net > 0 ? p.party_a : p.party_b;
-    const netTo = net > 0 ? p.party_b : p.party_a;
-    const netAmt = Math.abs(net);
-    volumeNetted += netAmt;
-    pairsNetted += 1;
-
-    const sid = "ns_" + randomId(10);
-    settlements.push({
-      id: sid,
-      party_a: p.party_a,
-      party_b: p.party_b,
-      gross_a_to_b: gab,
-      gross_b_to_a: gba,
-      net_amount: netAmt,
-      net_from: netFrom,
-      net_to: netTo,
-      tx_count_a_to_b: p.tx_count_a_to_b,
-      tx_count_b_to_a: p.tx_count_b_to_a,
-    });
-
-    try {
-      await env.DB.prepare(
-        `INSERT INTO netting_settlements (
-           id, run_id, party_a, party_b, gross_a_to_b, gross_b_to_a,
-           net_amount, net_from, net_to, tx_count_a_to_b, tx_count_b_to_a,
-           status, created_at
-         ) VALUES (
-           ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'settled', datetime('now')
-         )`
-      )
-        .bind(
-          sid,
-          runId,
-          p.party_a,
-          p.party_b,
-          gab,
-          gba,
-          netAmt,
-          netFrom,
-          netTo,
-          p.tx_count_a_to_b,
-          p.tx_count_b_to_a
-        )
-        .run();
-    } catch (e) {
-      return bad(
-        request,
-        "netting tables missing — run d1-netting-migration.sql: " + (e.message || e),
-        500
-      );
-    }
-
-    // Ledger annotation (always)
-    await env.DB.prepare(
-      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
-       VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
-    )
-      .bind(
-        SYSTEM_NETTING,
-        netTo,
-        netAmt,
-        "net:" + sid + ":" + netFrom + "→" + netTo,
-        Date.now() - t0
-      )
-      .run()
-      .catch(() => {});
-
-    // Optional hard settle: move balances (off by default — safe for demo)
-    if (applyBalances) {
-      try {
-        await ensureAccount(env, netFrom);
-        await ensureAccount(env, netTo);
-        const debit = await env.DB.prepare(
-          `UPDATE accounts SET balance = balance - ?1, updated_at = datetime('now')
-           WHERE repo_id = ?2 AND balance >= ?1 RETURNING balance`
-        )
-          .bind(netAmt, netFrom)
-          .first();
-        if (debit) {
-          await env.DB.prepare(
-            `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now')
-             WHERE repo_id = ?2`
-          )
-            .bind(netAmt, netTo)
-            .run();
-        }
-      } catch (_) {}
-    }
-  }
-
-  try {
-    await env.DB.prepare(
-      `INSERT INTO netting_runs (
-         id, window_hours, pairs_scanned, pairs_netted,
-         volume_gross, volume_netted, status, created_by, created_at
-       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'done', ?7, datetime('now'))`
-    )
-      .bind(
-        runId,
-        windowHours,
-        pairs.length,
-        pairsNetted,
-        Math.round(volumeGross * 1e6) / 1e6,
-        Math.round(volumeNetted * 1e6) / 1e6,
-        authUser.id
-      )
-      .run();
-  } catch (e) {
-    return bad(
-      request,
-      "netting tables missing — run d1-netting-migration.sql: " + (e.message || e),
-      500
-    );
-  }
-
-  const saved = Math.round((volumeGross - volumeNetted) * 1e6) / 1e6;
-  return json(request, {
-    ok: true,
-    run_id: runId,
-    window_hours: windowHours,
-    pairs_scanned: pairs.length,
-    pairs_netted: pairsNetted,
-    volume_gross: Math.round(volumeGross * 1e6) / 1e6,
-    volume_net: Math.round(volumeNetted * 1e6) / 1e6,
-    volume_saved: saved,
-    apply_balances: applyBalances,
-    settlements: settlements.slice(0, 50),
-    latency_ms: Date.now() - t0,
-    hint: applyBalances
-      ? "Hard settle applied (balances moved)."
-      : "Soft net: report + ledger annotation only. Pass apply_balances:true to move funds.",
-  });
-}
-
-async function handleNettingList(request, url, env) {
-  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 10), 1), 50);
-  try {
-    const { results: runs } = await env.DB.prepare(
-      `SELECT id, window_hours, pairs_scanned, pairs_netted, volume_gross, volume_netted, status, created_at
-       FROM netting_runs ORDER BY created_at DESC LIMIT ?1`
-    )
-      .bind(limit)
-      .all();
-    const runIds = (runs || []).map((r) => r.id);
-    let settlements = [];
-    if (runIds.length) {
-      const placeholders = runIds.map(() => "?").join(",");
-      const q = await env.DB.prepare(
-        `SELECT id, run_id, party_a, party_b, gross_a_to_b, gross_b_to_a, net_amount, net_from, net_to, created_at
-         FROM netting_settlements WHERE run_id IN (${placeholders})
-         ORDER BY created_at DESC LIMIT 100`
-      )
-        .bind(...runIds)
-        .all();
-      settlements = q.results || [];
-    }
-    return json(request, {
-      ok: true,
-      runs: runs || [],
-      settlements,
-    });
-  } catch (e) {
-    return bad(
-      request,
-      "netting tables missing — run d1-netting-migration.sql: " + (e.message || e),
-      500
-    );
-  }
-}
-
 /* ─── Policy-as-code spend rules ───
  * JSON policy on agent_policies.repo_id:
  * {
@@ -3957,7 +3591,7 @@ async function handleNettingList(request, url, env) {
  *   require_task_prefix: ["job-", "task-"],  // empty = any task
  *   notes: "..."
  * }
- * Glob: * matches any segment remainder (owner/* or star/name or *).
+ * Glob: * matches any segment remainder (owner/* or */name or *).
  */
 function matchRepoGlob(pattern, repo) {
   if (!pattern || !repo) return false;
@@ -4391,3 +4025,4 @@ async function handleMeKeysUnsuspend(request, env) {
 
   return json(request, { ok: true, id, unsuspended: true });
 }
+
