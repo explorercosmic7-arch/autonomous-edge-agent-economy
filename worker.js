@@ -19,7 +19,8 @@
  * D1 users: github_access_token, github_login (optional ALTER)
  * D1:       streams table (d1-stream-migration.sql)
  * D1:       agent_limits, velocity_events, safety_events; api_keys.suspended_at
- * Safety:   helpers + gate on pay/escrow/stream + GET|POST /api/me/safety (step 4)
+ * Safety:   gate + /api/me/safety + webhooks wallet.locked/agent.runaway_loop
+ * Cron:     expireHeldEscrows + pruneTelemetry (old velocity/safety/webhook logs)
  */
 
 
@@ -296,7 +297,7 @@ async function checkWalletLocked(env, repoId) {
   return null;
 }
 
-async function lockWallet(env, repoId, reason, { api_key_id, user_id } = {}) {
+async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx } = {}) {
   await ensureAgentLimits(env, repoId);
   await env.DB.prepare(
     `UPDATE agent_limits
@@ -314,6 +315,13 @@ async function lockWallet(env, repoId, reason, { api_key_id, user_id } = {}) {
     user_id,
     reason,
   });
+  if (user_id) {
+    scheduleWebhook(ctx, env, user_id, "wallet.locked", {
+      repo_id: repoId,
+      reason: reason || "Wallet locked",
+      api_key_id: api_key_id || null,
+    });
+  }
 }
 
 async function unlockWallet(env, repoId, { user_id } = {}) {
@@ -547,20 +555,29 @@ async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (vel) {
     // Persistent spike → kill-switch
     if (vel.spike && keyId) {
+      const uid = authUser && authUser.id;
       await suspendApiKey(env, keyId, vel.error, {
         repo_id: fromRepo,
-        user_id: authUser && authUser.id,
+        user_id: uid,
       });
       await lockWallet(env, fromRepo, vel.error, {
         api_key_id: keyId,
-        user_id: authUser && authUser.id,
+        user_id: uid,
       });
       await logSafetyEvent(env, "agent.runaway_loop", {
         repo_id: fromRepo,
         api_key_id: keyId,
-        user_id: authUser && authUser.id,
+        user_id: uid,
         reason: vel.error,
       });
+      if (uid) {
+        // fire-and-forget (no ctx in gate path)
+        scheduleWebhook(null, env, uid, "agent.runaway_loop", {
+          repo_id: fromRepo,
+          reason: vel.error,
+          api_key_id: keyId,
+        });
+      }
     }
     return bad(request, vel.error, 429, {
       code: vel.code,
@@ -869,6 +886,73 @@ async function expireHeldEscrows(env, ctx) {
   return { expired, scanned: results.length, latency_ms: Date.now() - t0 };
 }
 
+
+
+/* ─── Telemetry prune (non-critical only; never touch balances/users/ledger core) ───
+ * Safe to delete:
+ *   velocity_events > 24h
+ *   safety_events > 90d
+ *   webhook_deliveries > 30d
+ *   rate_limits updated > 7d ago
+ *   idempotency success/failed > 7d
+ * NEVER delete: accounts, transactions, users, sessions, api_keys, escrows, streams, agent_limits
+ */
+const PRUNE_VELOCITY_HOURS = 24;
+const PRUNE_SAFETY_DAYS = 90;
+const PRUNE_WEBHOOK_DAYS = 30;
+const PRUNE_RATE_LIMIT_DAYS = 7;
+const PRUNE_IDEM_DAYS = 7;
+
+async function pruneTelemetry(env) {
+  const t0 = Date.now();
+  const out = {
+    velocity: 0,
+    safety: 0,
+    webhook_deliveries: 0,
+    rate_limits: 0,
+    idempotency: 0,
+  };
+
+  async function del(sql, label) {
+    try {
+      const r = await env.DB.prepare(sql).run();
+      out[label] = r.meta?.changes || 0;
+    } catch (e) {
+      console.log("prune_" + label, e && e.message);
+    }
+  }
+
+  await del(
+    `DELETE FROM velocity_events
+     WHERE created_at < datetime('now', '-${PRUNE_VELOCITY_HOURS} hours')`,
+    "velocity"
+  );
+  await del(
+    `DELETE FROM safety_events
+     WHERE created_at < datetime('now', '-${PRUNE_SAFETY_DAYS} days')`,
+    "safety"
+  );
+  await del(
+    `DELETE FROM webhook_deliveries
+     WHERE created_at < datetime('now', '-${PRUNE_WEBHOOK_DAYS} days')`,
+    "webhook_deliveries"
+  );
+  await del(
+    `DELETE FROM rate_limits
+     WHERE updated_at < datetime('now', '-${PRUNE_RATE_LIMIT_DAYS} days')`,
+    "rate_limits"
+  );
+  await del(
+    `DELETE FROM idempotency
+     WHERE status IN ('success', 'failed')
+       AND updated_at < datetime('now', '-${PRUNE_IDEM_DAYS} days')`,
+    "idempotency"
+  );
+
+  out.latency_ms = Date.now() - t0;
+  return out;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1046,6 +1130,18 @@ export default {
           );
         } catch (err) {
           console.error("escrow-expire failed:", err && err.message ? err.message : err);
+        }
+        try {
+          const pruned = await pruneTelemetry(env);
+          console.log(
+            JSON.stringify({
+              cron: "telemetry-prune",
+              scheduledTime: event.scheduledTime,
+              ...pruned,
+            })
+          );
+        } catch (err) {
+          console.error("telemetry-prune failed:", err && err.message ? err.message : err);
         }
       })()
     );
@@ -1758,7 +1854,7 @@ async function handleMeWebhookGet(request, env) {
     configured: !!(row && row.webhook_url),
     url: row?.webhook_url || null,
     secret_prefix: row?.webhook_secret_prefix ? row.webhook_secret_prefix + "…" : null,
-    events: ["escrow.released", "escrow.refunded", "escrow.expired"],
+    events: ["escrow.released", "escrow.refunded", "escrow.expired", "wallet.locked", "agent.runaway_loop"],
   });
 }
 
@@ -1814,7 +1910,7 @@ async function handleMeWebhookSet(request, env) {
     url,
     secret_prefix: prefix + "…",
     secret,
-    events: ["escrow.released", "escrow.refunded", "escrow.expired"],
+    events: ["escrow.released", "escrow.refunded", "escrow.expired", "wallet.locked", "agent.runaway_loop"],
     hint: "Copy secret now. Verify X-AgentPay-Signature: sha256=<hmac-sha256(secret, rawBody)>.",
   });
 }
