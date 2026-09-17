@@ -19,7 +19,7 @@
  * D1 users: github_access_token, github_login (optional ALTER)
  * D1:       streams table (d1-stream-migration.sql)
  * D1:       agent_limits, velocity_events, safety_events; api_keys.suspended_at
- * Safety:   helpers + gate on pay / escrow hold / stream start (step 3)
+ * Safety:   helpers + gate on pay/escrow/stream + GET|POST /api/me/safety (step 4)
  */
 
 
@@ -962,6 +962,19 @@ export default {
         return await handleStreamList(request, url, env);
       }
 
+      if (request.method === "GET" && url.pathname === "/api/me/safety") {
+        return await handleMeSafetyGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/safety") {
+        return await handleMeSafetySet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/safety/unlock") {
+        return await handleMeSafetyUnlock(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/keys/unsuspend") {
+        return await handleMeKeysUnsuspend(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
           ok: true,
@@ -991,6 +1004,9 @@ export default {
             stream_meter: "POST /api/stream/meter",
             stream_stop: "POST /api/stream/stop",
             stream_list: "GET /api/stream",
+            me_safety: "GET|POST /api/me/safety",
+            me_safety_unlock: "POST /api/me/safety/unlock",
+            me_keys_unsuspend: "POST /api/me/keys/unsuspend",
           },
         });
       }
@@ -1656,12 +1672,24 @@ async function handleMeKeysList(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
 
-  const { results } = await env.DB.prepare(
-    `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at
-     FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
-  )
-    .bind(user.id)
-    .all();
+  let results;
+  try {
+    const q = await env.DB.prepare(
+      `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at, suspended_at, suspend_reason
+       FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
+    )
+      .bind(user.id)
+      .all();
+    results = q.results || [];
+  } catch (_) {
+    const q = await env.DB.prepare(
+      `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at
+       FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
+    )
+      .bind(user.id)
+      .all();
+    results = q.results || [];
+  }
 
   return json(request, {
     ok: true,
@@ -1674,6 +1702,9 @@ async function handleMeKeysList(request, env) {
       revoked: !!k.revoked_at,
       revoked_at: k.revoked_at,
       last_used_at: k.last_used_at,
+      suspended: !!k.suspended_at,
+      suspended_at: k.suspended_at || null,
+      suspend_reason: k.suspend_reason || null,
     })),
   });
 }
@@ -2760,3 +2791,213 @@ async function handleStreamList(request, url, env) {
     return bad(request, "streams table missing — run d1-stream-migration.sql", 500);
   }
 }
+
+
+/* ─── Safety controls (dashboard / API) ─── */
+
+async function handleMeSafetyGet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) {
+    return json(request, {
+      ok: true,
+      default_repo: null,
+      limits: null,
+      defaults: {
+        velocity_max_tx: SAFETY_DEFAULT_VELOCITY_MAX_TX,
+        velocity_tx_window_sec: SAFETY_DEFAULT_VELOCITY_TX_WINDOW_SEC,
+        velocity_max_usd: SAFETY_DEFAULT_VELOCITY_MAX_USD,
+        velocity_window_sec: SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC,
+        spike_tx_per_sec: SAFETY_SPIKE_TX_PER_SEC,
+      },
+    });
+  }
+
+  const lim = await getAgentLimits(env, repo);
+  let recent = [];
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT event, reason, created_at FROM safety_events
+       WHERE repo_id = ?1 ORDER BY created_at DESC LIMIT 10`
+    )
+      .bind(repo)
+      .all();
+    recent = results || [];
+  } catch (_) {}
+
+  return json(request, {
+    ok: true,
+    default_repo: repo,
+    limits: lim
+      ? {
+          repo_id: lim.repo_id,
+          daily_budget: lim.daily_budget,
+          daily_spent: lim.daily_spent,
+          daily_window_start: lim.daily_window_start,
+          velocity_max_usd: lim.velocity_max_usd,
+          velocity_window_sec: lim.velocity_window_sec,
+          velocity_max_tx: lim.velocity_max_tx,
+          velocity_tx_window_sec: lim.velocity_tx_window_sec,
+          locked: Number(lim.locked) === 1,
+          locked_at: lim.locked_at,
+          lock_reason: lim.lock_reason,
+          updated_at: lim.updated_at,
+        }
+      : null,
+    defaults: {
+      velocity_max_tx: SAFETY_DEFAULT_VELOCITY_MAX_TX,
+      velocity_tx_window_sec: SAFETY_DEFAULT_VELOCITY_TX_WINDOW_SEC,
+      velocity_max_usd: SAFETY_DEFAULT_VELOCITY_MAX_USD,
+      velocity_window_sec: SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC,
+      spike_tx_per_sec: SAFETY_SPIKE_TX_PER_SEC,
+    },
+    recent_events: recent,
+  });
+}
+
+async function handleMeSafetySet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) return bad(request, "Bind a default agent first");
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  await ensureAgentLimits(env, repo);
+
+  // null / "" clears optional caps
+  const parseOpt = (v) => {
+    if (v === null || v === "" || v === undefined) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return undefined; // invalid
+    return n;
+  };
+
+  const daily = parseOpt(body.daily_budget);
+  const vmaxUsd = parseOpt(body.velocity_max_usd);
+  const vwinUsd = parseOpt(body.velocity_window_sec);
+  const vmaxTx = parseOpt(body.velocity_max_tx);
+  const vwinTx = parseOpt(body.velocity_tx_window_sec);
+
+  if (daily === undefined) return bad(request, "daily_budget invalid");
+  if (vmaxUsd === undefined) return bad(request, "velocity_max_usd invalid");
+  if (vwinUsd === undefined) return bad(request, "velocity_window_sec invalid");
+  if (vmaxTx === undefined) return bad(request, "velocity_max_tx invalid");
+  if (vwinTx === undefined) return bad(request, "velocity_tx_window_sec invalid");
+
+  // Only update fields present in body
+  const sets = [];
+  const binds = [];
+  const add = (col, val, present) => {
+    if (!present) return;
+    sets.push(col + " = ?" + (binds.length + 1));
+    binds.push(val);
+  };
+
+  add("daily_budget", daily, "daily_budget" in body);
+  add("velocity_max_usd", vmaxUsd, "velocity_max_usd" in body);
+  add(
+    "velocity_window_sec",
+    vwinUsd != null ? Math.floor(vwinUsd) : null,
+    "velocity_window_sec" in body
+  );
+  add(
+    "velocity_max_tx",
+    vmaxTx != null ? Math.floor(vmaxTx) : null,
+    "velocity_max_tx" in body
+  );
+  add(
+    "velocity_tx_window_sec",
+    vwinTx != null ? Math.floor(vwinTx) : null,
+    "velocity_tx_window_sec" in body
+  );
+
+  if (!sets.length) return bad(request, "No fields to update");
+
+  sets.push("updated_at = datetime('now')");
+  binds.push(repo);
+
+  await env.DB.prepare(
+    `UPDATE agent_limits SET ${sets.join(", ")} WHERE repo_id = ?${binds.length}`
+  )
+    .bind(...binds)
+    .run();
+
+  await logSafetyEvent(env, "limits.updated", {
+    repo_id: repo,
+    user_id: user.id,
+    reason: "dashboard",
+    meta: body,
+  });
+
+  const lim = await getAgentLimits(env, repo);
+  return json(request, {
+    ok: true,
+    repo_id: repo,
+    limits: lim,
+  });
+}
+
+async function handleMeSafetyUnlock(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) return bad(request, "Bind a default agent first");
+
+  await unlockWallet(env, repo, { user_id: user.id });
+  return json(request, { ok: true, unlocked: true, repo_id: repo });
+}
+
+async function handleMeKeysUnsuspend(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  const row = await env.DB.prepare(
+    `SELECT id, suspended_at FROM api_keys WHERE id = ?1 AND user_id = ?2`
+  )
+    .bind(id, user.id)
+    .first();
+  if (!row) return bad(request, "Key not found", 404);
+  if (!row.suspended_at) {
+    return json(request, { ok: true, id, already_active: true });
+  }
+
+  try {
+    await env.DB.prepare(
+      `UPDATE api_keys
+       SET suspended_at = NULL, suspend_reason = NULL
+       WHERE id = ?1 AND user_id = ?2`
+    )
+      .bind(id, user.id)
+      .run();
+  } catch (e) {
+    return bad(request, "Could not unsuspend (column missing?)", 500);
+  }
+
+  await logSafetyEvent(env, "key.unsuspended", {
+    api_key_id: id,
+    user_id: user.id,
+    reason: "dashboard",
+  });
+
+  return json(request, { ok: true, id, unsuspended: true });
+}
+
