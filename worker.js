@@ -2109,6 +2109,7 @@ async function handlePay(request, env) {
     String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
       .trim()
       .slice(0, 128) || null;
+  const traceId = parseTraceId(body.trace_id || body.traceId || request.headers.get("X-Trace-Id"));
 
   if (!fromRepo) {
     return bad(
@@ -2188,17 +2189,39 @@ async function handlePay(request, env) {
     return bad(request, "Insufficient funds", 402);
   }
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `UPDATE accounts
-       SET balance = balance + ?1, updated_at = datetime('now')
-       WHERE repo_id = ?2`
-    ).bind(amount, toRepo),
-    env.DB.prepare(
-      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
-       VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
-    ).bind(fromRepo, toRepo, amount, task, Date.now() - t0, idem),
-  ]);
+  if (traceId) {
+    await ensureTrace(env, traceId, {
+      label: task || "pay",
+      created_by: authUser && authUser.id,
+    });
+  }
+
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE accounts
+         SET balance = balance + ?1, updated_at = datetime('now')
+         WHERE repo_id = ?2`
+      ).bind(amount, toRepo),
+      env.DB.prepare(
+        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key, trace_id)
+         VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6, ?7)`
+      ).bind(fromRepo, toRepo, amount, task, Date.now() - t0, idem, traceId),
+    ]);
+  } catch (e) {
+    // Fallback if trace_id column missing
+    await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE accounts
+         SET balance = balance + ?1, updated_at = datetime('now')
+         WHERE repo_id = ?2`
+      ).bind(amount, toRepo),
+      env.DB.prepare(
+        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
+         VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
+      ).bind(fromRepo, toRepo, amount, task, Date.now() - t0, idem),
+    ]);
+  }
 
   const payload = {
     ok: true,
@@ -2208,6 +2231,7 @@ async function handlePay(request, env) {
     to_repo: toRepo,
     amount,
     task,
+    trace_id: traceId || undefined,
     latency_ms: Date.now() - t0,
     balances: await readBalances(env, fromRepo, toRepo),
   };
@@ -2309,14 +2333,14 @@ async function handleLedger(request, url, env) {
   if (repo) {
     if (!parseRepo(repo)) return bad(request, "repo query must be owner/repo");
     stmt = env.DB.prepare(
-      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at
+      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at, trace_id
        FROM transactions
        WHERE from_repo = ?1 OR to_repo = ?1
        ORDER BY id DESC LIMIT ?2`
     ).bind(repo, limit);
   } else {
     stmt = env.DB.prepare(
-      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at
+      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at, trace_id
        FROM transactions ORDER BY id DESC LIMIT ?1`
     ).bind(limit);
   }
