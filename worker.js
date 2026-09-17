@@ -1112,6 +1112,11 @@ export default {
         return await handleMePolicySet(request, env);
       }
 
+      if (request.method === "GET" && url.pathname.startsWith("/api/trace/")) {
+        const tid = url.pathname.slice("/api/trace/".length).replace(/\/$/, "");
+        if (tid && tid !== "verify") return await handleTraceGet(request, env, tid);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/netting/run") {
         return await handleNettingRun(request, env);
       }
@@ -1173,6 +1178,7 @@ export default {
             me_policy: "GET|POST /api/me/policy",
             netting_run: "POST /api/netting/run",
             netting_list: "GET /api/netting",
+            trace_get: "GET /api/trace/:id",
           },
         });
       }
@@ -3601,6 +3607,65 @@ async function handleReceiptVerify(request, env) {
 
 
 
+
+function parseTraceId(v) {
+  const s = String(v || "").trim().slice(0, 128);
+  if (!s) return null;
+  if (!/^[A-Za-z0-9_.:\-]+$/.test(s)) return null;
+  return s;
+}
+
+async function ensureTrace(env, traceId, { label, created_by } = {}) {
+  if (!traceId) return;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO payment_traces (id, label, created_by, created_at)
+       VALUES (?1, ?2, ?3, datetime('now'))
+       ON CONFLICT(id) DO NOTHING`
+    )
+      .bind(traceId, label || null, created_by || null)
+      .run();
+  } catch (e) {
+    console.log("ensure_trace", e && e.message);
+  }
+}
+
+async function handleTraceGet(request, env, id) {
+  id = parseTraceId(id);
+  if (!id) return bad(request, "invalid trace id", 400);
+  let txs = [];
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT id, from_repo, to_repo, amount, task, status, latency_ms, created_at, trace_id
+       FROM transactions WHERE trace_id = ?1 ORDER BY id ASC LIMIT 200`
+    )
+      .bind(id)
+      .all();
+    txs = results || [];
+  } catch (e) {
+    return bad(
+      request,
+      "trace column/table missing — run d1-trace-migration.sql: " + (e.message || e),
+      500
+    );
+  }
+  let meta = null;
+  try {
+    meta = await env.DB.prepare(`SELECT * FROM payment_traces WHERE id = ?1`).bind(id).first();
+  } catch (_) {}
+  const vol = txs
+    .filter((t) => t.status === "success")
+    .reduce((s, t) => s + Number(t.amount || 0), 0);
+  return json(request, {
+    ok: true,
+    trace_id: id,
+    meta: meta || null,
+    count: txs.length,
+    volume: Math.round(vol * 1e6) / 1e6,
+    transactions: txs,
+  });
+}
+
 /* ─── Obligation netting (bilateral batch settlement) ───
  * For each unordered pair (A,B) with success pays in the window:
  *   gross_ab = sum(A→B), gross_ba = sum(B→A)
@@ -3892,7 +3957,7 @@ async function handleNettingList(request, url, env) {
  *   require_task_prefix: ["job-", "task-"],  // empty = any task
  *   notes: "..."
  * }
- * Glob: * matches any segment remainder (owner/* or */name or *).
+ * Glob: * matches any segment remainder (owner/* or star/name or *).
  */
 function matchRepoGlob(pattern, repo) {
   if (!pattern || !repo) return false;
