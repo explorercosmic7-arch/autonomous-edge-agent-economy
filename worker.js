@@ -23,6 +23,8 @@
  * Cron:     expireHeldEscrows + pruneTelemetry + expireSubWallets
  * Sub-wallets: POST /api/subwallet/open|spend|close, GET /api/subwallet
  * D1:       sub_wallets (d1-subwallet-migration.sql)
+ * Receipts: GET /api/receipt/:id, POST /api/receipt/verify; auto on pay
+ * D1:       payment_receipts (d1-receipts-migration.sql)
  */
 
 
@@ -1071,6 +1073,18 @@ export default {
         return await handleSubWalletList(request, url, env);
       }
 
+      if (request.method === "GET" && url.pathname.startsWith("/api/receipt/")) {
+        const rid = url.pathname.slice("/api/receipt/".length).replace(/\/$/, "");
+        if (rid === "verify") {
+          /* fall through — POST only */
+        } else if (rid) {
+          return await handleReceiptGet(request, env, rid);
+        }
+      }
+      if (request.method === "POST" && url.pathname === "/api/receipt/verify") {
+        return await handleReceiptVerify(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/api/me/safety") {
         return await handleMeSafetyGet(request, env);
       }
@@ -1120,6 +1134,8 @@ export default {
             subwallet_spend: "POST /api/subwallet/spend",
             subwallet_close: "POST /api/subwallet/close",
             subwallet_list: "GET /api/subwallet",
+            receipt_get: "GET /api/receipt/:id",
+            receipt_verify: "POST /api/receipt/verify",
           },
         });
       }
@@ -2189,6 +2205,18 @@ async function handlePay(request, env) {
   }
 
   await safetyRecordSpend(env, authUser, fromRepo, amount);
+
+  const rcpt = await issuePayReceipt(env, {
+    from_repo: fromRepo,
+    to_repo: toRepo,
+    amount,
+    task,
+    status: "success",
+  });
+  if (rcpt) {
+    payload.receipt_id = rcpt.id;
+    payload.receipt_signature = rcpt.signature;
+  }
 
   return json(request, payload);
 }
@@ -3366,6 +3394,143 @@ async function expireSubWallets(env) {
     refunded_total: refundedTotal,
     latency_ms: Date.now() - t0,
   };
+}
+
+
+
+/* ─── Signed payment receipts ───
+ * HMAC-SHA256 over canonical JSON using env.RECEIPT_SECRET (or SESSION cookie secret fallback).
+ * Agents store receipt_id + signature offline and verify later without trusting the UI.
+ */
+function receiptSecret(env) {
+  return env.RECEIPT_SECRET || env.SESSION_SECRET || env.GOOGLE_CLIENT_SECRET || "a2a-dev-receipt-secret";
+}
+
+function canonicalReceiptPayload(p) {
+  // stable field order for HMAC
+  return JSON.stringify({
+    v: 1,
+    id: p.id,
+    from_repo: p.from_repo,
+    to_repo: p.to_repo,
+    amount: p.amount,
+    task: p.task || "",
+    status: p.status || "success",
+    created_at: p.created_at,
+  });
+}
+
+async function issuePayReceipt(env, { from_repo, to_repo, amount, task, status, tx_id }) {
+  try {
+    const id = "rcpt_" + randomId(12);
+    const created_at = new Date().toISOString();
+    const body = {
+      id,
+      from_repo,
+      to_repo,
+      amount: Number(amount),
+      task: task || "",
+      status: status || "success",
+      created_at,
+    };
+    const canon = canonicalReceiptPayload(body);
+    const signature = await hmacSha256Hex(receiptSecret(env), canon);
+    await env.DB.prepare(
+      `INSERT INTO payment_receipts (
+         id, tx_id, from_repo, to_repo, amount, task, status, payload_json, signature, created_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))`
+    )
+      .bind(
+        id,
+        tx_id || null,
+        from_repo,
+        to_repo,
+        Number(amount),
+        task || "",
+        status || "success",
+        canon,
+        signature
+      )
+      .run();
+    return { id, signature, created_at, v: 1 };
+  } catch (e) {
+    console.log("receipt_issue_error", e && e.message);
+    return null;
+  }
+}
+
+async function handleReceiptGet(request, env, id) {
+  id = String(id || "").trim();
+  if (!id || id.length > 64) return bad(request, "invalid receipt id", 400);
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `SELECT id, tx_id, from_repo, to_repo, amount, task, status, payload_json, signature, created_at
+       FROM payment_receipts WHERE id = ?1`
+    )
+      .bind(id)
+      .first();
+  } catch (e) {
+    return bad(request, "payment_receipts table missing — run d1-receipts-migration.sql", 500);
+  }
+  if (!row) return bad(request, "Receipt not found", 404);
+  return json(request, {
+    ok: true,
+    receipt: {
+      id: row.id,
+      tx_id: row.tx_id,
+      from_repo: row.from_repo,
+      to_repo: row.to_repo,
+      amount: row.amount,
+      task: row.task,
+      status: row.status,
+      created_at: row.created_at,
+      signature: row.signature,
+      payload: row.payload_json,
+    },
+    verify: "POST /api/receipt/verify with { id } or { payload, signature }",
+  });
+}
+
+async function handleReceiptVerify(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  let payloadStr = body.payload;
+  let signature = body.signature;
+  const id = body.id ? String(body.id).trim() : null;
+
+  if (id && (!payloadStr || !signature)) {
+    let row;
+    try {
+      row = await env.DB.prepare(
+        `SELECT payload_json, signature FROM payment_receipts WHERE id = ?1`
+      )
+        .bind(id)
+        .first();
+    } catch {
+      return bad(request, "payment_receipts table missing — run d1-receipts-migration.sql", 500);
+    }
+    if (!row) return bad(request, "Receipt not found", 404);
+    payloadStr = row.payload_json;
+    signature = row.signature;
+  }
+
+  if (!payloadStr || !signature) {
+    return bad(request, "payload + signature required (or id)");
+  }
+
+  const expected = await hmacSha256Hex(receiptSecret(env), String(payloadStr));
+  const ok = expected === String(signature).toLowerCase() || expected === String(signature);
+  return json(request, {
+    ok: true,
+    valid: ok,
+    id: id || null,
+  });
 }
 
 /* ─── Safety controls (dashboard / API) ─── */
