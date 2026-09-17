@@ -3922,19 +3922,7 @@ async function handleNettingList(request, url, env) {
   }
 }
 
-/* ─── Policy-as-code spend rules ───
- * JSON policy on agent_policies.repo_id:
- * {
- *   version: 1,
- *   blocked: false,
- *   max_amount: 5.0,           // per tx (null = no cap beyond safety)
- *   allow_to: ["acme/*", "bob/tool"],  // empty = allow all (unless deny)
- *   deny_to: ["scam/*"],
- *   require_task_prefix: ["job-", "task-"],  // empty = any task
- *   notes: "..."
- * }
- * Glob: * matches any segment remainder (owner/* or star/name or *).
- */
+ 
 function matchRepoGlob(pattern, repo) {
   if (!pattern || !repo) return false;
   const p = String(pattern).trim();
