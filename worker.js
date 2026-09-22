@@ -36,6 +36,8 @@
  * D1:       intent_bonds + bond_events (d1-bonds-migration.sql)
  * Sagas:    POST /api/saga/start|advance|compensate|cancel, GET /api/saga
  * D1:       payment_sagas + saga_steps + saga_events (d1-saga-migration.sql)
+ * Credit:   rep-backed limits on agent_limits; GET|POST /api/me/credit
+ * D1:       agent_limits credit_* + rep_events (d1-credit-migration.sql)
  */
 
 
@@ -141,6 +143,17 @@ const SAFETY_DEFAULT_VELOCITY_MAX_USD = 2.0;     // max spend in window
 const SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC = 60;
 const SAFETY_SPIKE_TX_PER_SEC = 100;             // instant spike threshold
 const SAFETY_VELOCITY_PRUNE_HOURS = 24;
+
+/* Reputation-backed credit */
+const CREDIT_DEFAULT_LIMIT = 0;           // no credit unless set or earned
+const CREDIT_MAX_LIMIT = 10000;
+const CREDIT_REP_PER_USD = 10;            // +10 rep per $1 successful spend (capped)
+const CREDIT_REP_SUCCESS_BONUS = 1;       // flat +1 on successful pay/escrow release
+const CREDIT_REP_FAIL_PENALTY = 5;        // -5 on slash / compensate / lock
+const CREDIT_REP_TO_LIMIT_RATIO = 0.01;   // credit_limit ≈ rep_score * 0.01 (e.g. 1000 rep → $10)
+const CREDIT_AUTO_LIMIT = true;           // auto-raise suggested limit from rep (never above explicit set if locked)
+const RL_CREDIT_MAX = 20;
+const RL_CREDIT_WINDOW_SEC = 60;
 
 
 function corsHeaders(request) {
@@ -377,6 +390,7 @@ async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx } = {}
   )
     .bind(repoId, String(reason || "locked").slice(0, 500))
     .run();
+  await adjustRep(env, repoId, -CREDIT_REP_FAIL_PENALTY, "wallet_locked");
   await logSafetyEvent(env, "wallet.locked", {
     repo_id: repoId,
     api_key_id,
@@ -670,6 +684,206 @@ async function safetyRecordSpend(env, authUser, fromRepo, amount) {
   await recordVelocityEvent(env, fromRepo, amount, keyId);
   await addDailySpent(env, fromRepo, amount);
 }
+
+
+/* ─── Reputation-backed credit ───
+ * agent_limits.credit_limit  — max outstanding draw (null/0 = cash only)
+ * agent_limits.outstanding_credit — current borrowed
+ * agent_limits.rep_score — reputation points
+ * Spend path: if balance < amount, draw min(shortfall, available_credit).
+ * Repay: POST /api/me/credit/repay reduces outstanding from free balance.
+ * Auto-limit: suggested = min(CREDIT_MAX_LIMIT, rep_score * CREDIT_REP_TO_LIMIT_RATIO)
+ */
+
+async function getCreditState(env, repoId) {
+  const lim = await getAgentLimits(env, repoId);
+  if (!lim) {
+    return {
+      credit_limit: CREDIT_DEFAULT_LIMIT,
+      outstanding_credit: 0,
+      available_credit: CREDIT_DEFAULT_LIMIT,
+      rep_score: 0,
+      rep_events: 0,
+      suggested_limit: 0,
+    };
+  }
+  const limit = lim.credit_limit != null ? Number(lim.credit_limit) : CREDIT_DEFAULT_LIMIT;
+  const outstanding = Number(lim.outstanding_credit || 0);
+  const rep = Number(lim.rep_score || 0);
+  const suggested = Math.min(
+    CREDIT_MAX_LIMIT,
+    Math.round(rep * CREDIT_REP_TO_LIMIT_RATIO * 1e6) / 1e6
+  );
+  const effectiveLimit = Math.max(limit, 0);
+  const available = Math.max(0, Math.round((effectiveLimit - outstanding) * 1e6) / 1e6);
+  return {
+    credit_limit: effectiveLimit,
+    outstanding_credit: outstanding,
+    available_credit: available,
+    rep_score: rep,
+    rep_events: Number(lim.rep_events || 0),
+    suggested_limit: suggested,
+    locked: Number(lim.locked) === 1,
+  };
+}
+
+async function adjustRep(env, repoId, delta, reason, refId) {
+  if (!repoId || !delta) return null;
+  try {
+    await ensureAgentLimits(env, repoId);
+    const row = await env.DB.prepare(
+      `UPDATE agent_limits
+       SET rep_score = MAX(0, COALESCE(rep_score, 0) + ?2),
+           rep_events = COALESCE(rep_events, 0) + 1,
+           updated_at = datetime('now')
+       WHERE repo_id = ?1
+       RETURNING rep_score, credit_limit`
+    )
+      .bind(repoId, Number(delta))
+      .first();
+    if (!row) return null;
+    const score = Number(row.rep_score || 0);
+    // Soft auto-raise: only if credit_limit is null/0 and AUTO on
+    if (CREDIT_AUTO_LIMIT) {
+      const curLim = row.credit_limit != null ? Number(row.credit_limit) : 0;
+      const suggested = Math.min(
+        CREDIT_MAX_LIMIT,
+        Math.round(score * CREDIT_REP_TO_LIMIT_RATIO * 1e6) / 1e6
+      );
+      if (suggested > curLim && curLim === 0) {
+        await env.DB.prepare(
+          `UPDATE agent_limits SET credit_limit = ?2, updated_at = datetime('now') WHERE repo_id = ?1`
+        )
+          .bind(repoId, suggested)
+          .run();
+      }
+    }
+    try {
+      await env.DB.prepare(
+        `INSERT INTO rep_events (id, repo_id, delta, score_after, reason, ref_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))`
+      )
+        .bind(randomId(10), repoId, Number(delta), score, String(reason || "").slice(0, 200), refId || null)
+        .run();
+    } catch (_) {}
+    return score;
+  } catch (e) {
+    console.log("adjust_rep_error", e && e.message);
+    return null;
+  }
+}
+
+/**
+ * Debit with optional credit draw.
+ * Returns { ok, balance, credit_drawn, outstanding } or { ok:false, error, code }.
+ * Does NOT run safety gate — caller must.
+ */
+async function debitWithCredit(env, repoId, amount) {
+  amount = Number(amount);
+  await ensureAccount(env, repoId);
+  const acc = await env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?1`)
+    .bind(repoId)
+    .first();
+  const bal = Number(acc?.balance || 0);
+  if (bal >= amount) {
+    const row = await env.DB.prepare(
+      `UPDATE accounts SET balance = balance - ?1, updated_at = datetime('now')
+       WHERE repo_id = ?2 AND balance >= ?1 RETURNING balance`
+    )
+      .bind(amount, repoId)
+      .first();
+    if (!row) return { ok: false, error: "Insufficient funds", code: "insufficient" };
+    return { ok: true, balance: Number(row.balance), credit_drawn: 0, outstanding: 0 };
+  }
+
+  const shortfall = Math.round((amount - bal) * 1e6) / 1e6;
+  const credit = await getCreditState(env, repoId);
+  if (credit.locked) {
+    return { ok: false, error: "Wallet locked", code: "wallet_locked" };
+  }
+  if (credit.available_credit < shortfall) {
+    return {
+      ok: false,
+      error:
+        "Insufficient funds + credit (need $" +
+        amount.toFixed(6) +
+        ", cash $" +
+        bal.toFixed(6) +
+        ", credit available $" +
+        credit.available_credit.toFixed(6) +
+        ")",
+      code: "insufficient_credit",
+      balance: bal,
+      available_credit: credit.available_credit,
+    };
+  }
+
+  // Draw credit: set balance to 0 (use all cash), increase outstanding
+  await ensureAgentLimits(env, repoId);
+  const updLim = await env.DB.prepare(
+    `UPDATE agent_limits
+     SET outstanding_credit = COALESCE(outstanding_credit, 0) + ?2,
+         updated_at = datetime('now')
+     WHERE repo_id = ?1
+       AND COALESCE(credit_limit, 0) >= COALESCE(outstanding_credit, 0) + ?2
+     RETURNING outstanding_credit, credit_limit`
+  )
+    .bind(repoId, shortfall)
+    .first();
+  if (!updLim) {
+    return { ok: false, error: "Credit draw race or limit exceeded", code: "credit_race" };
+  }
+
+  // Cash goes to 0 (or stays if already 0); we "spent" amount via cash+credit
+  if (bal > 0) {
+    await env.DB.prepare(
+      `UPDATE accounts SET balance = 0, updated_at = datetime('now') WHERE repo_id = ?1`
+    )
+      .bind(repoId)
+      .run();
+  }
+
+  return {
+    ok: true,
+    balance: 0,
+    credit_drawn: shortfall,
+    outstanding: Number(updLim.outstanding_credit),
+  };
+}
+
+async function repayCredit(env, repoId, amount) {
+  amount = Number(amount);
+  if (!(amount > 0)) return { ok: false, error: "amount required" };
+  const lim = await getAgentLimits(env, repoId);
+  const outstanding = Number(lim?.outstanding_credit || 0);
+  if (outstanding <= 0) return { ok: true, repaid: 0, outstanding: 0, already_clear: true };
+  const pay = Math.min(amount, outstanding);
+  await ensureAccount(env, repoId);
+  const deb = await env.DB.prepare(
+    `UPDATE accounts SET balance = balance - ?1, updated_at = datetime('now')
+     WHERE repo_id = ?2 AND balance >= ?1 RETURNING balance`
+  )
+    .bind(pay, repoId)
+    .first();
+  if (!deb) return { ok: false, error: "Insufficient balance to repay credit", code: "insufficient" };
+  await env.DB.prepare(
+    `UPDATE agent_limits
+     SET outstanding_credit = MAX(0, COALESCE(outstanding_credit, 0) - ?2),
+         updated_at = datetime('now')
+     WHERE repo_id = ?1`
+  )
+    .bind(repoId, pay)
+    .run();
+  const after = await getCreditState(env, repoId);
+  return {
+    ok: true,
+    repaid: pay,
+    outstanding: after.outstanding_credit,
+    balance: Number(deb.balance),
+  };
+}
+
+
 
 /* ─── Auth ─── */
 
@@ -1244,6 +1458,16 @@ export default {
         return await handleMeKeysUnsuspend(request, env);
       }
 
+      if (request.method === "GET" && url.pathname === "/api/me/credit") {
+        return await handleMeCreditGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/credit") {
+        return await handleMeCreditSet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/credit/repay") {
+        return await handleMeCreditRepay(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/") {
         return json(request, {
           ok: true,
@@ -1304,6 +1528,8 @@ export default {
             saga_cancel: "POST /api/saga/cancel",
             saga_list: "GET /api/saga",
             saga_get: "GET /api/saga/:id",
+            me_credit: "GET|POST /api/me/credit",
+            me_credit_repay: "POST /api/me/credit/repay",
           },
         });
       }
@@ -2352,16 +2578,8 @@ async function handlePay(request, env) {
     ).bind(toRepo),
   ]);
 
-  const debit = await env.DB.prepare(
-    `UPDATE accounts
-     SET balance = balance - ?1, updated_at = datetime('now')
-     WHERE repo_id = ?2 AND balance >= ?1
-     RETURNING balance`
-  )
-    .bind(amount, fromRepo)
-    .first();
-
-  if (!debit) {
+  const debitRes = await debitWithCredit(env, fromRepo, amount);
+  if (!debitRes.ok) {
     if (idem && wonLock) {
       await env.DB.prepare(`DELETE FROM idempotency WHERE key = ? AND status = 'pending'`)
         .bind(idem)
@@ -2373,7 +2591,13 @@ async function handlePay(request, env) {
     )
       .bind(fromRepo, toRepo, amount, task, Date.now() - t0)
       .run();
-    return bad(request, "Insufficient funds", 402);
+    return bad(request, debitRes.error || "Insufficient funds", debitRes.code === "wallet_locked" ? 403 : 402, {
+      code: debitRes.code || "insufficient",
+      available_credit: debitRes.available_credit,
+    });
+  }
+  const debit = { balance: debitRes.balance };
+  const creditDrawn = debitRes.credit_drawn || 0;
   }
 
   if (traceId) {
@@ -2434,6 +2658,7 @@ async function handlePay(request, env) {
   }
 
   await safetyRecordSpend(env, authUser, fromRepo, amount);
+  await adjustRep(env, fromRepo, CREDIT_REP_SUCCESS_BONUS + Math.min(50, amount * CREDIT_REP_PER_USD), "pay_success");
 
   const rcpt = await issuePayReceipt(env, {
     from_repo: fromRepo,
@@ -2605,16 +2830,15 @@ async function handleEscrowHold(request, env) {
   await ensureAccount(env, fromRepo);
   await ensureAccount(env, toRepo);
 
-  const debit = await env.DB.prepare(
-    `UPDATE accounts
-     SET balance = balance - ?1, updated_at = datetime('now')
-     WHERE repo_id = ?2 AND balance >= ?1
-     RETURNING balance`
-  )
-    .bind(amount, fromRepo)
-    .first();
-
-  if (!debit) return bad(request, "Insufficient funds", 402);
+  const debitRes = await debitWithCredit(env, fromRepo, amount);
+  if (!debitRes.ok) {
+    return bad(request, debitRes.error || "Insufficient funds", debitRes.code === "wallet_locked" ? 403 : 402, {
+      code: debitRes.code || "insufficient",
+      available_credit: debitRes.available_credit,
+    });
+  }
+  const debit = { balance: debitRes.balance };
+  const creditDrawn = debitRes.credit_drawn || 0;
 
   const id = "esc_" + randomId(12);
   const modifier = "+" + ttlSec + " seconds";
@@ -5002,6 +5226,7 @@ async function handleBondSlash(request, env, ctx) {
   }
   if (stmts.length) await env.DB.batch(stmts);
 
+  await adjustRep(env, row.poster_repo, -CREDIT_REP_FAIL_PENALTY, "bond_slashed", id);
   await logBondEvent(env, id, "slashed", {
     actor_repo: authUser.default_repo,
     amount: slashAmt,
@@ -5731,6 +5956,7 @@ async function compensateSagaInternal(env, row, reason, t0, ctx) {
     .bind(row.id, reason || "compensated")
     .run();
 
+  await adjustRep(env, row.owner_repo, -CREDIT_REP_FAIL_PENALTY, "saga_compensated", row.id);
   await logSagaEvent(env, row.id, "compensated", {
     amount: refunded,
     note: reason || "compensated",
@@ -6210,6 +6436,135 @@ async function handleMePolicySet(request, env) {
 }
 
 /* ─── Safety controls (dashboard / API) ─── */
+
+
+async function handleMeCreditGet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) {
+    return json(request, {
+      ok: true,
+      default_repo: null,
+      credit: null,
+      hint: "Bind a default agent first",
+    });
+  }
+  const state = await getCreditState(env, repo);
+  let recent = [];
+  try {
+    const q = await env.DB.prepare(
+      `SELECT delta, score_after, reason, ref_id, created_at
+       FROM rep_events WHERE repo_id = ?1 ORDER BY created_at DESC LIMIT 12`
+    )
+      .bind(repo)
+      .all();
+    recent = q.results || [];
+  } catch (_) {}
+  return json(request, {
+    ok: true,
+    default_repo: repo,
+    credit: state,
+    recent_rep: recent,
+    schema: {
+      credit_limit: "Max outstanding borrow (USD)",
+      outstanding_credit: "Current drawn credit",
+      available_credit: "credit_limit - outstanding",
+      rep_score: "Reputation points (earned on successful activity)",
+      suggested_limit: "rep_score * " + CREDIT_REP_TO_LIMIT_RATIO,
+    },
+  });
+}
+
+async function handleMeCreditSet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) return bad(request, "Bind a default agent first");
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  await ensureAgentLimits(env, repo);
+  const sets = [];
+  const binds = [];
+  if ("credit_limit" in body) {
+    let lim = body.credit_limit;
+    if (lim === null || lim === "") lim = 0;
+    lim = Number(lim);
+    if (!Number.isFinite(lim) || lim < 0 || lim > CREDIT_MAX_LIMIT) {
+      return bad(request, "credit_limit must be 0.." + CREDIT_MAX_LIMIT);
+    }
+    // Cannot set below outstanding
+    const st = await getCreditState(env, repo);
+    if (lim < st.outstanding_credit) {
+      return bad(
+        request,
+        "credit_limit cannot be below outstanding_credit ($" + st.outstanding_credit.toFixed(6) + ")"
+      );
+    }
+    sets.push("credit_limit = ?" + (binds.length + 1));
+    binds.push(lim);
+  }
+  if (!sets.length) return bad(request, "Provide credit_limit");
+  sets.push("updated_at = datetime('now')");
+  binds.push(repo);
+  await env.DB.prepare(
+    `UPDATE agent_limits SET ${sets.join(", ")} WHERE repo_id = ?${binds.length}`
+  )
+    .bind(...binds)
+    .run();
+
+  await logSafetyEvent(env, "credit.updated", {
+    repo_id: repo,
+    user_id: user.id,
+    reason: "dashboard",
+    meta: body,
+  });
+  const state = await getCreditState(env, repo);
+  return json(request, { ok: true, default_repo: repo, credit: state });
+}
+
+async function handleMeCreditRepay(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+  const repo = user.default_repo ? parseRepo(user.default_repo) : null;
+  if (!repo) return bad(request, "Bind a default agent first");
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+  let amount = body.amount != null ? parseAmount(body.amount) : null;
+  if (amount == null) {
+    // repay all possible from balance
+    const acc = await env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?1`)
+      .bind(repo)
+      .first();
+    const st = await getCreditState(env, repo);
+    amount = Math.min(Number(acc?.balance || 0), st.outstanding_credit);
+    amount = Math.round(amount * 1e6) / 1e6;
+  }
+  if (!(amount > 0)) return bad(request, "Nothing to repay or amount invalid");
+
+  const result = await repayCredit(env, repo, amount);
+  if (!result.ok) return bad(request, result.error, result.code === "insufficient" ? 402 : 400);
+  await env.DB.prepare(
+    `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+     VALUES (?1, ?2, ?3, ?4, 'success', 0)`
+  )
+    .bind(repo, "system/credit", result.repaid, "credit-repay")
+    .run()
+    .catch(() => {});
+  return json(request, { ok: true, default_repo: repo, ...result });
+}
+
 
 async function handleMeSafetyGet(request, env) {
   const user = await getSessionUser(request, env);
