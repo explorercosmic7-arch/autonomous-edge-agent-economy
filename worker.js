@@ -8027,8 +8027,7 @@ async function handleCommitList(request, url, env) {
   }
 }
 
-async function expireCommits(env, ctx);
-    try { await expireWorkClaims(env, ctx); } catch (e) { console.log("expire_work", e && e.message); } {
+async function expireCommits(env, ctx) {
   const t0 = Date.now();
   let expired = 0;
   let refundedTotal = 0;
