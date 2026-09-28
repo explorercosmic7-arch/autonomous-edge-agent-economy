@@ -1740,10 +1740,8 @@ export default {
         } catch (err) {
           console.error("saga-expire failed:", err && err.message ? err.message : err);
         }
-      })
         try {
           const cm = await expireCommits(env, ctx);
-    try { await expireWorkClaims(env, ctx); } catch (e) { console.log("expire_work", e && e.message); };
           console.log(
             JSON.stringify({
               cron: "commit-expire",
@@ -1753,7 +1751,20 @@ export default {
           );
         } catch (err) {
           console.error("commit-expire failed:", err && err.message ? err.message : err);
-        }()
+        }
+        try {
+          const wk = await expireWorkClaims(env, ctx);
+          console.log(
+            JSON.stringify({
+              cron: "work-expire",
+              scheduledTime: event.scheduledTime,
+              ...(wk || {}),
+            })
+          );
+        } catch (err) {
+          console.error("work-expire failed:", err && err.message ? err.message : err);
+        }
+      })()
     );
   },
 };
