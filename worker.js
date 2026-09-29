@@ -2732,7 +2732,6 @@ async function handlePay(request, env) {
   }
   const debit = { balance: debitRes.balance };
   const creditDrawn = debitRes.credit_drawn || 0;
-  }
 
   if (traceId) {
     await ensureTrace(env, traceId, {
