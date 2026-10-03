@@ -1303,6 +1303,141 @@ async function pruneTelemetry(env) {
   return out;
 }
 
+
+/* ─── Sandbox D1 cleanup (ADMIN_CLEANUP_SECRET required) ───
+ * Temporary while AgentPay is in testing. Remove before real-user production.
+ * Does NOT drop schema. Does NOT delete users / sessions / api_keys by default.
+ * Clears ledger noise, held instruments, telemetry. Resets non-system balances to 0.
+ */
+async function handleAdminSandboxCleanup(request, env) {
+  const t0 = Date.now();
+  const secret = env.ADMIN_CLEANUP_SECRET;
+  if (!secret || String(secret).length < 16) {
+    return bad(
+      request,
+      "Cleanup disabled: set ADMIN_CLEANUP_SECRET (16+ chars) in Worker secrets",
+      503,
+      { code: "cleanup_disabled" }
+    );
+  }
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+
+  const provided =
+    (request.headers.get("X-Admin-Cleanup-Key") || "").trim() ||
+    String(body.secret || body.key || "").trim();
+
+  if (!provided || provided !== String(secret)) {
+    return bad(request, "Invalid cleanup key", 403, { code: "bad_cleanup_key" });
+  }
+
+  // Explicit acknowledge required so accidental calls fail closed
+  if (body.confirm !== true && body.confirm !== "SANDBOX_RESET") {
+    return bad(
+      request,
+      'Send JSON { "secret":"…", "confirm": true } or confirm: "SANDBOX_RESET"',
+      400,
+      { code: "confirm_required" }
+    );
+  }
+
+  const results = {};
+  async function wipe(label, sql) {
+    try {
+      const r = await env.DB.prepare(sql).run();
+      results[label] = { ok: true, changes: (r.meta && r.meta.changes) || 0 };
+    } catch (e) {
+      results[label] = { ok: false, error: (e && e.message) || String(e) };
+    }
+  }
+
+  // Telemetry / noise (safe)
+  await wipe("velocity_events", `DELETE FROM velocity_events`);
+  await wipe("safety_events", `DELETE FROM safety_events`);
+  await wipe("rate_limits", `DELETE FROM rate_limits`);
+  await wipe("webhook_deliveries", `DELETE FROM webhook_deliveries`);
+  await wipe("idempotency", `DELETE FROM idempotency`);
+  await wipe("rep_events", `DELETE FROM rep_events`);
+
+  // Money instruments + ledger (sandbox)
+  await wipe("transactions", `DELETE FROM transactions`);
+  await wipe("escrows", `DELETE FROM escrows`);
+  await wipe("streams", `DELETE FROM streams`);
+  await wipe("sub_wallets", `DELETE FROM sub_wallets`);
+  await wipe("payment_receipts", `DELETE FROM payment_receipts`);
+  await wipe("payment_commits", `DELETE FROM payment_commits`);
+  await wipe("commit_events", `DELETE FROM commit_events`);
+  await wipe("capability_tickets", `DELETE FROM capability_tickets`);
+  await wipe("ticket_events", `DELETE FROM ticket_events`);
+  await wipe("intent_bonds", `DELETE FROM intent_bonds`);
+  await wipe("bond_events", `DELETE FROM bond_events`);
+  await wipe("payment_sagas", `DELETE FROM payment_sagas`);
+  await wipe("saga_steps", `DELETE FROM saga_steps`);
+  await wipe("saga_events", `DELETE FROM saga_events`);
+  await wipe("netting_runs", `DELETE FROM netting_runs`);
+  await wipe("netting_settlements", `DELETE FROM netting_settlements`);
+  await wipe("clearing_batches", `DELETE FROM clearing_batches`);
+  await wipe("clearing_positions", `DELETE FROM clearing_positions`);
+  await wipe("work_claims", `DELETE FROM work_claims`);
+  await wipe("work_attestations", `DELETE FROM work_attestations`);
+  await wipe("work_events", `DELETE FROM work_events`);
+  await wipe("continuity_sessions", `DELETE FROM continuity_sessions`);
+  await wipe("continuity_events", `DELETE FROM continuity_events`);
+
+  // Agent index (re-scan after clean)
+  await wipe("agents", `DELETE FROM agents`);
+  await wipe("agent_capabilities", `DELETE FROM agent_capabilities`);
+
+  // Reset spend counters / unlock; keep policy rows
+  await wipe(
+    "agent_limits_reset",
+    `UPDATE agent_limits SET
+       daily_spent = 0,
+       daily_window_start = NULL,
+       outstanding_credit = 0,
+       locked = 0,
+       locked_at = NULL,
+       lock_reason = NULL,
+       updated_at = datetime('now')`
+  );
+
+  // Zero balances for non-system wallets (keep account rows)
+  await wipe(
+    "accounts_zero",
+    `UPDATE accounts SET balance = 0, updated_at = datetime('now')
+     WHERE repo_id NOT LIKE 'system/%'`
+  );
+
+  // Optional hard: body.wipe_keys === true revokes API keys (still keeps rows)
+  if (body.wipe_keys === true) {
+    await wipe(
+      "api_keys_revoke",
+      `UPDATE api_keys SET revoked_at = datetime('now')
+       WHERE revoked_at IS NULL`
+    );
+  }
+
+  const okTables = Object.values(results).filter((r) => r.ok).length;
+  const failTables = Object.values(results).filter((r) => !r.ok).length;
+
+  return json(request, {
+    ok: true,
+    sandbox: true,
+    message:
+      "Sandbox ledger cleaned. Users/sessions kept. Re-fund agents via Faucet. Remove this endpoint before real users.",
+    tables_ok: okTables,
+    tables_failed_or_missing: failTables,
+    results,
+    latency_ms: Date.now() - t0,
+  });
+}
+
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1400,6 +1535,11 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/escrow") {
         return await handleEscrowList(request, url, env);
       }
+      
+      if (request.method === "POST" && url.pathname === "/api/admin/sandbox-cleanup") {
+        return await handleAdminSandboxCleanup(request, env);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/escrow/expire-now") {
         const authUser = await getAuthUser(request, env);
         if (!authUser) return bad(request, "Sign in or API key required", 401);
