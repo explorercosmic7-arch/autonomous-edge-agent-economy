@@ -3,7 +3,7 @@
  * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
  *
  * INVENTORY (do not delete):
- * Auth:     GET /api/auth/google, GET /api/auth/google/callback, 
+ * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
  *           GET /api/auth/github, GET /api/auth/github/callback,
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance,
@@ -2682,6 +2682,17 @@ async function waitForIdem(env, key) {
 
 async function handlePay(request, env, ctx) {
   const t0 = Date.now();
+  const waitUntil = (p) => {
+    try {
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(Promise.resolve(p).catch((e) => console.log("pay_bg", e && e.message)));
+        return;
+      }
+    } catch (_) {}
+    // no ctx: still fire-and-forget without blocking too long
+    Promise.resolve(p).catch(() => {});
+  };
+
   let body;
   try {
     body = await request.json();
@@ -2716,7 +2727,9 @@ async function handlePay(request, env, ctx) {
     String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
       .trim()
       .slice(0, 128) || null;
-  const traceId = parseTraceId(body.trace_id || body.traceId || request.headers.get("X-Trace-Id"));
+  const traceId = parseTraceId(
+    body.trace_id || body.traceId || request.headers.get("X-Trace-Id")
+  );
 
   if (!fromRepo) {
     return bad(
@@ -2728,7 +2741,6 @@ async function handlePay(request, env, ctx) {
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
 
-  // Safety: suspended key / wallet lock / policy / daily budget / velocity
   if (authUser) {
     authUser._policyCtx = { to_repo: toRepo, task };
     const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
@@ -2762,7 +2774,6 @@ async function handlePay(request, env, ctx) {
     }
   }
 
-  // Ensure both accounts exist (single batch)
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO accounts (repo_id, balance) VALUES (?, 0) ON CONFLICT(repo_id) DO NOTHING`
@@ -2772,15 +2783,11 @@ async function handlePay(request, env, ctx) {
     ).bind(toRepo),
   ]);
 
-  /*
-   * FAST PATH — pure cash debit (no credit draw):
-   * One UPDATE with balance guard + credit recipient + ledger insert in one batch.
-   * Falls back to debitWithCredit only when cash is short.
-   */
   let fromBalance = null;
   let creditDrawn = 0;
   let usedCredit = false;
 
+  // Fast cash path
   const cashDebit = await env.DB.prepare(
     `UPDATE accounts
      SET balance = balance - ?1, updated_at = datetime('now')
@@ -2793,23 +2800,24 @@ async function handlePay(request, env, ctx) {
   if (cashDebit) {
     fromBalance = Number(cashDebit.balance);
   } else {
-    // Slow path: reputation-backed credit draw
     const debitRes = await debitWithCredit(env, fromRepo, amount);
     if (!debitRes.ok) {
       if (idem && wonLock) {
-        await env.DB.prepare(`DELETE FROM idempotency WHERE key = ? AND status = 'pending'`)
+        await env.DB.prepare(
+          `DELETE FROM idempotency WHERE key = ? AND status = 'pending'`
+        )
           .bind(idem)
-          .run();
+          .run()
+          .catch(() => {});
       }
-      // Fire-and-forget failed ledger row (don't block error response)
-      const failIns = env.DB.prepare(
-        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
-         VALUES (?1, ?2, ?3, ?4, 'failed', ?5)`
-      )
-        .bind(fromRepo, toRepo, amount, task, Date.now() - t0)
-        .run();
-      if (ctx && ctx.waitUntil) ctx.waitUntil(failIns.catch(() => {}));
-      else await failIns.catch(() => {});
+      waitUntil(
+        env.DB.prepare(
+          `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+           VALUES (?1, ?2, ?3, ?4, 'failed', ?5)`
+        )
+          .bind(fromRepo, toRepo, amount, task, Date.now() - t0)
+          .run()
+      );
       return bad(
         request,
         debitRes.error || "Insufficient funds",
@@ -2826,7 +2834,6 @@ async function handlePay(request, env, ctx) {
   }
 
   if (traceId) {
-    // Best-effort; do not block settlement
     try {
       await ensureTrace(env, traceId, {
         label: task || "pay",
@@ -2839,8 +2846,29 @@ async function handlePay(request, env, ctx) {
   let toBalance = null;
   let txId = null;
 
+  async function compensateDebit() {
+    try {
+      await env.DB.prepare(
+        `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
+      )
+        .bind(amount, fromRepo)
+        .run();
+      if (usedCredit && creditDrawn > 0) {
+        await env.DB.prepare(
+          `UPDATE agent_limits
+           SET outstanding_credit = MAX(0, COALESCE(outstanding_credit, 0) - ?2),
+               updated_at = datetime('now')
+           WHERE repo_id = ?1`
+        )
+          .bind(fromRepo, creditDrawn)
+          .run();
+      }
+    } catch (e) {
+      console.log("pay_compensate_err", e && e.message);
+    }
+  }
+
   try {
-    // Credit + ledger in one batch; prefer RETURNING on both when available
     const batchRes = await env.DB.batch([
       env.DB.prepare(
         `UPDATE accounts
@@ -2854,13 +2882,21 @@ async function handlePay(request, env, ctx) {
          RETURNING id`
       ).bind(fromRepo, toRepo, amount, task, latency, idem, traceId),
     ]);
-    const creditRow = batchRes?.[0]?.results?.[0] || batchRes?.[0]?.result?.[0];
-    const txRow = batchRes?.[1]?.results?.[0] || batchRes?.[1]?.result?.[0];
-    // D1 batch shape varies — normalize
+    // D1 batch: array of { results: [...] }
+    const r0 = batchRes && batchRes[0];
+    const r1 = batchRes && batchRes[1];
+    const creditRow =
+      (r0 && r0.results && r0.results[0]) ||
+      (r0 && r0.result && r0.result[0]) ||
+      null;
+    const txRow =
+      (r1 && r1.results && r1.results[0]) ||
+      (r1 && r1.result && r1.result[0]) ||
+      null;
     if (creditRow && creditRow.balance != null) toBalance = Number(creditRow.balance);
     if (txRow && txRow.id != null) txId = txRow.id;
   } catch (e) {
-    // Fallback: no RETURNING / no trace_id column
+    // Fallback without RETURNING / without trace_id column
     try {
       await env.DB.batch([
         env.DB.prepare(
@@ -2874,27 +2910,12 @@ async function handlePay(request, env, ctx) {
         ).bind(fromRepo, toRepo, amount, task, latency, idem),
       ]);
     } catch (e2) {
-      // Critical: debit already applied — attempt compensating credit back to sender
       console.log("pay_settle_error", e2 && e2.message);
-      await env.DB.prepare(
-        `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
-      )
-        .bind(amount, fromRepo)
-        .run()
-        .catch(() => {});
-      if (usedCredit && creditDrawn > 0) {
-        await env.DB.prepare(
-          `UPDATE agent_limits
-           SET outstanding_credit = MAX(0, COALESCE(outstanding_credit, 0) - ?2),
-               updated_at = datetime('now')
-           WHERE repo_id = ?1`
-        )
-          .bind(fromRepo, creditDrawn)
-          .run()
-          .catch(() => {});
-      }
+      await compensateDebit();
       if (idem && wonLock) {
-        await env.DB.prepare(`DELETE FROM idempotency WHERE key = ? AND status = 'pending'`)
+        await env.DB.prepare(
+          `DELETE FROM idempotency WHERE key = ? AND status = 'pending'`
+        )
           .bind(idem)
           .run()
           .catch(() => {});
@@ -2903,14 +2924,34 @@ async function handlePay(request, env, ctx) {
     }
   }
 
-  // If to-balance not returned, skip extra read (latency win); client can GET /api/balance
   if (toBalance == null) {
-    // Single cheap read only for response completeness
-    const row = await env.DB.prepare(`SELECT balance FROM accounts WHERE repo_id = ?1`)
+    const row = await env.DB.prepare(
+      `SELECT balance FROM accounts WHERE repo_id = ?1`
+    )
       .bind(toRepo)
       .first()
       .catch(() => null);
     if (row) toBalance = Number(row.balance);
+  }
+
+  // Receipt before response so clients always get receipt_id when possible
+  let receiptId = null;
+  let receiptSig = null;
+  try {
+    const rcpt = await issuePayReceipt(env, {
+      from_repo: fromRepo,
+      to_repo: toRepo,
+      amount,
+      task,
+      status: "success",
+      tx_id: txId,
+    });
+    if (rcpt) {
+      receiptId = rcpt.id;
+      receiptSig = rcpt.signature;
+    }
+  } catch (e) {
+    console.log("pay_receipt_err", e && e.message);
   }
 
   const payload = {
@@ -2929,85 +2970,71 @@ async function handlePay(request, env, ctx) {
       [toRepo]: toBalance,
     },
   };
-
-  /*
-   * POST-COMMIT (non-critical path)
-   * velocity + daily spent + rep + receipt + idempotency finalize
-   * Prefer waitUntil so the client gets the money move ASAP.
-   */
-  const postCommit = (async () => {
-    try {
-      // Batch telemetry: velocity event + daily spent bump
-      const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
-      const today = new Date().toISOString().slice(0, 10);
-      await env.DB.batch([
-        env.DB.prepare(
-          `INSERT INTO velocity_events (id, repo_id, api_key_id, amount, created_at)
-           VALUES (?1, ?2, ?3, ?4, datetime('now'))`
-        ).bind(randomId(12), fromRepo, keyId || null, Number(amount) || 0),
-        env.DB.prepare(
-          `INSERT INTO agent_limits (repo_id, daily_spent, daily_window_start, updated_at)
-           VALUES (?1, ?2, ?3, datetime('now'))
-           ON CONFLICT(repo_id) DO UPDATE SET
-             daily_spent = CASE
-               WHEN substr(COALESCE(agent_limits.daily_window_start, ''), 1, 10) = ?3
-               THEN COALESCE(agent_limits.daily_spent, 0) + ?2
-               ELSE ?2
-             END,
-             daily_window_start = ?3,
-             updated_at = datetime('now')`
-        ).bind(fromRepo, Number(amount) || 0, today),
-      ]).catch(() => {});
-
-      // Reputation (best-effort)
-      await adjustRep(
-        env,
-        fromRepo,
-        CREDIT_REP_SUCCESS_BONUS + Math.min(50, amount * CREDIT_REP_PER_USD),
-        "pay_success"
-      ).catch(() => {});
-
-      // Receipt (HMAC) — optional
-      const rcpt = await issuePayReceipt(env, {
-        from_repo: fromRepo,
-        to_repo: toRepo,
-        amount,
-        task,
-        status: "success",
-        tx_id: txId,
-      }).catch(() => null);
-      if (rcpt) {
-        payload.receipt_id = rcpt.id;
-        payload.receipt_signature = rcpt.signature;
-      }
-
-      // Idempotency finalize last (includes receipt ids if issued)
-      if (idem && wonLock) {
-        await env.DB.prepare(
-          `UPDATE idempotency
-           SET status = 'success', result_json = ?1, updated_at = datetime('now')
-           WHERE key = ?2`
-        )
-          .bind(JSON.stringify(payload), idem)
-          .run()
-          .catch(() => {});
-      }
-    } catch (e) {
-      console.log("pay_post_commit", e && e.message);
-    }
-  })();
-
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(postCommit);
-    // Small yield so receipt often lands before response when DO is warm
-    // (still non-blocking for cold path — we return immediately)
-  } else {
-    await postCommit;
+  if (receiptId) {
+    payload.receipt_id = receiptId;
+    payload.receipt_signature = receiptSig;
   }
+
+  // Post-commit telemetry + idempotency (non-blocking)
+  const keyId =
+    authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
+  const today = new Date().toISOString().slice(0, 10);
+  const payloadJson = JSON.stringify(payload);
+
+  waitUntil(
+    (async () => {
+      try {
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO velocity_events (id, repo_id, api_key_id, amount, created_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))`
+          ).bind(randomId(12), fromRepo, keyId || null, Number(amount) || 0),
+          env.DB.prepare(
+            `UPDATE agent_limits
+             SET daily_spent = CASE
+                   WHEN substr(COALESCE(daily_window_start, ''), 1, 10) = ?3
+                   THEN COALESCE(daily_spent, 0) + ?2
+                   ELSE ?2
+                 END,
+                 daily_window_start = ?3,
+                 updated_at = datetime('now')
+             WHERE repo_id = ?1`
+          ).bind(fromRepo, Number(amount) || 0, today),
+        ]);
+      } catch (_) {
+        // ensure row then retry daily bump
+        try {
+          await ensureAgentLimits(env, fromRepo);
+          await addDailySpent(env, fromRepo, amount);
+          await recordVelocityEvent(env, fromRepo, amount, keyId);
+        } catch (e2) {
+          console.log("pay_telemetry", e2 && e2.message);
+        }
+      }
+      try {
+        await adjustRep(
+          env,
+          fromRepo,
+          CREDIT_REP_SUCCESS_BONUS + Math.min(50, amount * CREDIT_REP_PER_USD),
+          "pay_success"
+        );
+      } catch (_) {}
+      if (idem && wonLock) {
+        try {
+          await env.DB.prepare(
+            `UPDATE idempotency
+             SET status = 'success', result_json = ?1, updated_at = datetime('now')
+             WHERE key = ?2`
+          )
+            .bind(payloadJson, idem)
+            .run();
+        } catch (_) {}
+      }
+    })()
+  );
 
   return json(request, payload);
 }
-
 
 
 async function handleFund(request, env) {
@@ -9287,4 +9314,3 @@ async function expireContinuitySessions(env, ctx) {
   }
   return { recovered, bond_total: bondTotal, latency_ms: Date.now() - t0 };
 }
-
