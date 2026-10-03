@@ -9,7 +9,7 @@
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance,
  *           GET /api/me/github/repos, GET /api/me/gitlab/repos, GET /api/me/repos
- * Agents:   GET /api/agents, GET /api/agents/search, POST /api/agents/scan
+ * Agents:   GET /api/agents, GET /api/agents/search, GET /api/agents/rank, POST /api/agents/scan
  *           Capabilities-aware index (AP-Capabilities / wrangler.toml)
  * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
  * Webhook:  GET|POST /api/me/webhook, POST /api/me/webhook/clear
@@ -1358,6 +1358,9 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/agents/search") {
         return await handleAgentsSearch(request, url, env);
       }
+      if (request.method === "GET" && url.pathname === "/api/agents/rank") {
+        return await handleAgentsRank(request, url, env);
+      }
       if (request.method === "POST" && url.pathname === "/api/agents/scan") {
         return await handleAgentsScan(request, env, ctx);
       }
@@ -1649,6 +1652,7 @@ export default {
             me_repos: "GET /api/me/repos",
             agents: "GET /api/agents",
             agents_search: "GET /api/agents/search",
+            agents_rank: "GET /api/agents/rank",
             agents_scan: "POST /api/agents/scan",
             me_keys: "GET|POST /api/me/keys",
             me_webhook: "GET|POST /api/me/webhook",
@@ -3158,40 +3162,47 @@ async function handleAgentsList(request, url, env) {
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 50), 1), 200);
   const provider = (url.searchParams.get("provider") || "").trim().toLowerCase();
   const hireable = url.searchParams.get("hireable");
+  const capability = (url.searchParams.get("capability") || url.searchParams.get("q") || "")
+    .trim()
+    .toLowerCase();
+  const sort = (url.searchParams.get("sort") || "rank").toLowerCase();
 
-  let sql = `SELECT repo_id, provider, display_name, description,
-                    capabilities_json, capabilities_text, source, hireable, indexed_at
-             FROM agent_index WHERE 1=1`;
+  let sql = `SELECT a.repo_id, a.provider, a.display_name, a.description,
+                    a.capabilities_json, a.capabilities_text, a.source, a.hireable, a.indexed_at,
+                    COALESCE(l.rep_score, 0) AS rep_score,
+                    COALESCE(l.locked, 0) AS locked,
+                    COALESCE(acc.balance, 0) AS balance
+             FROM agent_index a
+             LEFT JOIN agent_limits l ON l.repo_id = a.repo_id
+             LEFT JOIN accounts acc ON acc.repo_id = a.repo_id
+             WHERE 1=1`;
   const binds = [];
   if (provider === "github" || provider === "gitlab") {
-    sql += ` AND provider = ?`;
+    sql += ` AND a.provider = ?`;
     binds.push(provider);
   }
   if (hireable === "1" || hireable === "true") {
-    sql += ` AND hireable = 1`;
+    sql += ` AND a.hireable = 1`;
   }
-  sql += ` ORDER BY indexed_at DESC LIMIT ?`;
-  binds.push(limit);
+  if (capability) {
+    sql += ` AND (a.capabilities_text LIKE ? OR a.capabilities_json LIKE ? OR a.repo_id LIKE ?)`;
+    const like = "%" + capability + "%";
+    binds.push(like, like, like);
+  }
+  sql += ` ORDER BY a.indexed_at DESC LIMIT ?`;
+  binds.push(Math.min(limit * 3, 300));
 
   try {
     const { results } = await env.DB.prepare(sql).bind(...binds).all();
-    const agents = (results || []).map((r) => {
-      let capabilities = [];
-      try {
-        capabilities = JSON.parse(r.capabilities_json || "[]");
-      } catch (_) {}
-      return {
-        repo_id: r.repo_id,
-        provider: r.provider,
-        display_name: r.display_name,
-        description: r.description,
-        capabilities,
-        source: r.source,
-        hireable: Number(r.hireable) === 1,
-        indexed_at: r.indexed_at,
-      };
+    let agents = (results || []).map((r) => scoreAgentRow(r, capability));
+    agents = sortAgents(agents, sort).slice(0, limit);
+    return json(request, {
+      ok: true,
+      count: agents.length,
+      sort,
+      query: capability || null,
+      agents,
     });
-    return json(request, { ok: true, count: agents.length, agents });
   } catch (e) {
     return bad(
       request,
@@ -3207,59 +3218,182 @@ async function handleAgentsSearch(request, url, env) {
     .trim()
     .toLowerCase();
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 20), 1), 100);
+  const sort = (url.searchParams.get("sort") || "rank").toLowerCase();
 
   if (!capability) {
     return bad(request, "capability or q required (e.g. model/vision)");
   }
 
-  // Fast path: LIKE on denormalized capabilities_text
   try {
     const { results } = await env.DB.prepare(
-      `SELECT repo_id, provider, display_name, description,
-              capabilities_json, capabilities_text, source, hireable, indexed_at
-       FROM agent_index
-       WHERE hireable = 1
+      `SELECT a.repo_id, a.provider, a.display_name, a.description,
+              a.capabilities_json, a.capabilities_text, a.source, a.hireable, a.indexed_at,
+              COALESCE(l.rep_score, 0) AS rep_score,
+              COALESCE(l.locked, 0) AS locked,
+              COALESCE(acc.balance, 0) AS balance
+       FROM agent_index a
+       LEFT JOIN agent_limits l ON l.repo_id = a.repo_id
+       LEFT JOIN accounts acc ON acc.repo_id = a.repo_id
+       WHERE a.hireable = 1
          AND (
-           capabilities_text LIKE ?1
-           OR capabilities_json LIKE ?2
-           OR repo_id LIKE ?3
+           a.capabilities_text LIKE ?1
+           OR a.capabilities_json LIKE ?2
+           OR a.repo_id LIKE ?3
          )
-       ORDER BY indexed_at DESC
+       ORDER BY a.indexed_at DESC
        LIMIT ?4`
     )
-      .bind("%" + capability + "%", "%" + capability + "%", "%" + capability + "%", limit)
+      .bind("%" + capability + "%", "%" + capability + "%", "%" + capability + "%", Math.min(limit * 3, 200))
       .all();
 
-    const agents = (results || []).map((r) => {
-      let capabilities = [];
-      try {
-        capabilities = JSON.parse(r.capabilities_json || "[]");
-      } catch (_) {}
-      return {
-        repo_id: r.repo_id,
-        provider: r.provider,
-        display_name: r.display_name,
-        description: r.description,
-        capabilities,
-        source: r.source,
-        hireable: Number(r.hireable) === 1,
-        indexed_at: r.indexed_at,
-        match: capability,
-      };
-    });
+    let agents = (results || []).map((r) => scoreAgentRow(r, capability));
+    agents = sortAgents(agents, sort).slice(0, limit);
 
     return json(request, {
       ok: true,
       query: capability,
       count: agents.length,
+      sort,
       agents,
-      latency_hint_ms: "index lookup — no repo tree scan",
+      latency_hint_ms: "ranked index lookup — no repo tree scan",
     });
   } catch (e) {
     return bad(request, "Search failed: " + (e.message || e), 500);
   }
 }
 
+/** Public ranked discovery for humans + agents (Find Agents page). */
+async function handleAgentsRank(request, url, env) {
+  await ensureAgentIndexTable(env).catch(() => {});
+  const capability = (url.searchParams.get("capability") || url.searchParams.get("q") || "")
+    .trim()
+    .toLowerCase();
+  const provider = (url.searchParams.get("provider") || "").trim().toLowerCase();
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 24), 1), 100);
+  const hireableOnly = url.searchParams.get("hireable") !== "0";
+
+  let sql = `SELECT a.repo_id, a.provider, a.display_name, a.description,
+                    a.capabilities_json, a.capabilities_text, a.source, a.hireable, a.indexed_at,
+                    COALESCE(l.rep_score, 0) AS rep_score,
+                    COALESCE(l.locked, 0) AS locked,
+                    COALESCE(l.credit_limit, 0) AS credit_limit,
+                    COALESCE(acc.balance, 0) AS balance
+             FROM agent_index a
+             LEFT JOIN agent_limits l ON l.repo_id = a.repo_id
+             LEFT JOIN accounts acc ON acc.repo_id = a.repo_id
+             WHERE 1=1`;
+  const binds = [];
+  if (hireableOnly) {
+    sql += ` AND a.hireable = 1`;
+  }
+  if (provider === "github" || provider === "gitlab") {
+    sql += ` AND a.provider = ?`;
+    binds.push(provider);
+  }
+  if (capability) {
+    sql += ` AND (a.capabilities_text LIKE ? OR a.capabilities_json LIKE ? OR a.repo_id LIKE ? OR a.description LIKE ?)`;
+    const like = "%" + capability + "%";
+    binds.push(like, like, like, like);
+  }
+  sql += ` ORDER BY a.indexed_at DESC LIMIT ?`;
+  binds.push(Math.min(limit * 4, 400));
+
+  try {
+    const t0 = Date.now();
+    const { results } = await env.DB.prepare(sql).bind(...binds).all();
+    let agents = (results || []).map((r) => scoreAgentRow(r, capability));
+    agents = sortAgents(agents, "rank").slice(0, limit);
+    return json(request, {
+      ok: true,
+      query: capability || null,
+      provider: provider || null,
+      count: agents.length,
+      agents,
+      algorithm: {
+        factors: [
+          "capability_match (exact > prefix > substring)",
+          "rep_score from agent_limits",
+          "hireable flag",
+          "not locked",
+          "indexed recency",
+          "soft balance signal",
+        ],
+        note: "Rank is advisory for discovery; always verify work/attestations before large pays.",
+      },
+      latency_ms: Date.now() - t0,
+    });
+  } catch (e) {
+    return bad(request, "Rank failed: " + (e.message || e), 500);
+  }
+}
+
+function scoreAgentRow(r, capability) {
+  let capabilities = [];
+  try {
+    capabilities = JSON.parse(r.capabilities_json || "[]");
+  } catch (_) {}
+  const caps = capabilities.map((c) => String(c).toLowerCase());
+  const q = (capability || "").toLowerCase();
+  let matchScore = 0;
+  if (q) {
+    if (caps.some((c) => c === q)) matchScore = 100;
+    else if (caps.some((c) => c.startsWith(q) || q.startsWith(c))) matchScore = 70;
+    else if (caps.some((c) => c.includes(q))) matchScore = 45;
+    else if (String(r.repo_id || "").toLowerCase().includes(q)) matchScore = 25;
+    else if (String(r.description || "").toLowerCase().includes(q)) matchScore = 15;
+    else matchScore = 5;
+  } else {
+    matchScore = 20 + Math.min(30, caps.length * 3);
+  }
+  const rep = Number(r.rep_score || 0);
+  const locked = Number(r.locked) === 1;
+  const hireable = Number(r.hireable) === 1;
+  const balance = Number(r.balance || 0);
+  // Weighted rank 0–100 scale (approx)
+  let rank =
+    matchScore * 0.45 +
+    Math.min(40, rep * 0.04) +
+    (hireable ? 12 : 0) +
+    (locked ? -25 : 8) +
+    Math.min(8, Math.log10(balance + 1) * 3);
+  rank = Math.round(Math.max(0, Math.min(100, rank)) * 10) / 10;
+  return {
+    repo_id: r.repo_id,
+    provider: r.provider,
+    display_name: r.display_name,
+    description: r.description,
+    capabilities,
+    source: r.source,
+    hireable,
+    locked,
+    rep_score: rep,
+    balance,
+    match_score: matchScore,
+    rank_score: rank,
+    indexed_at: r.indexed_at,
+    match: q || undefined,
+  };
+}
+
+function sortAgents(agents, sort) {
+  const s = (sort || "rank").toLowerCase();
+  const copy = agents.slice();
+  if (s === "rep") {
+    copy.sort((a, b) => (b.rep_score || 0) - (a.rep_score || 0) || (b.rank_score || 0) - (a.rank_score || 0));
+  } else if (s === "recent") {
+    copy.sort((a, b) => String(b.indexed_at || "").localeCompare(String(a.indexed_at || "")));
+  } else if (s === "name") {
+    copy.sort((a, b) => String(a.repo_id).localeCompare(String(b.repo_id)));
+  } else {
+    copy.sort(
+      (a, b) =>
+        (b.rank_score || 0) - (a.rank_score || 0) ||
+        (b.match_score || 0) - (a.match_score || 0) ||
+        (b.rep_score || 0) - (a.rep_score || 0)
+    );
+  }
+  return copy;
+}
 
 async function handleMeBalance(request, env) {
   const user = await getAuthUser(request, env);
