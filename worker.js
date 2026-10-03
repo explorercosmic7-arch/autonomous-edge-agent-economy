@@ -52,6 +52,7 @@
  * Continuity: POST /api/continuity/open|beat|close|recover, GET /api/continuity
  * D1:       continuity_sessions + continuity_events (d1-continuity-migration.sql)
  * Cron:     expireContinuitySessions
+ * Admin:    POST /api/admin/sandbox-cleanup (ADMIN_CLEANUP_SECRET + confirm)
  */
 
 
@@ -223,7 +224,7 @@ function corsHeaders(request) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, X-Admin-Cleanup-Key",
     "Access-Control-Allow-Credentials": "true",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
