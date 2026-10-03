@@ -5,6 +5,7 @@
  * INVENTORY (do not delete):
  * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
  *           GET /api/auth/github, GET /api/auth/github/callback,
+ *           GET /api/auth/gitlab, GET /api/auth/gitlab/callback,
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance,
  *           GET /api/me/github/repos
@@ -17,7 +18,7 @@
  *           POST /api/escrow/expire-now
  * Stream:   POST /api/stream/start|meter|stop, GET /api/stream
  * Cron:     scheduled() → expireHeldEscrows (+ webhook escrow.expired)
- * D1 users: github_access_token, github_login (optional ALTER)
+ * D1 users: github_access_token, github_login; gitlab_access_token, gitlab_username (optional ALTER)
  * D1:       streams table (d1-stream-migration.sql)
  * D1:       agent_limits, velocity_events, safety_events; api_keys.suspended_at
  * Safety:   gate + /api/me/safety + webhooks wallet.locked/agent.runaway_loop
@@ -1321,6 +1322,12 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/auth/github/callback") {
         return await handleAuthGithubCallback(request, env, url);
       }
+      if (request.method === "GET" && url.pathname === "/api/auth/gitlab") {
+        return handleAuthGitlabStart(request, env, url);
+      }
+      if (request.method === "GET" && url.pathname === "/api/auth/gitlab/callback") {
+        return await handleAuthGitlabCallback(request, env, url);
+      }
       if (request.method === "GET" && url.pathname === "/api/auth/me") {
         return await handleAuthMe(request, env);
       }
@@ -2131,6 +2138,195 @@ async function handleAuthGithubCallback(request, env, url) {
         .bind(githubUserId, email, name, picture, accessToken, ghLogin)
         .run();
       sessionUserId = githubUserId;
+    }
+  }
+
+  const sessionId = randomId(24);
+  const expiresAt = new Date(Date.now() + SESSION_DAYS * 864e5).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)`
+  )
+    .bind(sessionId, sessionUserId, expiresAt)
+    .run();
+
+  const maxAge = SESSION_DAYS * 86400;
+  const headers = new Headers({ Location: DASHBOARD_URL });
+  headers.append("Set-Cookie", sessionCookie(sessionId, maxAge));
+  headers.append(
+    "Set-Cookie",
+    "a2a_oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+  );
+  return new Response(null, { status: 302, headers });
+}
+
+
+/* ─── GitLab OAuth ─── */
+
+function handleAuthGitlabStart(request, env, url) {
+  const clientId = env.GITLAB_CLIENT_ID;
+  if (!clientId) return bad(request, "GITLAB_CLIENT_ID not configured on Worker", 500);
+
+  const redirectUri = `${url.origin}/api/auth/gitlab/callback`;
+  const state = randomId(16);
+  const params = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    response_type: "code",
+    scope: "read_user",
+    state,
+  });
+  const headers = new Headers({
+    Location: `https://gitlab.com/oauth/authorize?${params}`,
+    "Set-Cookie": `a2a_oauth_state=${state}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`,
+  });
+  return new Response(null, { status: 302, headers });
+}
+
+async function handleAuthGitlabCallback(request, env, url) {
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const err = url.searchParams.get("error");
+  if (err) {
+    return Response.redirect(
+      `${DASHBOARD_URL}?auth_error=${encodeURIComponent(err)}`,
+      302
+    );
+  }
+  if (!code || !state) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=missing_code`, 302);
+  }
+
+  const blocked = await rejectIfAlreadySignedIn(request, env);
+  if (blocked) return blocked;
+
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  if (!cookies.a2a_oauth_state || cookies.a2a_oauth_state !== state) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=bad_state`, 302);
+  }
+
+  const clientId = env.GITLAB_CLIENT_ID;
+  const clientSecret = env.GITLAB_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=server_config`, 302);
+  }
+
+  const redirectUri = `${url.origin}/api/auth/gitlab/callback`;
+  const tokenRes = await fetch("https://gitlab.com/oauth/token", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      code,
+      grant_type: "authorization_code",
+      redirect_uri: redirectUri,
+    }),
+  });
+  const tokenData = await tokenRes.json();
+  if (!tokenRes.ok || !tokenData.access_token) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=token_exchange`, 302);
+  }
+
+  const accessToken = tokenData.access_token;
+  const userRes = await fetch("https://gitlab.com/api/v4/user", {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+      "User-Agent": "AgentPay-Worker",
+    },
+  });
+  const profile = await userRes.json();
+  if (!userRes.ok || !profile.id) {
+    return Response.redirect(`${DASHBOARD_URL}?auth_error=userinfo`, 302);
+  }
+
+  let email = profile.email ? String(profile.email) : null;
+  if (!email && profile.public_email) email = String(profile.public_email);
+  if (!email) {
+    // Fallback: GitLab may hide email — use noreply style
+    email = `${profile.username || profile.id}@users.noreply.gitlab.com`;
+  }
+
+  const gitlabUserId = "gitlab:" + profile.id;
+  const name = String(profile.name || profile.username || email.split("@")[0]);
+  const picture = profile.avatar_url ? String(profile.avatar_url) : null;
+  const glUsername = profile.username ? String(profile.username) : null;
+
+  let sessionUserId = gitlabUserId;
+  const byGitlab = await env.DB.prepare(`SELECT id FROM users WHERE id = ?1`)
+    .bind(gitlabUserId)
+    .first();
+
+  if (byGitlab) {
+    try {
+      await env.DB.prepare(
+        `UPDATE users
+         SET email = ?1, name = ?2, picture = ?3, provider = 'gitlab',
+             gitlab_access_token = ?4, gitlab_username = ?5, updated_at = datetime('now')
+         WHERE id = ?6`
+      )
+        .bind(email, name, picture, accessToken, glUsername, gitlabUserId)
+        .run();
+    } catch (_) {
+      // columns optional until ALTER
+      await env.DB.prepare(
+        `UPDATE users
+         SET email = ?1, name = ?2, picture = ?3, provider = 'gitlab', updated_at = datetime('now')
+         WHERE id = ?4`
+      )
+        .bind(email, name, picture, gitlabUserId)
+        .run();
+    }
+    sessionUserId = gitlabUserId;
+  } else {
+    const byEmail = await env.DB.prepare(`SELECT id FROM users WHERE email = ?1`)
+      .bind(email)
+      .first();
+    if (byEmail) {
+      try {
+        await env.DB.prepare(
+          `UPDATE users
+           SET name = COALESCE(NULLIF(?1, ''), name),
+               picture = COALESCE(?2, picture),
+               gitlab_access_token = ?3,
+               gitlab_username = ?4,
+               updated_at = datetime('now')
+           WHERE id = ?5`
+        )
+          .bind(name, picture, accessToken, glUsername, byEmail.id)
+          .run();
+      } catch (_) {
+        await env.DB.prepare(
+          `UPDATE users
+           SET name = COALESCE(NULLIF(?1, ''), name),
+               picture = COALESCE(?2, picture),
+               updated_at = datetime('now')
+           WHERE id = ?3`
+        )
+          .bind(name, picture, byEmail.id)
+          .run();
+      }
+      sessionUserId = byEmail.id;
+    } else {
+      try {
+        await env.DB.prepare(
+          `INSERT INTO users (id, email, name, picture, provider, gitlab_access_token, gitlab_username, updated_at)
+           VALUES (?1, ?2, ?3, ?4, 'gitlab', ?5, ?6, datetime('now'))`
+        )
+          .bind(gitlabUserId, email, name, picture, accessToken, glUsername)
+          .run();
+      } catch (_) {
+        await env.DB.prepare(
+          `INSERT INTO users (id, email, name, picture, provider, updated_at)
+           VALUES (?1, ?2, ?3, ?4, 'gitlab', datetime('now'))`
+        )
+          .bind(gitlabUserId, email, name, picture)
+          .run();
+      }
+      sessionUserId = gitlabUserId;
     }
   }
 
