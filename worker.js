@@ -53,6 +53,7 @@
  * D1:       continuity_sessions + continuity_events (d1-continuity-migration.sql)
  * Cron:     expireContinuitySessions
  * Admin:    POST /api/admin/sandbox-cleanup (ADMIN_CLEANUP_SECRET + confirm)
+ * Admin:    POST /api/admin/sandbox-cleanup (ADMIN_CLEANUP_SECRET + confirm)
  */
 
 
@@ -1312,8 +1313,8 @@ async function pruneTelemetry(env) {
  */
 async function handleAdminSandboxCleanup(request, env) {
   const t0 = Date.now();
-  const secret = env.ADMIN_CLEANUP_SECRET;
-  if (!secret || String(secret).length < 16) {
+  const secret = String(env.ADMIN_CLEANUP_SECRET || "").trim();
+  if (!secret || secret.length < 16) {
     return bad(
       request,
       "Cleanup disabled: set ADMIN_CLEANUP_SECRET (16+ chars) in Worker secrets",
@@ -1333,11 +1334,18 @@ async function handleAdminSandboxCleanup(request, env) {
     (request.headers.get("X-Admin-Cleanup-Key") || "").trim() ||
     String(body.secret || body.key || "").trim();
 
-  if (!provided || provided !== String(secret)) {
-    return bad(request, "Invalid cleanup key", 403, { code: "bad_cleanup_key" });
+  if (!provided || provided !== secret) {
+    return bad(request, "Invalid cleanup key", 403, {
+      code: "bad_cleanup_key",
+      hint:
+        "Lengths: sent=" +
+        provided.length +
+        " stored=" +
+        secret.length +
+        " (must match exactly; re-save secret without quotes/spaces)",
+    });
   }
 
-  // Explicit acknowledge required so accidental calls fail closed
   if (body.confirm !== true && body.confirm !== "SANDBOX_RESET") {
     return bad(
       request,
@@ -1347,25 +1355,45 @@ async function handleAdminSandboxCleanup(request, env) {
     );
   }
 
+  // Anti-loop: max 3 cleanups / hour
+  const rl = await checkRateLimit(env, "admin:sandbox-cleanup", 3, 3600);
+  if (rl) {
+    return bad(request, "Cleanup rate limit: max 3 per hour (anti-loop protection)", 429, {
+      code: "cleanup_rate_limited",
+      retry_after_sec: rl.retry_after_sec,
+    });
+  }
+
   const results = {};
+  let wiped = 0;
+  let skipped = 0;
+  let failed = 0;
+
   async function wipe(label, sql) {
     try {
       const r = await env.DB.prepare(sql).run();
-      results[label] = { ok: true, changes: (r.meta && r.meta.changes) || 0 };
+      const changes = (r.meta && r.meta.changes) || 0;
+      results[label] = { ok: true, status: "wiped", changes };
+      wiped += 1;
     } catch (e) {
-      results[label] = { ok: false, error: (e && e.message) || String(e) };
+      const msg = (e && e.message) || String(e);
+      if (/no such table/i.test(msg)) {
+        results[label] = { ok: true, status: "skipped", reason: "table_not_present" };
+        skipped += 1;
+      } else {
+        results[label] = { ok: false, status: "error", error: msg };
+        failed += 1;
+      }
     }
   }
 
-  // Telemetry / noise (safe)
   await wipe("velocity_events", `DELETE FROM velocity_events`);
   await wipe("safety_events", `DELETE FROM safety_events`);
-  await wipe("rate_limits", `DELETE FROM rate_limits`);
+  await wipe("rate_limits", `DELETE FROM rate_limits WHERE bucket_key != 'admin:sandbox-cleanup'`);
   await wipe("webhook_deliveries", `DELETE FROM webhook_deliveries`);
   await wipe("idempotency", `DELETE FROM idempotency`);
   await wipe("rep_events", `DELETE FROM rep_events`);
 
-  // Money instruments + ledger (sandbox)
   await wipe("transactions", `DELETE FROM transactions`);
   await wipe("escrows", `DELETE FROM escrows`);
   await wipe("streams", `DELETE FROM streams`);
@@ -1389,12 +1417,9 @@ async function handleAdminSandboxCleanup(request, env) {
   await wipe("work_events", `DELETE FROM work_events`);
   await wipe("continuity_sessions", `DELETE FROM continuity_sessions`);
   await wipe("continuity_events", `DELETE FROM continuity_events`);
-
-  // Agent index (re-scan after clean)
   await wipe("agents", `DELETE FROM agents`);
   await wipe("agent_capabilities", `DELETE FROM agent_capabilities`);
 
-  // Reset spend counters / unlock; keep policy rows
   await wipe(
     "agent_limits_reset",
     `UPDATE agent_limits SET
@@ -1407,14 +1432,12 @@ async function handleAdminSandboxCleanup(request, env) {
        updated_at = datetime('now')`
   );
 
-  // Zero balances for non-system wallets (keep account rows)
   await wipe(
     "accounts_zero",
     `UPDATE accounts SET balance = 0, updated_at = datetime('now')
      WHERE repo_id NOT LIKE 'system/%'`
   );
 
-  // Optional hard: body.wipe_keys === true revokes API keys (still keeps rows)
   if (body.wipe_keys === true) {
     await wipe(
       "api_keys_revoke",
@@ -1423,16 +1446,35 @@ async function handleAdminSandboxCleanup(request, env) {
     );
   }
 
-  const okTables = Object.values(results).filter((r) => r.ok).length;
-  const failTables = Object.values(results).filter((r) => !r.ok).length;
+  try {
+    await env.DB.prepare(
+      `INSERT INTO safety_events (id, event, repo_id, api_key_id, user_id, reason, meta_json, created_at)
+       VALUES (?1, 'sandbox.cleanup', NULL, NULL, NULL, ?2, ?3, datetime('now'))`
+    )
+      .bind(
+        randomId(12),
+        "operator_cleanup",
+        JSON.stringify({ wiped, skipped, failed, wipe_keys: !!body.wipe_keys })
+      )
+      .run();
+  } catch (_) {}
 
   return json(request, {
-    ok: true,
+    ok: failed === 0,
     sandbox: true,
     message:
-      "Sandbox ledger cleaned. Users/sessions kept. Re-fund agents via Faucet. Remove this endpoint before real users.",
-    tables_ok: okTables,
-    tables_failed_or_missing: failTables,
+      failed === 0
+        ? "Sandbox ledger cleaned. Users/sessions kept. Re-fund via Faucet. Max 3 cleanups/hour."
+        : "Cleanup finished with some real errors (see results).",
+    summary: {
+      wiped,
+      skipped_missing_tables: skipped,
+      failed,
+      note:
+        skipped > 0
+          ? "Skipped tables were never migrated — normal, not a problem."
+          : undefined,
+    },
     results,
     latency_ms: Date.now() - t0,
   });
