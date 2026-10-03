@@ -6,6 +6,7 @@ compatibility_date = "2026-09-01"
 [vars]
 GOOGLE_CLIENT_ID = "99262308475-u3eo6kki1b0lkndrsfbnq3c423pck05n.apps.googleusercontent.com"
 GITHUB_CLIENT_ID = "Ov23liPOnUOgxyuC159f"
+GITLAB_CLIENT_ID = "bb6cebc93cd509fed474143abb2afdb6d8d1431721b8c3e29502b9a86a7f745f"
 
  
 [[d1_databases]]
