@@ -3,7 +3,7 @@
  * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
  *
  * INVENTORY (do not delete):
- * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
+ * Auth:     GET /api/auth/google, GET /api/auth/google/callback, 
  *           GET /api/auth/github, GET /api/auth/github/callback,
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance,
