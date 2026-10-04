@@ -16,8 +16,8 @@
  *           GET /api/me/webhook/deliveries
  * Ledger:   POST /api/pay (fast cash path + batched settle + waitUntil post-commit),
  *           POST /api/fund, GET /api/balance, GET /api/ledger
- * Escrow:   POST /api/escrow/hold|release|refund, GET /api/escrow,
- *           POST /api/escrow/expire-now
+ * Escrow:   POST /api/escrow/hold|release|refund (hold: waitUntil post-commit like pay),
+ *           GET /api/escrow, POST /api/escrow/expire-now
  * Stream:   POST /api/stream/start|meter|stop, GET /api/stream
  * Cron:     scheduled() → expireHeldEscrows (+ webhook escrow.expired)
  * D1 users: github_access_token, github_login; gitlab_access_token, gitlab_username (optional ALTER)
@@ -1566,7 +1566,7 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/api/escrow/hold") {
-        return await handleEscrowHold(request, env);
+        return await handleEscrowHold(request, env, ctx);
       }
       if (request.method === "POST" && url.pathname === "/api/escrow/release") {
         return await handleEscrowRelease(request, env, ctx);
@@ -4344,8 +4344,18 @@ async function handleLedger(request, url, env) {
 
 /* ─── Escrow (agent banking) ─── */
 
-async function handleEscrowHold(request, env) {
+async function handleEscrowHold(request, env, ctx) {
   const t0 = Date.now();
+  const waitUntil = (p) => {
+    try {
+      if (ctx && typeof ctx.waitUntil === "function") {
+        ctx.waitUntil(Promise.resolve(p).catch((e) => console.log("escrow_hold_bg", e && e.message)));
+        return;
+      }
+    } catch (_) {}
+    Promise.resolve(p).catch(() => {});
+  };
+
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
 
@@ -4425,29 +4435,43 @@ async function handleEscrowHold(request, env) {
   const id = "esc_" + randomId(12);
   const modifier = "+" + ttlSec + " seconds";
 
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT INTO escrows (
-         id, from_repo, to_repo, amount, task, status, created_by,
-         idempotency_key, expires_at, created_at, updated_at
-       ) VALUES (
-         ?1, ?2, ?3, ?4, ?5, 'held', ?6, ?7,
-         datetime('now', ?8), datetime('now'), datetime('now')
-       )`
-    ).bind(id, fromRepo, toRepo, amount, task, authUser.id, idem, modifier),
-    env.DB.prepare(
-      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
-       VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
-    ).bind(fromRepo, SYSTEM_ESCROW, amount, "escrow-hold:" + id, Date.now() - t0, idem),
-  ]);
+  let storedExpires = null;
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO escrows (
+           id, from_repo, to_repo, amount, task, status, created_by,
+           idempotency_key, expires_at, created_at, updated_at
+         ) VALUES (
+           ?1, ?2, ?3, ?4, ?5, 'held', ?6, ?7,
+           datetime('now', ?8), datetime('now'), datetime('now')
+         )`
+      ).bind(id, fromRepo, toRepo, amount, task, authUser.id, idem, modifier),
+      env.DB.prepare(
+        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
+         VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
+      ).bind(fromRepo, SYSTEM_ESCROW, amount, "escrow-hold:" + id, Date.now() - t0, idem),
+    ]);
+    const stored = await env.DB.prepare(
+      `SELECT expires_at FROM escrows WHERE id = ?1`
+    )
+      .bind(id)
+      .first();
+    storedExpires = stored?.expires_at || null;
+  } catch (e) {
+    // best-effort compensate debit if insert failed
+    try {
+      await env.DB.prepare(
+        `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
+      )
+        .bind(amount, fromRepo)
+        .run();
+    } catch (_) {}
+    return bad(request, "Escrow hold failed: " + (e.message || e), 500);
+  }
 
-  const stored = await env.DB.prepare(
-    `SELECT expires_at FROM escrows WHERE id = ?1`
-  )
-    .bind(id)
-    .first();
-
-  await safetyRecordSpend(env, authUser, fromRepo, amount);
+  // Post-commit: velocity + daily spend (non-blocking) — same pattern as pay
+  waitUntil(safetyRecordSpend(env, authUser, fromRepo, amount));
 
   return json(request, {
     ok: true,
@@ -4459,10 +4483,11 @@ async function handleEscrowHold(request, env) {
       amount,
       task,
       status: "held",
-      expires_at: stored?.expires_at || null,
+      expires_at: storedExpires,
       ttl_seconds: ttlSec,
     },
     balance_from: debit.balance,
+    credit_drawn: creditDrawn || undefined,
     latency_ms: Date.now() - t0,
   });
 }
