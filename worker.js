@@ -1417,8 +1417,7 @@ async function handleAdminSandboxCleanup(request, env) {
   await wipe("work_events", `DELETE FROM work_events`);
   await wipe("continuity_sessions", `DELETE FROM continuity_sessions`);
   await wipe("continuity_events", `DELETE FROM continuity_events`);
-  await wipe("agents", `DELETE FROM agents`);
-  await wipe("agent_capabilities", `DELETE FROM agent_capabilities`);
+  await wipe("agent_index", `DELETE FROM agent_index`);
 
   await wipe(
     "agent_limits_reset",
