@@ -48,7 +48,9 @@
  * D1:       clearing_batches + clearing_positions (d1-clearing-migration.sql)
  * Receipts: HMAC-SHA256 via env.RECEIPT_SECRET (pay + clearing settlements)
  * Work:     POST /api/work/claim|lock|attest|settle|refund, GET /api/work
+ *           Attestation diversity: no self-attest (provider/buyer), distinct attestors only
  * D1:       work_claims + work_attestations + work_events (d1-work-migration.sql)
+ *           Optional: UNIQUE(claim_id, attestor_repo) — d1-work-attest-diversity.sql
  * Continuity: POST /api/continuity/open|beat|close|recover, GET /api/continuity
  * D1:       continuity_sessions + continuity_events (d1-continuity-migration.sql)
  * Cron:     expireContinuitySessions
@@ -201,6 +203,11 @@ const WORK_MAX_TTL_SEC = 72 * 3600;
 const RL_WORK_MAX = 40;
 const RL_WORK_WINDOW_SEC = 60;
 const EXPIRE_WORK_BATCH = 50;
+
+/* Attestation diversity (VWS) */
+const WORK_BLOCK_SELF_ATTEST = true; // provider + buyer cannot attest own claim
+const WORK_REQUIRE_DISTINCT_ATTESTORS = true; // one vote per attestor_repo per claim
+
 
 /* Heartbeat Continuity (dead-agent recovery) */
 const SYSTEM_CONTINUITY = "system/continuity";
@@ -5946,6 +5953,48 @@ async function handleWorkAttest(request, env, ctx) {
     return bad(request, "Claim not attestable (status=" + row.status + ")", 400);
   }
 
+  // ── Attestation diversity: no self-attest (provider / buyer) ──
+  if (WORK_BLOCK_SELF_ATTEST) {
+    if (row.provider_repo && attestor === row.provider_repo) {
+      await logWorkEvent(env, id, "attest_rejected", {
+        actor_repo: attestor,
+        note: "self_attest_provider",
+      });
+      return bad(request, "Provider cannot attest their own claim", 403, {
+        code: "self_attest_forbidden",
+      });
+    }
+    if (row.buyer_repo && attestor === row.buyer_repo) {
+      await logWorkEvent(env, id, "attest_rejected", {
+        actor_repo: attestor,
+        note: "self_attest_buyer",
+      });
+      return bad(request, "Buyer cannot attest a claim they funded", 403, {
+        code: "self_attest_forbidden",
+      });
+    }
+  }
+
+  // ── Distinct attestors only (one vote per repo) ──
+  if (WORK_REQUIRE_DISTINCT_ATTESTORS) {
+    try {
+      const prior = await env.DB.prepare(
+        `SELECT id FROM work_attestations
+         WHERE claim_id = ?1 AND attestor_repo = ?2 LIMIT 1`
+      )
+        .bind(id, attestor)
+        .first();
+      if (prior) {
+        return bad(request, "This attestor already attested this claim", 409, {
+          code: "duplicate_attestor",
+          attestor_repo: attestor,
+        });
+      }
+    } catch (e) {
+      // table missing handled on insert
+    }
+  }
+
   // If expected_hash set, attestation must match
   if (row.expected_hash && row.expected_hash.toLowerCase() !== outputHash) {
     await logWorkEvent(env, id, "attest_mismatch", { actor_repo: attestor, note: outputHash.slice(0, 16) });
@@ -5966,10 +6015,29 @@ async function handleWorkAttest(request, env, ctx) {
       .bind(attId, id, attestor, outputHash, note)
       .run();
   } catch (e) {
-    return bad(request, "work_attestations missing — run d1-work-migration.sql: " + (e.message || e), 500);
+    const msg = (e && e.message) || String(e);
+    if (/UNIQUE|unique|constraint/i.test(msg)) {
+      return bad(request, "This attestor already attested this claim", 409, {
+        code: "duplicate_attestor",
+        attestor_repo: attestor,
+      });
+    }
+    return bad(request, "work_attestations missing — run d1-work-migration.sql: " + msg, 500);
   }
 
-  const newCount = Number(row.attestation_count || 0) + 1;
+  // Recount distinct attestors (source of truth for diversity)
+  let distinctCount = 1;
+  try {
+    const dist = await env.DB.prepare(
+      `SELECT COUNT(DISTINCT attestor_repo) AS c FROM work_attestations WHERE claim_id = ?1`
+    )
+      .bind(id)
+      .first();
+    distinctCount = Number(dist?.c || 1);
+  } catch (_) {
+    distinctCount = Number(row.attestation_count || 0) + 1;
+  }
+
   const newStatus =
     row.status === "locked" || row.status === "attested"
       ? "attested"
@@ -5985,28 +6053,42 @@ async function handleWorkAttest(request, env, ctx) {
          updated_at = datetime('now')
      WHERE id = ?1`
   )
-    .bind(id, outputHash, newCount)
+    .bind(id, outputHash, distinctCount)
     .run();
 
-  await logWorkEvent(env, id, "attested", { actor_repo: attestor, note: outputHash.slice(0, 16) });
+  await logWorkEvent(env, id, "attested", {
+    actor_repo: attestor,
+    note: outputHash.slice(0, 16) + " distinct=" + distinctCount,
+  });
 
   if (row.created_by) {
     scheduleWebhook(ctx, env, row.created_by, "work.attested", {
-      id, attestor_repo: attestor, output_hash: outputHash, attestation_count: newCount,
+      id,
+      attestor_repo: attestor,
+      output_hash: outputHash,
+      attestation_count: distinctCount,
+      distinct_attestors: distinctCount,
+      min_attestations: Number(row.min_attestations || 1),
     });
   }
 
+  const minAtt = Number(row.min_attestations || 1);
   return json(request, {
     ok: true,
     claim_id: id,
     attestation_id: attId,
-    attestation_count: newCount,
-    min_attestations: Number(row.min_attestations || 1),
+    attestor_repo: attestor,
+    attestation_count: distinctCount,
+    distinct_attestors: distinctCount,
+    min_attestations: minAtt,
     output_hash: outputHash,
     status: newStatus === "open" && row.status === "open" ? "open" : "attested",
+    diversity: {
+      self_attest_blocked: WORK_BLOCK_SELF_ATTEST,
+      distinct_required: WORK_REQUIRE_DISTINCT_ATTESTORS,
+    },
     ready_to_settle:
-      (row.status === "locked" || row.status === "attested") &&
-      newCount >= Number(row.min_attestations || 1),
+      (row.status === "locked" || row.status === "attested") && distinctCount >= minAtt,
     latency_ms: Date.now() - t0,
   });
 }
@@ -6033,12 +6115,27 @@ async function handleWorkSettle(request, env, ctx) {
   if (Number(row.locked_amount || 0) <= 0) {
     return bad(request, "No funds locked on claim", 400);
   }
-  if (Number(row.attestation_count || 0) < Number(row.min_attestations || 1)) {
+  // Diversity: require distinct attestors (re-count; ignore inflated row counters)
+  let distinctAtt = Number(row.attestation_count || 0);
+  try {
+    const dist = await env.DB.prepare(
+      `SELECT COUNT(DISTINCT attestor_repo) AS c FROM work_attestations WHERE claim_id = ?1`
+    )
+      .bind(id)
+      .first();
+    if (dist && dist.c != null) distinctAtt = Number(dist.c);
+  } catch (_) {}
+  const minAtt = Number(row.min_attestations || 1);
+  if (distinctAtt < minAtt) {
     return bad(
       request,
-      "Need " + row.min_attestations + " attestation(s), have " + (row.attestation_count || 0),
+      "Need " + minAtt + " distinct attestation(s), have " + distinctAtt,
       400,
-      { code: "insufficient_attestations" }
+      {
+        code: "insufficient_attestations",
+        distinct_attestors: distinctAtt,
+        min_attestations: minAtt,
+      }
     );
   }
   if (!row.output_hash) return bad(request, "No output_hash on claim — attest first", 400);
