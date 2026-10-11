@@ -59,7 +59,10 @@
  * D1:       collaborative_pools + pool_contributions + pool_events (d1-pool-migration.sql)
  * Cron:     expireCollaborativePools
  * Admin:    POST /api/admin/sandbox-cleanup (ADMIN_CLEANUP_SECRET + confirm)
- * Admin:    POST /api/admin/sandbox-cleanup (ADMIN_CLEANUP_SECRET + confirm)
+ * Shield:   GET /api/shield, GET|POST /api/me/shield, POST /api/me/shield/release
+ *           Adaptive circuit-breaker + agent quarantine (bot flood / key compromise)
+ * D1:       edge_shield + shield_events (d1-shield-migration.sql)
+ * Admin:    POST /api/admin/shield (ADMIN_CLEANUP_SECRET)
  */
 
 
@@ -239,6 +242,19 @@ const POOL_MAX_TTL_SEC = 720 * 3600;
 const RL_POOL_MAX = 30;
 const RL_POOL_WINDOW_SEC = 60;
 const EXPIRE_POOL_BATCH = 40;
+
+/* Edge Shield — adaptive circuit breaker / quarantine */
+const SHIELD_LEVEL_NORMAL = 0;
+const SHIELD_LEVEL_WATCH = 1;      // log + tighter soft limits
+const SHIELD_LEVEL_THROTTLE = 2;   // cut rate limits in half
+const SHIELD_LEVEL_FREEZE = 3;     // block new spends (refunds/settles OK)
+const SHIELD_LEVEL_EMERGENCY = 4;  // global freeze all discretionary spends
+const SHIELD_AUTO_LOCKS_TRIP = 3;  // N wallet locks in window → global escalate
+const SHIELD_AUTO_WINDOW_SEC = 300;
+const SHIELD_COOLDOWN_SEC = 600;   // default auto cool-down
+const SHIELD_MAX_LEVEL = 4;
+const RL_SHIELD_MAX = 30;
+const RL_SHIELD_WINDOW_SEC = 60;
 
 
 function corsHeaders(request) {
@@ -701,11 +717,196 @@ async function addDailySpent(env, repoId, amount) {
  * Full pre-spend safety gate for a from_repo debit.
  * Returns null if allowed, or a bad() Response.
  */
+
+/* ─── Edge Shield helpers ─── */
+
+async function logShieldEvent(env, event, { scope, scope_id, level, reason, meta } = {}) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO shield_events (id, scope, scope_id, event, level, reason, meta_json, created_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))`
+    )
+      .bind(
+        randomId(12),
+        scope || "repo",
+        scope_id || null,
+        event,
+        level != null ? Number(level) : null,
+        reason ? String(reason).slice(0, 500) : null,
+        meta ? JSON.stringify(meta) : null
+      )
+      .run();
+  } catch (e) {
+    console.log("shield_event_err", e && e.message);
+  }
+}
+
+async function ensureShieldRow(env, id) {
+  try {
+    await env.DB.prepare(
+      `INSERT INTO edge_shield (id, level, trip_count, updated_at)
+       VALUES (?1, 0, 0, datetime('now'))
+       ON CONFLICT(id) DO NOTHING`
+    )
+      .bind(id)
+      .run();
+  } catch (e) {
+    // table may be missing — callers handle
+  }
+}
+
+async function getShield(env, id) {
+  try {
+    await ensureShieldRow(env, id);
+    const row = await env.DB.prepare(`SELECT * FROM edge_shield WHERE id = ?1`).bind(id).first();
+    if (!row) return { id, level: 0, reason: null, cools_at: null };
+    // auto cool-down
+    if (row.cools_at && Number(row.level) > 0) {
+      const ms = Date.parse(String(row.cools_at).replace(" ", "T") + "Z");
+      if (Number.isFinite(ms) && ms < Date.now()) {
+        await env.DB.prepare(
+          `UPDATE edge_shield
+           SET level = 0, reason = NULL, cools_at = NULL, updated_at = datetime('now')
+           WHERE id = ?1`
+        )
+          .bind(id)
+          .run();
+        await logShieldEvent(env, "cooled", {
+          scope: id === "global" ? "global" : "repo",
+          scope_id: id,
+          level: 0,
+          reason: "auto_cooldown",
+        });
+        return { id, level: 0, reason: null, cools_at: null, trip_count: row.trip_count };
+      }
+    }
+    return row;
+  } catch {
+    return { id, level: 0, reason: null, cools_at: null };
+  }
+}
+
+async function setShieldLevel(env, id, level, reason, { cooldownSec } = {}) {
+  level = Math.max(0, Math.min(SHIELD_MAX_LEVEL, Math.floor(Number(level) || 0)));
+  const cd = cooldownSec != null ? Number(cooldownSec) : SHIELD_COOLDOWN_SEC;
+  const modifier = level > 0 ? "+" + Math.max(30, cd) + " seconds" : null;
+  await ensureShieldRow(env, id);
+  if (level === 0) {
+    await env.DB.prepare(
+      `UPDATE edge_shield
+       SET level = 0, reason = NULL, cools_at = NULL, updated_at = datetime('now')
+       WHERE id = ?1`
+    )
+      .bind(id)
+      .run();
+  } else {
+    await env.DB.prepare(
+      `UPDATE edge_shield
+       SET level = ?2,
+           reason = ?3,
+           trip_count = trip_count + 1,
+           last_trip_at = datetime('now'),
+           cools_at = datetime('now', ?4),
+           updated_at = datetime('now')
+       WHERE id = ?1`
+    )
+      .bind(id, level, String(reason || "shield").slice(0, 500), modifier)
+      .run();
+  }
+  await logShieldEvent(env, level === 0 ? "released" : "trip", {
+    scope: id === "global" ? "global" : "repo",
+    scope_id: id,
+    level,
+    reason,
+  });
+  return getShield(env, id);
+}
+
+/** Count recent wallet locks — drives global auto-trip. */
+async function countRecentWalletLocks(env) {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM safety_events
+       WHERE event = 'wallet.locked'
+         AND created_at >= datetime('now', ?1)`
+    )
+      .bind("-" + SHIELD_AUTO_WINDOW_SEC + " seconds")
+      .first();
+    return Number(row?.c || 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Shield gate: returns bad() Response if spend blocked, or null if OK.
+ * Throttle level only annotates; FREEZE+ blocks discretionary spends.
+ */
+async function checkShieldGate(request, env, fromRepo) {
+  const global = await getShield(env, "global");
+  const gLevel = Number(global.level || 0);
+  if (gLevel >= SHIELD_LEVEL_EMERGENCY) {
+    return bad(request, "Global emergency shield active — discretionary spends frozen", 503, {
+      code: "shield_emergency",
+      shield_level: gLevel,
+      reason: global.reason || "emergency",
+      cools_at: global.cools_at || null,
+    });
+  }
+  if (gLevel >= SHIELD_LEVEL_FREEZE) {
+    return bad(request, "Network shield freeze — new spends paused (refunds/settles still work)", 503, {
+      code: "shield_freeze",
+      shield_level: gLevel,
+      reason: global.reason || "freeze",
+      cools_at: global.cools_at || null,
+    });
+  }
+
+  if (fromRepo) {
+    const local = await getShield(env, fromRepo);
+    const lLevel = Number(local.level || 0);
+    if (lLevel >= SHIELD_LEVEL_FREEZE) {
+      return bad(request, "Agent quarantined by Edge Shield — new spends blocked until cool-down or release", 403, {
+        code: "shield_quarantine",
+        shield_level: lLevel,
+        reason: local.reason || "quarantine",
+        cools_at: local.cools_at || null,
+        repo_id: fromRepo,
+      });
+    }
+  }
+  return null;
+}
+
+async function maybeAutoTripGlobalShield(env) {
+  try {
+    const locks = await countRecentWalletLocks(env);
+    if (locks < SHIELD_AUTO_LOCKS_TRIP) return null;
+    const g = await getShield(env, "global");
+    const cur = Number(g.level || 0);
+    if (cur >= SHIELD_LEVEL_THROTTLE) return g;
+    return await setShieldLevel(
+      env,
+      "global",
+      SHIELD_LEVEL_THROTTLE,
+      "auto: " + locks + " wallet locks in " + SHIELD_AUTO_WINDOW_SEC + "s",
+      { cooldownSec: SHIELD_COOLDOWN_SEC }
+    );
+  } catch (e) {
+    console.log("auto_trip_shield", e && e.message);
+    return null;
+  }
+}
+
 async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (!fromRepo) return null;
 
   const sus = rejectIfSuspendedKey(request, authUser);
   if (sus) return sus;
+
+  // Edge Shield: global freeze / agent quarantine
+  const shieldBlock = await checkShieldGate(request, env, fromRepo);
+  if (shieldBlock) return shieldBlock;
 
   const locked = await checkWalletLocked(env, fromRepo);
   if (locked) {
@@ -744,12 +945,26 @@ async function safetyGate(request, env, authUser, fromRepo, amount) {
         user_id: uid,
         reason: vel.error,
       });
+      // Quarantine agent under Edge Shield (auto cool-down)
+      try {
+        await setShieldLevel(env, fromRepo, SHIELD_LEVEL_FREEZE, "runaway_loop: " + vel.error, {
+          cooldownSec: SHIELD_COOLDOWN_SEC,
+        });
+        await maybeAutoTripGlobalShield(env);
+      } catch (e) {
+        console.log("shield_trip_on_spike", e && e.message);
+      }
       if (uid) {
         // fire-and-forget (no ctx in gate path)
         scheduleWebhook(null, env, uid, "agent.runaway_loop", {
           repo_id: fromRepo,
           reason: vel.error,
           api_key_id: keyId,
+        });
+        scheduleWebhook(null, env, uid, "shield.quarantine", {
+          repo_id: fromRepo,
+          reason: vel.error,
+          level: SHIELD_LEVEL_FREEZE,
         });
       }
     }
@@ -1442,6 +1657,8 @@ async function handleAdminSandboxCleanup(request, env) {
   await wipe("pool_events", `DELETE FROM pool_events`);
   await wipe("pool_contributions", `DELETE FROM pool_contributions`);
   await wipe("collaborative_pools", `DELETE FROM collaborative_pools`);
+  await wipe("shield_events", `DELETE FROM shield_events`);
+  await wipe("edge_shield", `DELETE FROM edge_shield`);
   await wipe("agent_index", `DELETE FROM agent_index`);
 
   await wipe(
@@ -1820,6 +2037,20 @@ export default {
         }
       }
 
+      
+      if (request.method === "GET" && url.pathname === "/api/shield") {
+        return await handleShieldPublic(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/shield") {
+        return await handleMeShieldGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/shield/release") {
+        return await handleMeShieldRelease(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/shield") {
+        return await handleAdminShield(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/api/me/safety") {
         return await handleMeSafetyGet(request, env);
       }
@@ -1899,6 +2130,10 @@ export default {
             stream_list: "GET /api/stream",
             me_safety: "GET|POST /api/me/safety",
             me_safety_unlock: "POST /api/me/safety/unlock",
+            shield: "GET /api/shield",
+            me_shield: "GET /api/me/shield",
+            me_shield_release: "POST /api/me/shield/release",
+            admin_shield: "POST /api/admin/shield",
             me_keys_unsuspend: "POST /api/me/keys/unsuspend",
             subwallet_open: "POST /api/subwallet/open",
             subwallet_spend: "POST /api/subwallet/spend",
@@ -3811,7 +4046,7 @@ async function handleMeWebhookGet(request, env) {
     configured: !!(row && row.webhook_url),
     url: row?.webhook_url || null,
     secret_prefix: row?.webhook_secret_prefix ? row.webhook_secret_prefix + "…" : null,
-    events: ["escrow.released", "escrow.refunded", "escrow.expired", "wallet.locked", "agent.runaway_loop"],
+    events: ["escrow.released", "escrow.refunded", "escrow.expired", "wallet.locked", "agent.runaway_loop", "shield.quarantine", "shield.trip"],
   });
 }
 
@@ -3867,7 +4102,7 @@ async function handleMeWebhookSet(request, env) {
     url,
     secret_prefix: prefix + "…",
     secret,
-    events: ["escrow.released", "escrow.refunded", "escrow.expired", "wallet.locked", "agent.runaway_loop"],
+    events: ["escrow.released", "escrow.refunded", "escrow.expired", "wallet.locked", "agent.runaway_loop", "shield.quarantine", "shield.trip"],
     hint: "Copy secret now. Verify X-AgentPay-Signature: sha256=<hmac-sha256(secret, rawBody)>.",
   });
 }
@@ -11366,3 +11601,152 @@ async function expireCollaborativePools(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
+
+
+/* ─── Edge Shield API ─── */
+
+async function handleShieldPublic(request, env) {
+  const global = await getShield(env, "global");
+  return json(request, {
+    ok: true,
+    global: {
+      level: Number(global.level || 0),
+      reason: global.reason || null,
+      cools_at: global.cools_at || null,
+      last_trip_at: global.last_trip_at || null,
+    },
+    levels: {
+      0: "normal",
+      1: "watch",
+      2: "throttle",
+      3: "freeze / quarantine",
+      4: "emergency",
+    },
+    hint: "Level ≥3 blocks new spends. Auto-trips on runaway loops and mass wallet locks.",
+  });
+}
+
+async function handleMeShieldGet(request, env) {
+  const authUser = await getAuthUser(request, env);
+  if (!authUser) return bad(request, "Sign in or API key required", 401);
+
+  const global = await getShield(env, "global");
+  let repo = authUser.default_repo ? parseRepo(authUser.default_repo) : null;
+  let local = null;
+  if (repo) local = await getShield(env, repo);
+
+  let events = [];
+  try {
+    const q = await env.DB.prepare(
+      `SELECT event, scope, scope_id, level, reason, created_at
+       FROM shield_events
+       WHERE scope_id = 'global' OR scope_id = ?1
+       ORDER BY created_at DESC LIMIT 20`
+    )
+      .bind(repo || "")
+      .all();
+    events = q.results || [];
+  } catch (_) {}
+
+  return json(request, {
+    ok: true,
+    global: {
+      level: Number(global.level || 0),
+      reason: global.reason || null,
+      cools_at: global.cools_at || null,
+    },
+    agent: local
+      ? {
+          repo_id: repo,
+          level: Number(local.level || 0),
+          reason: local.reason || null,
+          cools_at: local.cools_at || null,
+          trip_count: Number(local.trip_count || 0),
+        }
+      : null,
+    events,
+  });
+}
+
+async function handleMeShieldRelease(request, env) {
+  const authUser = await getAuthUser(request, env);
+  if (!authUser) return bad(request, "Sign in or API key required", 401);
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch (_) {}
+
+  let repo = parseRepo(body.repo_id || body.repo) || parseRepo(authUser.default_repo);
+  if (!repo) return bad(request, "repo_id required (or set default agent)");
+
+  // Only owner session (not pure API key of different agent) — session or matching default_repo
+  if (authUser.auth_via === "api_key" && authUser.default_repo !== repo) {
+    return bad(request, "API key not bound to this agent", 403);
+  }
+
+  const before = await getShield(env, repo);
+  if (Number(before.level || 0) === 0) {
+    return json(request, { ok: true, already: true, agent: { repo_id: repo, level: 0 } });
+  }
+
+  const after = await setShieldLevel(env, repo, 0, "owner_release");
+  // Also unlock wallet if locked
+  try {
+    await unlockWallet(env, repo, { user_id: authUser.id });
+  } catch (_) {}
+
+  if (authUser.id) {
+    scheduleWebhook(null, env, authUser.id, "shield.released", {
+      repo_id: repo,
+      previous_level: Number(before.level || 0),
+    });
+  }
+
+  return json(request, {
+    ok: true,
+    released: true,
+    agent: {
+      repo_id: repo,
+      level: Number(after.level || 0),
+      reason: after.reason || null,
+    },
+  });
+}
+
+async function handleAdminShield(request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+  const secret =
+    request.headers.get("X-Admin-Cleanup-Key") ||
+    body.secret ||
+    "";
+  const expected = env.ADMIN_CLEANUP_SECRET || "";
+  if (!expected || secret !== expected) {
+    return bad(request, "Unauthorized", 401, { code: "admin_auth" });
+  }
+
+  const scope = String(body.scope || "global").toLowerCase();
+  const id = scope === "global" ? "global" : parseRepo(body.repo_id || body.repo);
+  if (scope !== "global" && !id) return bad(request, "repo_id required for repo scope");
+
+  const level = Math.max(0, Math.min(SHIELD_MAX_LEVEL, Math.floor(Number(body.level) || 0)));
+  const reason = body.reason ? String(body.reason).slice(0, 500) : "admin";
+  const cooldownSec = body.cooldown_sec != null ? Number(body.cooldown_sec) : SHIELD_COOLDOWN_SEC;
+
+  const row = await setShieldLevel(env, id, level, reason, { cooldownSec });
+  return json(request, {
+    ok: true,
+    shield: {
+      id,
+      level: Number(row.level || 0),
+      reason: row.reason || null,
+      cools_at: row.cools_at || null,
+    },
+  });
+}
+
