@@ -67,6 +67,10 @@
  *           Spend Intent Capsules — time-boxed amount-capped pre-auth envelopes
  * D1:       intent_capsules + intent_events (d1-intent-migration.sql)
  * Cron:     expireIntentCapsules
+ * Colo:     POST /api/me/keys/bind|unbind, GET /api/me/key, GET /api/edge
+ *           Bind API keys to Cloudflare colo and/or IP fingerprint — stolen keys fail off-edge
+ * D1:       api_keys.bound_colo, bound_ip_hash, bind_mode, last_colo, last_ip_hash,
+ *           bind_violations, bound_at (d1-colo-migration.sql)
  */
 
 
@@ -1240,6 +1244,153 @@ async function rejectIfAlreadySignedIn(request, env) {
   );
 }
 
+
+/* ─── Edge fingerprint (colo + IP) for key binding ─── */
+
+function getRequestEdge(request) {
+  const cf = request.cf || {};
+  const colo = (cf.colo && String(cf.colo).toUpperCase()) || null;
+  const ip =
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("True-Client-IP") ||
+    (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
+    null;
+  return { colo, ip, country: cf.country || null, ray: request.headers.get("CF-Ray") || null };
+}
+
+async function hashIp(ip) {
+  if (!ip) return null;
+  return sha256Hex("ip:" + String(ip).trim().toLowerCase());
+}
+
+/**
+ * Enforce colo/IP binding on an API key row.
+ * Returns null if OK, or { code, error, ... } if blocked.
+ * May learn-bind on first use (mode=learn).
+ */
+async function enforceKeyBinding(env, keyRow, request) {
+  if (!keyRow || !keyRow.key_id) return null;
+  let mode = (keyRow.bind_mode || "").toLowerCase().trim();
+  if (!mode || mode === "none" || mode === "off") {
+    // Still record last edge for visibility
+    try {
+      const edge = getRequestEdge(request);
+      const ipHash = await hashIp(edge.ip);
+      await env.DB.prepare(
+        `UPDATE api_keys SET last_colo = ?2, last_ip_hash = ?3, last_used_at = datetime('now')
+         WHERE id = ?1`
+      )
+        .bind(keyRow.key_id, edge.colo, ipHash)
+        .run();
+    } catch (_) {}
+    return null;
+  }
+
+  const edge = getRequestEdge(request);
+  const ipHash = await hashIp(edge.ip);
+  let boundColo = keyRow.bound_colo ? String(keyRow.bound_colo).toUpperCase() : null;
+  let boundIp = keyRow.bound_ip_hash || null;
+
+  // Learn: pin on first successful sighting
+  if (mode === "learn" && !boundColo && !boundIp) {
+    try {
+      await env.DB.prepare(
+        `UPDATE api_keys
+         SET bound_colo = ?2, bound_ip_hash = ?3, bound_at = datetime('now'),
+             last_colo = ?2, last_ip_hash = ?3, last_used_at = datetime('now'),
+             bind_mode = 'either'
+         WHERE id = ?1`
+      )
+        .bind(keyRow.key_id, edge.colo, ipHash)
+        .run();
+      await logSafetyEvent(env, "key.edge_bound", {
+        api_key_id: keyRow.key_id,
+        user_id: keyRow.user_id || keyRow.id,
+        reason: "learn",
+        meta: { colo: edge.colo, has_ip: !!ipHash },
+      });
+    } catch (e) {
+      console.log("key_learn_bind", e && e.message);
+    }
+    return null;
+  }
+
+  // If edge metadata missing (local / non-CF), allow — do not lock out operators offline
+  if (!edge.colo && !ipHash) {
+    return null;
+  }
+
+  const coloOk = !!(boundColo && edge.colo && boundColo === edge.colo);
+  const ipOk = !!(boundIp && ipHash && boundIp === ipHash);
+
+  let allowed = false;
+  if (mode === "colo") allowed = coloOk || (!boundColo && !!edge.colo);
+  else if (mode === "ip") allowed = ipOk || (!boundIp && !!ipHash);
+  else if (mode === "both") allowed = (boundColo ? coloOk : true) && (boundIp ? ipOk : true) && (coloOk || ipOk || (!boundColo && !boundIp));
+  else if (mode === "either" || mode === "learn") allowed = coloOk || ipOk;
+  else allowed = true;
+
+  // First-use pin for colo/ip/both when bounds empty
+  if (!allowed && (mode === "colo" || mode === "ip" || mode === "both") && !boundColo && !boundIp) {
+    try {
+      await env.DB.prepare(
+        `UPDATE api_keys
+         SET bound_colo = ?2, bound_ip_hash = ?3, bound_at = datetime('now'),
+             last_colo = ?2, last_ip_hash = ?3, last_used_at = datetime('now')
+         WHERE id = ?1`
+      )
+        .bind(keyRow.key_id, edge.colo, ipHash)
+        .run();
+      return null;
+    } catch (_) {}
+  }
+
+  if (allowed) {
+    try {
+      await env.DB.prepare(
+        `UPDATE api_keys SET last_colo = ?2, last_ip_hash = ?3, last_used_at = datetime('now')
+         WHERE id = ?1`
+      )
+        .bind(keyRow.key_id, edge.colo, ipHash)
+        .run();
+    } catch (_) {}
+    return null;
+  }
+
+  // Violation
+  try {
+    await env.DB.prepare(
+      `UPDATE api_keys
+       SET bind_violations = COALESCE(bind_violations, 0) + 1,
+           last_colo = ?2, last_ip_hash = ?3, last_used_at = datetime('now')
+       WHERE id = ?1`
+    )
+      .bind(keyRow.key_id, edge.colo, ipHash)
+      .run();
+    await logSafetyEvent(env, "key.edge_mismatch", {
+      api_key_id: keyRow.key_id,
+      user_id: keyRow.user_id || keyRow.id,
+      reason: "edge_mismatch",
+      meta: {
+        mode,
+        bound_colo: boundColo,
+        got_colo: edge.colo,
+        ip_match: ipOk,
+      },
+    });
+  } catch (_) {}
+
+  return {
+    code: "key_edge_mismatch",
+    error:
+      "API key bound to another edge (colo/IP). Stolen or off-edge use blocked.",
+    bind_mode: mode,
+    bound_colo: boundColo,
+    got_colo: edge.colo || null,
+  };
+}
+
+
 async function getApiKeyUser(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const m = auth.match(/^Bearer\s+(a2a_[A-Fa-f0-9]+)$/i);
@@ -1252,6 +1403,7 @@ async function getApiKeyUser(request, env) {
   try {
     row = await env.DB.prepare(
       `SELECT k.id AS key_id, k.user_id, k.revoked_at, k.suspended_at, k.suspend_reason,
+              k.bound_colo, k.bound_ip_hash, k.bind_mode, k.last_colo, k.bind_violations,
               u.id, u.email, u.name, u.picture, u.provider, u.default_repo
        FROM api_keys k
        JOIN users u ON u.id = k.user_id
@@ -1260,24 +1412,49 @@ async function getApiKeyUser(request, env) {
       .bind(hash)
       .first();
   } catch (_) {
-    // suspended_at column may be missing until ALTER
-    row = await env.DB.prepare(
-      `SELECT k.id AS key_id, k.user_id, k.revoked_at,
-              u.id, u.email, u.name, u.picture, u.provider, u.default_repo
-       FROM api_keys k
-       JOIN users u ON u.id = k.user_id
-       WHERE k.key_hash = ?1`
-    )
-      .bind(hash)
-      .first();
+    // columns may be missing until ALTER — fall back progressively
+    try {
+      row = await env.DB.prepare(
+        `SELECT k.id AS key_id, k.user_id, k.revoked_at, k.suspended_at, k.suspend_reason,
+                u.id, u.email, u.name, u.picture, u.provider, u.default_repo
+         FROM api_keys k
+         JOIN users u ON u.id = k.user_id
+         WHERE k.key_hash = ?1`
+      )
+        .bind(hash)
+        .first();
+    } catch (__) {
+      row = await env.DB.prepare(
+        `SELECT k.id AS key_id, k.user_id, k.revoked_at,
+                u.id, u.email, u.name, u.picture, u.provider, u.default_repo
+         FROM api_keys k
+         JOIN users u ON u.id = k.user_id
+         WHERE k.key_hash = ?1`
+      )
+        .bind(hash)
+        .first();
+    }
   }
 
   if (!row || row.revoked_at) return null;
   if (row.suspended_at) {
-    // Mark so callers can return 403 with reason
     row._suspended = true;
     row._suspend_reason = row.suspend_reason || "API key suspended";
     return row;
+  }
+
+  // Colo / IP binding — stolen keys fail off-edge
+  try {
+    const edgeBlock = await enforceKeyBinding(env, row, request);
+    if (edgeBlock) {
+      row._edge_blocked = true;
+      row._edge_error = edgeBlock.error;
+      row._edge_code = edgeBlock.code;
+      row._edge_meta = edgeBlock;
+      return row;
+    }
+  } catch (e) {
+    console.log("enforce_key_binding", e && e.message);
   }
 
   env.DB.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`)
@@ -1296,6 +1473,16 @@ async function getAuthUser(request, env) {
     if (keyUser._suspended) {
       return { ...keyUser, auth_via: "api_key", suspended: true };
     }
+    if (keyUser._edge_blocked) {
+      return {
+        ...keyUser,
+        auth_via: "api_key",
+        edge_blocked: true,
+        _edge_error: keyUser._edge_error,
+        _edge_code: keyUser._edge_code,
+        _edge_meta: keyUser._edge_meta,
+      };
+    }
     return { ...keyUser, auth_via: "api_key" };
   }
   return null;
@@ -1309,6 +1496,20 @@ function rejectIfSuspendedKey(request, authUser) {
       authUser._suspend_reason || authUser.suspend_reason || "API key suspended (kill-switch)",
       403,
       { code: "key_suspended" }
+    );
+  }
+  if (authUser && authUser.auth_via === "api_key" && (authUser.edge_blocked || authUser._edge_blocked)) {
+    const meta = authUser._edge_meta || {};
+    return bad(
+      request,
+      authUser._edge_error || "API key bound to another edge",
+      403,
+      {
+        code: authUser._edge_code || "key_edge_mismatch",
+        bind_mode: meta.bind_mode || null,
+        bound_colo: meta.bound_colo || null,
+        got_colo: meta.got_colo || null,
+      }
     );
   }
   return null;
@@ -2407,6 +2608,18 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/me/keys/revoke") {
         return await handleMeKeysRevoke(request, env);
       }
+      if (request.method === "POST" && url.pathname === "/api/me/keys/bind") {
+        return await handleMeKeysBind(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/keys/unbind") {
+        return await handleMeKeysUnbind(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/key") {
+        return await handleMeKeySelf(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/edge") {
+        return await handleEdgeInfo(request, env);
+      }
 
       if (request.method === "GET" && url.pathname === "/api/me/webhook") {
         return await handleMeWebhookGet(request, env);
@@ -2749,6 +2962,10 @@ export default {
             agents_rank: "GET /api/agents/rank",
             agents_scan: "POST /api/agents/scan",
             me_keys: "GET|POST /api/me/keys",
+            me_keys_bind: "POST /api/me/keys/bind",
+            me_keys_unbind: "POST /api/me/keys/unbind",
+            me_key: "GET /api/me/key",
+            edge: "GET /api/edge",
             me_webhook: "GET|POST /api/me/webhook",
             me_webhook_clear: "POST /api/me/webhook/clear",
             me_webhook_deliveries: "GET /api/me/webhook/deliveries",
@@ -2833,7 +3050,14 @@ export default {
         });
       }
       if (request.method === "GET" && url.pathname === "/health") {
-        return json(request, { ok: true, service: "a2a-ledger", ts: Date.now() });
+        const edge = getRequestEdge(request);
+        return json(request, {
+          ok: true,
+          service: "a2a-ledger",
+          ts: Date.now(),
+          colo: edge.colo,
+          country: edge.country,
+        });
       }
       if (request.method === "POST" && url.pathname === "/api/pay") {
         return await handlePay(request, env, ctx);
@@ -4600,12 +4824,47 @@ async function handleMeKeysCreate(request, env) {
   const keyHash = await sha256Hex(secret);
   const keyPrefix = secret.slice(0, 12);
 
-  await env.DB.prepare(
-    `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label)
-     VALUES (?1, ?2, ?3, ?4, ?5)`
-  )
-    .bind(id, user.id, keyHash, keyPrefix, label)
-    .run();
+  let bindMode = body.bind_mode != null ? String(body.bind_mode).toLowerCase().trim() : "";
+  if (!["", "none", "learn", "colo", "ip", "both", "either"].includes(bindMode)) {
+    return bad(request, "bind_mode must be none|learn|colo|ip|both|either");
+  }
+  if (bindMode === "none") bindMode = "";
+
+  const edge = getRequestEdge(request);
+  let boundColo = null;
+  let boundIp = null;
+  if (bindMode && bindMode !== "learn") {
+    boundColo = edge.colo || (body.colo ? String(body.colo).toUpperCase().slice(0, 8) : null);
+    boundIp = await hashIp(edge.ip);
+  }
+
+  const pinNow = !!(bindMode && bindMode !== "learn");
+  try {
+    await env.DB.prepare(
+      `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, bind_mode, bound_colo, bound_ip_hash, bound_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
+    )
+      .bind(
+        id,
+        user.id,
+        keyHash,
+        keyPrefix,
+        label,
+        bindMode || null,
+        pinNow ? boundColo : null,
+        pinNow ? boundIp : null,
+        pinNow ? new Date().toISOString().replace("T", " ").slice(0, 19) : null
+      )
+      .run();
+  } catch (_) {
+    await env.DB.prepare(
+      `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label)
+       VALUES (?1, ?2, ?3, ?4, ?5)`
+    )
+      .bind(id, user.id, keyHash, keyPrefix, label)
+      .run();
+    bindMode = "";
+  }
 
   return json(request, {
     ok: true,
@@ -4613,7 +4872,11 @@ async function handleMeKeysCreate(request, env) {
     label,
     key_prefix: keyPrefix,
     key: secret,
-    hint: "Copy now. The full key is never shown again.",
+    bind_mode: bindMode || null,
+    bound_colo: bindMode && bindMode !== "learn" ? boundColo : null,
+    edge: { colo: edge.colo, country: edge.country },
+    hint: "Copy now. The full key is never shown again." +
+      (bindMode ? " Edge binding: " + bindMode + "." : ""),
   });
 }
 
@@ -4624,25 +4887,39 @@ async function handleMeKeysList(request, env) {
   let results;
   try {
     const q = await env.DB.prepare(
-      `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at, suspended_at, suspend_reason
+      `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at,
+              suspended_at, suspend_reason,
+              bound_colo, bind_mode, last_colo, bind_violations, bound_at
        FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
     )
       .bind(user.id)
       .all();
     results = q.results || [];
   } catch (_) {
-    const q = await env.DB.prepare(
-      `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at
-       FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
-    )
-      .bind(user.id)
-      .all();
-    results = q.results || [];
+    try {
+      const q = await env.DB.prepare(
+        `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at, suspended_at, suspend_reason
+         FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
+      )
+        .bind(user.id)
+        .all();
+      results = q.results || [];
+    } catch (__) {
+      const q = await env.DB.prepare(
+        `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at
+         FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
+      )
+        .bind(user.id)
+        .all();
+      results = q.results || [];
+    }
   }
 
+  const edge = getRequestEdge(request);
   return json(request, {
     ok: true,
     count: results.length,
+    current_edge: { colo: edge.colo, country: edge.country },
     keys: results.map((k) => ({
       id: k.id,
       key_prefix: k.key_prefix + "…",
@@ -4654,9 +4931,221 @@ async function handleMeKeysList(request, env) {
       suspended: !!k.suspended_at,
       suspended_at: k.suspended_at || null,
       suspend_reason: k.suspend_reason || null,
+      bind_mode: k.bind_mode || null,
+      bound_colo: k.bound_colo || null,
+      last_colo: k.last_colo || null,
+      bound_at: k.bound_at || null,
+      bind_violations: Number(k.bind_violations || 0),
     })),
   });
 }
+
+
+async function handleMeKeysBind(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  let mode = body.mode != null ? String(body.mode).toLowerCase().trim() : "either";
+  if (!["learn", "colo", "ip", "both", "either"].includes(mode)) {
+    return bad(request, "mode must be learn|colo|ip|both|either");
+  }
+
+  const row = await env.DB.prepare(
+    `SELECT id, user_id, revoked_at FROM api_keys WHERE id = ?1`
+  )
+    .bind(id)
+    .first();
+  if (!row || row.user_id !== user.id) return bad(request, "Key not found", 404);
+  if (row.revoked_at) return bad(request, "Key revoked", 400);
+
+  const edge = getRequestEdge(request);
+  const colo =
+    (body.colo && String(body.colo).toUpperCase().slice(0, 8)) || edge.colo || null;
+  const ipHash = await hashIp(edge.ip);
+
+  if (mode !== "learn" && mode !== "ip" && !colo) {
+    return bad(request, "No colo on this request and none provided — cannot bind", 400, {
+      code: "no_colo",
+    });
+  }
+
+  try {
+    if (mode === "learn") {
+      await env.DB.prepare(
+        `UPDATE api_keys
+         SET bind_mode = 'learn', bound_colo = NULL, bound_ip_hash = NULL,
+             bound_at = NULL
+         WHERE id = ?1`
+      )
+        .bind(id)
+        .run();
+    } else {
+      await env.DB.prepare(
+        `UPDATE api_keys
+         SET bind_mode = ?2,
+             bound_colo = ?3,
+             bound_ip_hash = ?4,
+             bound_at = datetime('now'),
+             last_colo = COALESCE(?3, last_colo),
+             last_ip_hash = COALESCE(?4, last_ip_hash)
+         WHERE id = ?1`
+      )
+        .bind(
+          id,
+          mode,
+          mode === "ip" ? null : colo,
+          mode === "colo" ? null : ipHash
+        )
+        .run();
+    }
+  } catch (e) {
+    return bad(
+      request,
+      "Colo columns missing — run d1-colo-migration.sql: " + (e.message || e),
+      500
+    );
+  }
+
+  await logSafetyEvent(env, "key.edge_bound", {
+    api_key_id: id,
+    user_id: user.id,
+    reason: mode,
+    meta: { colo, mode },
+  });
+
+  return json(request, {
+    ok: true,
+    id,
+    bind_mode: mode,
+    bound_colo: mode === "ip" || mode === "learn" ? null : colo,
+    bound_ip: mode === "colo" || mode === "learn" ? false : !!ipHash,
+    current_edge: { colo: edge.colo, country: edge.country },
+    hint:
+      mode === "learn"
+        ? "First API use will pin colo + IP, then enforce either."
+        : "Key locked to this edge. Off-edge requests return 403 key_edge_mismatch.",
+  });
+}
+
+async function handleMeKeysUnbind(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  const row = await env.DB.prepare(
+    `SELECT id, user_id FROM api_keys WHERE id = ?1`
+  )
+    .bind(id)
+    .first();
+  if (!row || row.user_id !== user.id) return bad(request, "Key not found", 404);
+
+  try {
+    await env.DB.prepare(
+      `UPDATE api_keys
+       SET bind_mode = NULL, bound_colo = NULL, bound_ip_hash = NULL,
+           bound_at = NULL, bind_violations = 0
+       WHERE id = ?1`
+    )
+      .bind(id)
+      .run();
+  } catch (e) {
+    return bad(
+      request,
+      "Colo columns missing — run d1-colo-migration.sql: " + (e.message || e),
+      500
+    );
+  }
+
+  await logSafetyEvent(env, "key.edge_unbound", {
+    api_key_id: id,
+    user_id: user.id,
+    reason: "owner_unbind",
+  });
+
+  return json(request, { ok: true, id, bind_mode: null, unbound: true });
+}
+
+/** Current API key metadata + binding (API key auth). */
+async function handleMeKeySelf(request, env) {
+  const authUser = await getAuthUser(request, env);
+  if (!authUser) return bad(request, "Sign in or API key required", 401);
+  const sus = rejectIfSuspendedKey(request, authUser);
+  if (sus) return sus;
+
+  if (authUser.auth_via !== "api_key") {
+    return bad(request, "Use an API key Bearer token for this endpoint", 400, {
+      code: "api_key_required",
+    });
+  }
+
+  const edge = getRequestEdge(request);
+  let row = null;
+  try {
+    row = await env.DB.prepare(
+      `SELECT id, key_prefix, label, bind_mode, bound_colo, last_colo,
+              bind_violations, bound_at, last_used_at, created_at
+       FROM api_keys WHERE id = ?1`
+    )
+      .bind(authUser.key_id)
+      .first();
+  } catch (_) {
+    row = await env.DB.prepare(
+      `SELECT id, key_prefix, label, last_used_at, created_at
+       FROM api_keys WHERE id = ?1`
+    )
+      .bind(authUser.key_id)
+      .first();
+  }
+
+  return json(request, {
+    ok: true,
+    key: row
+      ? {
+          id: row.id,
+          key_prefix: (row.key_prefix || "") + "…",
+          label: row.label,
+          bind_mode: row.bind_mode || null,
+          bound_colo: row.bound_colo || null,
+          last_colo: row.last_colo || null,
+          bind_violations: Number(row.bind_violations || 0),
+          bound_at: row.bound_at || null,
+          last_used_at: row.last_used_at || null,
+        }
+      : null,
+    current_edge: { colo: edge.colo, country: edge.country, ray: edge.ray },
+    bound_ok: !(authUser.edge_blocked || authUser._edge_blocked),
+  });
+}
+
+async function handleEdgeInfo(request, env) {
+  const edge = getRequestEdge(request);
+  return json(request, {
+    ok: true,
+    colo: edge.colo,
+    country: edge.country,
+    ray: edge.ray,
+    has_ip: !!edge.ip,
+    hint: "Bind API keys with POST /api/me/keys/bind { id, mode: 'colo'|'either'|'both'|'learn' }",
+  });
+}
+
 
 async function handleMeKeysRevoke(request, env) {
   const user = await getSessionUser(request, env);
@@ -12410,3 +12899,4 @@ async function handleAdminShield(request, env) {
     },
   });
 }
+
