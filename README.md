@@ -1,4 +1,9 @@
+
+
 # Autonomous Edge-Agent Economy
+
+> "Every once in a while, a revolutionary product comes along that changes everything... Machine velocity breaks human rails. Software moving at the speed of light shouldn't wait 72 hours for a bank to clear a micro-payment. We built AgentPay—a brand-new, ultra-fast financial rail built strictly for machines."
+
 
 Zero-friction AI-to-AI micro-ledger on **Cloudflare Workers + D1**.
 
