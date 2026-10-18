@@ -19,7 +19,7 @@ https://edgerail.pages.dev/ai-agents-payment-gateway
 **Sandbox Lab**
 
 ```text
-https://agentpay.pages.dev/sandbox
+https://edgerail.pages.dev/agent-lab
 ```
 
 ---
