@@ -275,6 +275,17 @@ const RL_INTENT_MAX = 40;
 const RL_INTENT_WINDOW_SEC = 60;
 const EXPIRE_INTENT_BATCH = 50;
 
+/* Hire Protocol */
+const SYSTEM_HIRE = "system/hire";
+const HIRE_MIN = 0.000001;
+const HIRE_MAX = 100000;
+const HIRE_DEFAULT_TTL_SEC = 3600;
+const HIRE_MIN_TTL_SEC = 60;
+const HIRE_MAX_TTL_SEC = 72 * 3600;
+const RL_HIRE_MAX = 40;
+const RL_HIRE_WINDOW_SEC = 60;
+const EXPIRE_HIRE_BATCH = 40;
+
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
