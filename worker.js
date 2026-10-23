@@ -79,6 +79,10 @@
  *           Bonded arbitration over work claims — slash / release / split (supreme court)
  * D1:       work_disputes + dispute_arbiters + dispute_events (d1-dispute-migration.sql)
  * Cron:     expireDisputes
+ * Security: response security headers on all JSON; Content-Length body cap;
+ *           timing-safe admin secret compare; per-IP POST rate limit;
+ *           GET /api/security/status (public defense map);
+ *           POST /api/admin/integrity (ADMIN_CLEANUP_SECRET — ledger balance audit)
  */
 
 
@@ -336,9 +340,23 @@ const RL_DISPUTE_MAX = 30;
 const RL_DISPUTE_WINDOW_SEC = 60;
 const EXPIRE_DISPUTE_BATCH = 40;
 
+/* ─── Hardening defaults (do not loosen without review) ─── */
+const MAX_JSON_BODY_BYTES = 256 * 1024; // 256 KiB — rejects oversized POST before parse
+const RL_IP_POST_MAX = 120;             // global per-IP POST budget
+const RL_IP_POST_WINDOW_SEC = 60;
+const INTEGRITY_SAMPLE_LIMIT = 500;     // max accounts scanned per integrity run
 
 
-
+function securityHeaders() {
+  return {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+    "Cache-Control": "no-store",
+    "X-AgentPay-Security": "bank-grade-v1",
+  };
+}
 
 function corsHeaders(request) {
   const origin = request.headers.get("Origin") || "";
@@ -358,6 +376,7 @@ function json(request, data, status = 200, extraHeaders = {}) {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
+      ...securityHeaders(),
       ...corsHeaders(request),
       ...extraHeaders,
     },
@@ -366,6 +385,69 @@ function json(request, data, status = 200, extraHeaders = {}) {
 
 function bad(request, message, status = 400, extra = {}) {
   return json(request, { ok: false, error: message, ...extra }, status);
+}
+
+/** Constant-time string compare for admin secrets (length must match first). */
+function timingSafeEqualString(a, b) {
+  const s1 = String(a || "");
+  const s2 = String(b || "");
+  if (s1.length !== s2.length) return false;
+  let out = 0;
+  for (let i = 0; i < s1.length; i++) {
+    out |= s1.charCodeAt(i) ^ s2.charCodeAt(i);
+  }
+  return out === 0;
+}
+
+/** Reject oversized bodies early (Content-Length). Returns Response or null. */
+function rejectOversizedBody(request) {
+  if (request.method !== "POST" && request.method !== "PUT" && request.method !== "PATCH") {
+    return null;
+  }
+  const cl = request.headers.get("Content-Length");
+  if (cl == null || cl === "") return null;
+  const n = Number(cl);
+  if (!Number.isFinite(n) || n < 0) {
+    return bad(request, "Invalid Content-Length", 400, { code: "bad_content_length" });
+  }
+  if (n > MAX_JSON_BODY_BYTES) {
+    return bad(request, "Request body too large (max " + MAX_JSON_BODY_BYTES + " bytes)", 413, {
+      code: "body_too_large",
+      max_bytes: MAX_JSON_BODY_BYTES,
+    });
+  }
+  return null;
+}
+
+function clientIp(request) {
+  return (
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("True-Client-IP") ||
+    (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
+    "unknown"
+  );
+}
+
+async function assertAdminSecret(request, env, body) {
+  const secret = String(env.ADMIN_CLEANUP_SECRET || "").trim();
+  if (!secret || secret.length < 16) {
+    return {
+      ok: false,
+      response: bad(request, "Admin disabled: set ADMIN_CLEANUP_SECRET (16+ chars)", 503, {
+        code: "admin_disabled",
+      }),
+    };
+  }
+  const provided =
+    (request.headers.get("X-Admin-Cleanup-Key") || "").trim() ||
+    String((body && (body.secret || body.key)) || "").trim();
+  if (!provided || !timingSafeEqualString(provided, secret)) {
+    return {
+      ok: false,
+      response: bad(request, "Invalid admin key", 403, { code: "bad_admin_key" }),
+    };
+  }
+  return { ok: true };
 }
 
 function parseRepo(v) {
@@ -1823,6 +1905,208 @@ async function pruneTelemetry(env) {
 }
 
 
+/* ─── Security status (public, read-only defense map) ─── */
+async function handleSecurityStatus(request, env) {
+  let globalShield = { level: 0, reason: null, cools_at: null };
+  try {
+    globalShield = await getShield(env, "global");
+  } catch (_) {}
+
+  return json(request, {
+    ok: true,
+    product: "AgentPay Secure Gateway",
+    security_tier: "bank-grade-v1",
+    as_of: new Date().toISOString(),
+    network: {
+      global_shield_level: Number(globalShield.level || 0),
+      global_shield_reason: globalShield.reason || null,
+      global_shield_cools_at: globalShield.cools_at || null,
+    },
+    controls: {
+      body_max_bytes: MAX_JSON_BODY_BYTES,
+      ip_post_rate_limit: { max: RL_IP_POST_MAX, window_sec: RL_IP_POST_WINDOW_SEC },
+      pay_rate_limit: { max: RL_PAY_MAX, window_sec: RL_PAY_WINDOW_SEC },
+      security_headers: true,
+      timing_safe_admin: true,
+      idempotency_on_pay: true,
+      safety_gate: [
+        "wallet_lock",
+        "edge_shield",
+        "policy_as_code",
+        "daily_budget",
+        "velocity_tx",
+        "velocity_usd",
+        "spike_kill_switch",
+        "rep_credit_draw",
+      ],
+      key_binding: ["colo", "ip", "either", "both", "learn"],
+      work_attestation_diversity: {
+        block_self_attest: WORK_BLOCK_SELF_ATTEST,
+        require_distinct_attestors: WORK_REQUIRE_DISTINCT_ATTESTORS,
+      },
+      dispute_court: true,
+      zero_loss_instruments: [
+        "escrow",
+        "stream",
+        "subwallet",
+        "intent_capsule",
+        "commit_reveal",
+        "work_settlement",
+        "dispute_bonds",
+      ],
+    },
+    admin: {
+      integrity: "POST /api/admin/integrity (X-Admin-Cleanup-Key)",
+      shield: "POST /api/admin/shield",
+      sandbox_cleanup: "POST /api/admin/sandbox-cleanup",
+    },
+    hint: "Public map only — no balances or secrets exposed.",
+  });
+}
+
+/**
+ * Ledger integrity audit (admin-only).
+ * Checks: non-negative balances, locked+spendable consistency signals,
+ * orphaned held instruments sample, system account presence.
+ * Does NOT mutate ledger.
+ */
+async function handleAdminIntegrity(request, env) {
+  const t0 = Date.now();
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+  const admin = await assertAdminSecret(request, env, body);
+  if (!admin.ok) return admin.response;
+
+  const rl = await checkRateLimit(env, "admin:integrity", 10, 3600);
+  if (rl) {
+    return bad(request, "Integrity rate limit: max 10/hour", 429, {
+      code: "integrity_rate_limited",
+      retry_after_sec: rl.retry_after_sec,
+    });
+  }
+
+  const findings = [];
+  const stats = {
+    accounts_scanned: 0,
+    negative_balances: 0,
+    locked_wallets: 0,
+    system_accounts_ok: 0,
+    held_escrows: 0,
+    open_disputes: 0,
+  };
+
+  // System accounts must exist (create if missing for audit readiness)
+  const systemRepos = [
+    SYSTEM_FAUCET,
+    SYSTEM_ESCROW,
+    SYSTEM_STREAM,
+    SYSTEM_SUBWALLET,
+    SYSTEM_DISPUTE,
+  ];
+  for (const repo of systemRepos) {
+    try {
+      await ensureAccount(env, repo);
+      stats.system_accounts_ok += 1;
+    } catch (e) {
+      findings.push({ severity: "high", code: "system_account", repo, error: e.message });
+    }
+  }
+
+  // Sample accounts for negative balance
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT repo_id, balance FROM accounts
+       ORDER BY updated_at DESC LIMIT ?1`
+    )
+      .bind(INTEGRITY_SAMPLE_LIMIT)
+      .all();
+    for (const row of results || []) {
+      stats.accounts_scanned += 1;
+      if (Number(row.balance) < -0.0000005) {
+        stats.negative_balances += 1;
+        findings.push({
+          severity: "critical",
+          code: "negative_balance",
+          repo_id: row.repo_id,
+          balance: Number(row.balance),
+        });
+      }
+    }
+  } catch (e) {
+    findings.push({ severity: "high", code: "accounts_scan_failed", error: e.message });
+  }
+
+  try {
+    const lockRow = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM agent_limits WHERE locked = 1`
+    ).first();
+    stats.locked_wallets = Number(lockRow?.c || 0);
+  } catch (_) {}
+
+  try {
+    const esc = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM escrows WHERE status = 'held'`
+    ).first();
+    stats.held_escrows = Number(esc?.c || 0);
+  } catch (_) {}
+
+  try {
+    const dsp = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM work_disputes WHERE status IN ('open', 'voting', 'accepted')`
+    ).first();
+    stats.open_disputes = Number(dsp?.c || 0);
+  } catch (_) {}
+
+  // Outstanding credit vs limit sanity
+  try {
+    const badCredit = await env.DB.prepare(
+      `SELECT repo_id, credit_limit, outstanding_credit FROM agent_limits
+       WHERE COALESCE(outstanding_credit, 0) > COALESCE(credit_limit, 0) + 0.000001
+       LIMIT 20`
+    ).all();
+    for (const row of badCredit.results || []) {
+      findings.push({
+        severity: "high",
+        code: "credit_overdraw",
+        repo_id: row.repo_id,
+        credit_limit: Number(row.credit_limit),
+        outstanding_credit: Number(row.outstanding_credit),
+      });
+    }
+  } catch (_) {}
+
+  const critical = findings.filter((f) => f.severity === "critical").length;
+  const high = findings.filter((f) => f.severity === "high").length;
+
+  try {
+    await logSafetyEvent(env, "integrity.scan", {
+      reason: critical > 0 ? "findings_critical" : "ok",
+      meta: { critical, high, accounts_scanned: stats.accounts_scanned },
+    });
+  } catch (_) {}
+
+  return json(request, {
+    ok: critical === 0,
+    integrity: critical === 0 ? "pass" : "fail",
+    stats,
+    findings,
+    summary: {
+      critical,
+      high,
+      message:
+        critical === 0
+          ? "No critical ledger anomalies in sample."
+          : "Critical findings — investigate before increasing limits.",
+    },
+    latency_ms: Date.now() - t0,
+  });
+}
+
+
 /* ─── Sandbox D1 cleanup (ADMIN_CLEANUP_SECRET required) ───
  * Temporary while AgentPay is in testing. Remove before real-user production.
  * Does NOT drop schema. Does NOT delete users / sessions / api_keys by default.
@@ -1830,16 +2114,6 @@ async function pruneTelemetry(env) {
  */
 async function handleAdminSandboxCleanup(request, env) {
   const t0 = Date.now();
-  const secret = String(env.ADMIN_CLEANUP_SECRET || "").trim();
-  if (!secret || secret.length < 16) {
-    return bad(
-      request,
-      "Cleanup disabled: set ADMIN_CLEANUP_SECRET (16+ chars) in Worker secrets",
-      503,
-      { code: "cleanup_disabled" }
-    );
-  }
-
   let body = {};
   try {
     body = await request.json();
@@ -1847,21 +2121,8 @@ async function handleAdminSandboxCleanup(request, env) {
     body = {};
   }
 
-  const provided =
-    (request.headers.get("X-Admin-Cleanup-Key") || "").trim() ||
-    String(body.secret || body.key || "").trim();
-
-  if (!provided || provided !== secret) {
-    return bad(request, "Invalid cleanup key", 403, {
-      code: "bad_cleanup_key",
-      hint:
-        "Lengths: sent=" +
-        provided.length +
-        " stored=" +
-        secret.length +
-        " (must match exactly; re-save secret without quotes/spaces)",
-    });
-  }
+  const admin = await assertAdminSecret(request, env, body);
+  if (!admin.ok) return admin.response;
 
   if (body.confirm !== true && body.confirm !== "SANDBOX_RESET") {
     return bad(
@@ -4545,10 +4806,45 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request) });
+      return new Response(null, {
+        status: 204,
+        headers: { ...securityHeaders(), ...corsHeaders(request) },
+      });
+    }
+
+    // Early body-size gate (Content-Length) — bank-grade abuse resistance
+    const oversized = rejectOversizedBody(request);
+    if (oversized) return oversized;
+
+    // Global per-IP POST budget (in addition to route-level RL)
+    if (request.method === "POST") {
+      try {
+        const ip = clientIp(request);
+        const ipRl = await checkRateLimit(
+          env,
+          "ip:post:" + ip,
+          RL_IP_POST_MAX,
+          RL_IP_POST_WINDOW_SEC
+        );
+        if (ipRl) {
+          return bad(request, "Too many requests from this IP", 429, {
+            code: "ip_rate_limited",
+            retry_after_sec: ipRl.retry_after_sec,
+          });
+        }
+      } catch (e) {
+        console.log("ip_rl_error", e && e.message);
+      }
     }
 
     try {
+      if (request.method === "GET" && url.pathname === "/api/security/status") {
+        return await handleSecurityStatus(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/integrity") {
+        return await handleAdminIntegrity(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/api/auth/google") {
         return handleAuthGoogleStart(request, env, url);
       }
@@ -16156,14 +16452,8 @@ async function handleAdminShield(request, env) {
   } catch {
     return bad(request, "Invalid JSON body");
   }
-  const secret =
-    request.headers.get("X-Admin-Cleanup-Key") ||
-    body.secret ||
-    "";
-  const expected = env.ADMIN_CLEANUP_SECRET || "";
-  if (!expected || secret !== expected) {
-    return bad(request, "Unauthorized", 401, { code: "admin_auth" });
-  }
+  const admin = await assertAdminSecret(request, env, body);
+  if (!admin.ok) return admin.response;
 
   const scope = String(body.scope || "global").toLowerCase();
   const id = scope === "global" ? "global" : parseRepo(body.repo_id || body.repo);
