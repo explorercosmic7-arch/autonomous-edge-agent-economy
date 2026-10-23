@@ -89,7 +89,7 @@
 const ALLOWED_ORIGINS = new Set([
   "https://edgerail.pages.dev",
   "https://newhorizons-beyondhorizon.pages.dev",
-  "https://agentpay.pages.dev",
+ 
   "https://autonomous-edge-agent-economy.explorercosmic7.workers.dev",
 ]);
 
