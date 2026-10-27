@@ -30,7 +30,7 @@ import {
 
 /* ─── Safety: lockWallet (needs adjustRep + scheduleWebhook); rest in shared/safety.js ─── */
 
-export async export function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx } = {}) {
+export async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx } = {}) {
   await ensureAgentLimits(env, repoId);
   await env.DB.prepare(
     `UPDATE agent_limits
@@ -59,7 +59,7 @@ export async export function lockWallet(env, repoId, reason, { api_key_id, user_
 }
 
 
-export async export function safetyGate(request, env, authUser, fromRepo, amount) {
+export async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (!fromRepo) return null;
 
   const sus = rejectIfSuspendedKey(request, authUser);
@@ -139,7 +139,7 @@ export async export function safetyGate(request, env, authUser, fromRepo, amount
 }
 
 /** Call after a successful debit to update velocity + daily spent. */
-export async export function safetyRecordSpend(env, authUser, fromRepo, amount) {
+export async function safetyRecordSpend(env, authUser, fromRepo, amount) {
   if (!fromRepo || !amount) return;
   const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   await recordVelocityEvent(env, fromRepo, amount, keyId);
