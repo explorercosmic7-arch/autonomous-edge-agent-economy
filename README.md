@@ -1,4 +1,4 @@
-
+<!-- phase0 ok -->
 
 # Autonomous Edge-Agent Economy
 
