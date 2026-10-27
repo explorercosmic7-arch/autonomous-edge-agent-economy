@@ -1,3 +1,14 @@
+import {
+  securityHeaders,
+  corsHeaders,
+  json,
+  bad,
+  timingSafeEqualString,
+  rejectOversizedBody,
+  clientIp,
+  MAX_JSON_BODY_BYTES,
+} from "./shared/http.js";
+
 /***
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
  * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
@@ -85,13 +96,6 @@
  *           POST /api/admin/integrity (ADMIN_CLEANUP_SECRET — ledger balance audit)
  */
 
-
-const ALLOWED_ORIGINS = new Set([
-  "https://edgerail.pages.dev",
-  "https://newhorizons-beyondhorizon.pages.dev",
- 
-  "https://autonomous-edge-agent-economy.explorercosmic7.workers.dev",
-]);
 
 const DASHBOARD_URL = "https://edgerail.pages.dev/ai-agents-payment-gateway";
 const COOKIE_NAME = "a2a_session";
@@ -341,92 +345,10 @@ const RL_DISPUTE_WINDOW_SEC = 60;
 const EXPIRE_DISPUTE_BATCH = 40;
 
 /* ─── Hardening defaults (do not loosen without review) ─── */
-const MAX_JSON_BODY_BYTES = 256 * 1024; // 256 KiB — rejects oversized POST before parse
 const RL_IP_POST_MAX = 120;             // global per-IP POST budget
 const RL_IP_POST_WINDOW_SEC = 60;
 const INTEGRITY_SAMPLE_LIMIT = 500;     // max accounts scanned per integrity run
 
-
-function securityHeaders() {
-  return {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
-    "Cache-Control": "no-store",
-    "X-AgentPay-Security": "bank-grade-v1",
-  };
-}
-
-function corsHeaders(request) {
-  const origin = request.headers.get("Origin") || "";
-  const allow = ALLOWED_ORIGINS.has(origin) ? origin : "https://edgerail.pages.dev";
-  return {
-    "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Idempotency-Key, X-Admin-Cleanup-Key",
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Max-Age": "86400",
-    Vary: "Origin",
-  };
-}
-
-function json(request, data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...securityHeaders(),
-      ...corsHeaders(request),
-      ...extraHeaders,
-    },
-  });
-}
-
-function bad(request, message, status = 400, extra = {}) {
-  return json(request, { ok: false, error: message, ...extra }, status);
-}
-
-/** Constant-time string compare for admin secrets (length must match first). */
-function timingSafeEqualString(a, b) {
-  const s1 = String(a || "");
-  const s2 = String(b || "");
-  if (s1.length !== s2.length) return false;
-  let out = 0;
-  for (let i = 0; i < s1.length; i++) {
-    out |= s1.charCodeAt(i) ^ s2.charCodeAt(i);
-  }
-  return out === 0;
-}
-
-/** Reject oversized bodies early (Content-Length). Returns Response or null. */
-function rejectOversizedBody(request) {
-  if (request.method !== "POST" && request.method !== "PUT" && request.method !== "PATCH") {
-    return null;
-  }
-  const cl = request.headers.get("Content-Length");
-  if (cl == null || cl === "") return null;
-  const n = Number(cl);
-  if (!Number.isFinite(n) || n < 0) {
-    return bad(request, "Invalid Content-Length", 400, { code: "bad_content_length" });
-  }
-  if (n > MAX_JSON_BODY_BYTES) {
-    return bad(request, "Request body too large (max " + MAX_JSON_BODY_BYTES + " bytes)", 413, {
-      code: "body_too_large",
-      max_bytes: MAX_JSON_BODY_BYTES,
-    });
-  }
-  return null;
-}
-
-function clientIp(request) {
-  return (
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("True-Client-IP") ||
-    (request.headers.get("X-Forwarded-For") || "").split(",")[0].trim() ||
-    "unknown"
-  );
-}
 
 async function assertAdminSecret(request, env, body) {
   const secret = String(env.ADMIN_CLEANUP_SECRET || "").trim();
@@ -585,7 +507,6 @@ async function checkRateLimit(env, bucketKey, max, windowSec) {
     .run();
   return null;
 }
-
 
 
 /* ─── Safety helpers (budget / velocity / lock / kill-switch) ─── */
@@ -1349,7 +1270,6 @@ async function repayCredit(env, repoId, amount) {
 }
 
 
-
 /* ─── Auth ─── */
 
 async function getSessionUser(request, env) {
@@ -1838,7 +1758,6 @@ async function expireHeldEscrows(env, ctx) {
 }
 
 
-
 /* ─── Telemetry prune (non-critical only; never touch balances/users/ledger core) ───
  * Safe to delete:
  *   velocity_events > 24h
@@ -2266,8 +2185,6 @@ async function handleAdminSandboxCleanup(request, env) {
     latency_ms: Date.now() - t0,
   });
 }
-
-
 
 
 /* ─── Spend Intent Capsules ───
@@ -3641,7 +3558,6 @@ async function expireHireRfqs(env, ctx) {
 }
 
 
-
 /* ─── Standing Orders (recurring micro-pays) ───
  * POST /api/standing/open   { from_repo?, to_repo, amount, interval_sec, max_runs?, budget_usd?, ttl_seconds?, task?, label? }
  * POST /api/standing/cancel { id }
@@ -4228,9 +4144,6 @@ async function processStandingOrders(env, ctx) {
   }
   return { ran, failed, completed, expired, latency_ms: Date.now() - t0 };
 }
-
-
-
 
 
 /* ─── Delegation chains (parent authority / child pocket money) ───
@@ -5523,7 +5436,6 @@ export default {
         }
 
 
-
         try {
           const pruned = await pruneTelemetry(env);
           console.log(
@@ -6380,7 +6292,6 @@ async function handleMeGithubRepos(request, env) {
     repos: withCaps,
   });
 }
-
 
 
 /* ─── GitLab project list (parity with GitHub repo picker) ─── */
@@ -8993,8 +8904,6 @@ async function handleStreamList(request, url, env) {
 }
 
 
-
-
 /* ─── Ephemeral sub-wallets (task wallets) ───
  * Parent debits budget → held in system/subwallet.
  * Child spends only via POST /api/subwallet/spend { id, to_repo, amount }.
@@ -9433,7 +9342,6 @@ async function expireSubWallets(env) {
 }
 
 
-
 /* ─── Signed payment receipts ───
  * HMAC-SHA256 over canonical JSON using env.RECEIPT_SECRET (or SESSION cookie secret fallback).
  * Agents store receipt_id + signature offline and verify later without trusting the UI.
@@ -9568,8 +9476,6 @@ async function handleReceiptVerify(request, env) {
     id: id || null,
   });
 }
-
-
 
 
 function parseTraceId(v) {
@@ -11012,7 +10918,6 @@ async function handleNettingList(request, url, env) {
     );
   }
 }
-
 
 
 /* ─── Dispute / Arbitration (Supreme Court) ───
@@ -14190,7 +14095,6 @@ async function handleMePolicySet(request, env) {
 }
 
 /* ─── Safety controls (dashboard / API) ─── */
-
 
 
 /* ─── Commit–reveal counterfactual pay ───
