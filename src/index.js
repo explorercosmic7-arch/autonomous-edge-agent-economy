@@ -5,7 +5,7 @@
  * INVENTORY (do not delete):
  * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
  *           GET /api/auth/github, GET /api/auth/github/callback,
- *           GET /api/auth/gitlab, GET /api/auth/gitlab/callback,
+ *           GET /api/auth/gitlab, GET /api/auth/gitlab/callback, 
  *           GET /api/auth/me, POST /api/auth/logout
  * Me:       POST /api/me/agent, GET /api/me/balance,
  *           GET /api/me/github/repos, GET /api/me/gitlab/repos, GET /api/me/repos
