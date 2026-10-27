@@ -9,7 +9,7 @@ import { DASHBOARD_URL } from "./constants.js";
 
 /* ─── Auth ─── */
 
-export async export function getSessionUser(request, env) {
+export async function getSessionUser(request, env) {
   const cookies = parseCookies(request.headers.get("Cookie"));
   const sid = cookies[COOKIE_NAME];
   if (!sid) return null;
