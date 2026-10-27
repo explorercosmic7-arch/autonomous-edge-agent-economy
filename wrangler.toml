@@ -1,5 +1,5 @@
 name = "autonomous-edge-agent-economy"
-main = "worker.js"
+main = "src/index.js"
 compatibility_date = "2026-09-01"
 
 
