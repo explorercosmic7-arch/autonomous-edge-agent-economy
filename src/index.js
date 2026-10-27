@@ -14958,5 +14958,5 @@ async function handleAdminShield(request, env) {
       reason: row.reason || null,
       cools_at: row.cools_at || null,
     },
-  });
+  }); 
 }
