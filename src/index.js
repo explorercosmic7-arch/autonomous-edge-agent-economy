@@ -31,6 +31,9 @@ import {
 
 import { checkRateLimit } from "./shared/rateLimit.js";
 
+
+import { assertAdminSecret } from "./shared/admin.js";
+
 /***
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
  * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
@@ -366,30 +369,6 @@ const EXPIRE_DISPUTE_BATCH = 40;
 const RL_IP_POST_MAX = 120;             // global per-IP POST budget
 const RL_IP_POST_WINDOW_SEC = 60;
 const INTEGRITY_SAMPLE_LIMIT = 500;     // max accounts scanned per integrity run
-
-
-async function assertAdminSecret(request, env, body) {
-  const secret = String(env.ADMIN_CLEANUP_SECRET || "").trim();
-  if (!secret || secret.length < 16) {
-    return {
-      ok: false,
-      response: bad(request, "Admin disabled: set ADMIN_CLEANUP_SECRET (16+ chars)", 503, {
-        code: "admin_disabled",
-      }),
-    };
-  }
-  const provided =
-    (request.headers.get("X-Admin-Cleanup-Key") || "").trim() ||
-    String((body && (body.secret || body.key)) || "").trim();
-  if (!provided || !timingSafeEqualString(provided, secret)) {
-    return {
-      ok: false,
-      response: bad(request, "Invalid admin key", 403, { code: "bad_admin_key" }),
-    };
-  }
-  return { ok: true };
-}
-
 
 
 /* ─── Safety helpers (budget / velocity / lock / kill-switch) ─── */
