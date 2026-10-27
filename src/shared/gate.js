@@ -1,4 +1,4 @@
-/**
+/** 
  * Shared safety gate — lockWallet, safetyGate, safetyRecordSpend.
  * Orchestrates auth / shield / policy / velocity / daily budget checks.
  */
