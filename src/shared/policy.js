@@ -55,7 +55,7 @@ export function normalizePolicy(raw) {
   };
 }
 
-export async export function getAgentPolicy(env, repoId) {
+export async function getAgentPolicy(env, repoId) {
   if (!repoId) return normalizePolicy({});
   try {
     const row = await env.DB.prepare(
