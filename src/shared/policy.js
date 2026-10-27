@@ -76,7 +76,7 @@ export async function getAgentPolicy(env, repoId) {
 }
 
 /** Returns null if allowed, or { code, error }. */
-export async export function checkSpendPolicy(env, fromRepo, amount, toRepo, task) {
+export async function checkSpendPolicy(env, fromRepo, amount, toRepo, task) {
   const pol = await getAgentPolicy(env, fromRepo);
   if (pol.blocked) {
     return { code: "policy_blocked", error: "Spend policy: agent is blocked by policy-as-code" };
@@ -129,7 +129,7 @@ export async export function checkSpendPolicy(env, fromRepo, amount, toRepo, tas
   return null;
 }
 
-export async export function handleMePolicyGet(request, env) {
+export async function handleMePolicyGet(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
   const repo = user.default_repo ? parseRepo(user.default_repo) : null;
@@ -170,7 +170,7 @@ export async export function handleMePolicyGet(request, env) {
   });
 }
 
-export async export function handleMePolicySet(request, env) {
+export async function handleMePolicySet(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
   const repo = user.default_repo ? parseRepo(user.default_repo) : null;
