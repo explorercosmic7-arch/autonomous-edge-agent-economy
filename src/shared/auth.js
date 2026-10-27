@@ -38,7 +38,7 @@ export async function getSessionUser(request, env) {
  * sign in with the other provider.
  * Returns Response redirect when blocked; null when OK to continue OAuth.
  */
-export async export function rejectIfAlreadySignedIn(request, env) {
+export async function rejectIfAlreadySignedIn(request, env) {
   const existing = await getSessionUser(request, env);
   if (!existing) return null;
   return Response.redirect(
@@ -53,7 +53,7 @@ export async export function rejectIfAlreadySignedIn(request, env) {
  * Returns null if OK, or { code, error, ... } if blocked.
  * May learn-bind on first use (mode=learn).
  */
-export async export function enforceKeyBinding(env, keyRow, request) {
+export async function enforceKeyBinding(env, keyRow, request) {
   if (!keyRow || !keyRow.key_id) return null;
   let mode = (keyRow.bind_mode || "").toLowerCase().trim();
   if (!mode || mode === "none" || mode === "off") {
@@ -176,7 +176,7 @@ export async export function enforceKeyBinding(env, keyRow, request) {
 }
 
 
-export async export function getApiKeyUser(request, env) {
+export async function getApiKeyUser(request, env) {
   const auth = request.headers.get("Authorization") || "";
   const m = auth.match(/^Bearer\s+(a2a_[A-Fa-f0-9]+)$/i);
   if (!m) return null;
@@ -250,7 +250,7 @@ export async export function getApiKeyUser(request, env) {
   return row;
 }
 
-export async export function getAuthUser(request, env) {
+export async function getAuthUser(request, env) {
   const session = await getSessionUser(request, env);
   if (session) return { ...session, auth_via: "session" };
   const keyUser = await getApiKeyUser(request, env);
