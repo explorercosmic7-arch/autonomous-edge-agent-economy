@@ -1,4 +1,4 @@
-/** 
+/***
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
  * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
  *
