@@ -3,97 +3,20 @@ import {
   corsHeaders,
   json,
   bad,
-  timingSafeEqualString,
   rejectOversizedBody,
   clientIp,
-  MAX_JSON_BODY_BYTES,
 } from "./shared/http.js";
-
-
-import {
-  parseRepo,
-  parseAmount,
-  sleep,
-  randomId,
-  parseCookies,
-  sessionCookie,
-  clearSessionCookie,
-  sha256Hex,
-  hmacSha256Hex,
-  parseTtlSeconds,
-  parseWebhookUrl,
-  REPO_RE,
-  MIN_AMOUNT,
-  MAX_AMOUNT,
-  COOKIE_NAME,
-} from "./shared/utils.js";
-
 
 import { checkRateLimit } from "./shared/rateLimit.js";
 
+import { getRequestEdge } from "./shared/edge.js";
 
-import { assertAdminSecret } from "./shared/admin.js";
-
-
-import { getRequestEdge, hashIp } from "./shared/edge.js";
+import { getAuthUser } from "./shared/auth.js";
 
 import {
-  logSafetyEvent,
-  ensureAgentLimits,
-  getAgentLimits,
-  checkWalletLocked,
-  unlockWallet,
-  suspendApiKey,
-  recordVelocityEvent,
-  checkVelocity,
-  checkDailyBudget,
-  addDailySpent,
-} from "./shared/safety.js";
-
-import {
-  logShieldEvent,
-  ensureShieldRow,
-  getShield,
-  setShieldLevel,
-  countRecentWalletLocks,
-  checkShieldGate,
-  maybeAutoTripGlobalShield,
-} from "./shared/shield.js";
-
-import { ensureAccount } from "./shared/accounts.js";
-
-import {
-  getCreditState,
-  adjustRep,
-  debitWithCredit,
-  repayCredit,
-} from "./shared/credit.js";
-
-import { dispatchWebhook, scheduleWebhook } from "./shared/webhooks.js";
-
-import {
-  getSessionUser,
-  rejectIfAlreadySignedIn,
-  enforceKeyBinding,
-  getApiKeyUser,
-  getAuthUser,
-  rejectIfSuspendedKey,
-} from "./shared/auth.js";
-
-import {
-  matchRepoGlob,
-  normalizePolicy,
-  getAgentPolicy,
-  checkSpendPolicy,
   handleMePolicyGet,
   handleMePolicySet,
 } from "./shared/policy.js";
-
-import {
-  lockWallet,
-  safetyGate,
-  safetyRecordSpend,
-} from "./shared/gate.js";
 
 import {
   expireHeldEscrows,
@@ -142,7 +65,6 @@ import {
   handleDelegateGet,
   handleDelegateList,
   expireDelegations,
-  claimDelegationSpend,
 } from "./shared/delegate.js";
 
 import {
@@ -290,9 +212,6 @@ import {
   handleFund,
   handleBalance,
   handleLedger,
-  issuePayReceipt,
-  parseTraceId,
-  ensureTrace,
 } from "./shared/ledger.js";
 
 import {
@@ -335,248 +254,9 @@ import {
   handleMeSafetyUnlock,
 } from "./shared/meSafety.js";
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 import {
-  DASHBOARD_URL,
-  SESSION_DAYS,
-  FAUCET_MAX_PER_CALL,
-  FAUCET_ACCOUNT_CAP,
-  SYSTEM_FAUCET,
-  SYSTEM_ESCROW,
-  MAX_KEYS_PER_USER,
-  RL_KEY_CREATE_MAX,
-  RL_KEY_CREATE_WINDOW_SEC,
-  RL_PAY_MAX,
-  RL_PAY_WINDOW_SEC,
-  RL_ESCROW_MAX,
-  RL_ESCROW_WINDOW_SEC,
-  ESCROW_DEFAULT_TTL_HOURS,
-  ESCROW_MIN_TTL_SEC,
-  ESCROW_MAX_TTL_SEC,
-  EXPIRE_BATCH_LIMIT,
-  WEBHOOK_TIMEOUT_MS,
-  RL_WEBHOOK_SET_MAX,
-  RL_WEBHOOK_SET_WINDOW_SEC,
-  RL_GITHUB_REPOS_MAX,
-  RL_GITHUB_REPOS_WINDOW_SEC,
-  RL_STREAM_MAX,
-  RL_STREAM_WINDOW_SEC,
-  SYSTEM_STREAM,
-  STREAM_MIN_BUDGET,
-  STREAM_MAX_BUDGET,
-  SYSTEM_SUBWALLET,
-  SUBWALLET_MIN_BUDGET,
-  SUBWALLET_MAX_BUDGET,
-  SUBWALLET_DEFAULT_TTL_SEC,
-  SUBWALLET_MIN_TTL_SEC,
-  SUBWALLET_MAX_TTL_SEC,
-  RL_SUBWALLET_MAX,
-  RL_SUBWALLET_WINDOW_SEC,
-  EXPIRE_SUBWALLET_BATCH,
-  SYSTEM_NETTING,
-  NETTING_DEFAULT_WINDOW_HOURS,
-  NETTING_MIN_WINDOW_HOURS,
-  NETTING_MAX_WINDOW_HOURS,
-  NETTING_MAX_PAIRS,
-  RL_NETTING_MAX,
-  RL_NETTING_WINDOW_SEC,
-  SYSTEM_TICKET,
-  TICKET_MIN_UNITS,
-  TICKET_MAX_UNITS,
-  TICKET_DEFAULT_TTL_SEC,
-  TICKET_MIN_TTL_SEC,
-  TICKET_MAX_TTL_SEC,
-  RL_TICKET_MAX,
-  RL_TICKET_WINDOW_SEC,
-  EXPIRE_TICKET_BATCH,
-  SYSTEM_BOND,
-  SYSTEM_SLASH_POOL,
-  BOND_MIN,
-  BOND_MAX,
-  BOND_DEFAULT_TTL_SEC,
-  BOND_MIN_TTL_SEC,
-  BOND_MAX_TTL_SEC,
-  BOND_DEFAULT_MATCH_TTL_SEC,
-  BOND_DEFAULT_SLASH_BPS,
-  RL_BOND_MAX,
-  RL_BOND_WINDOW_SEC,
-  EXPIRE_BOND_BATCH,
-  SYSTEM_SAGA,
-  SAGA_MIN_BUDGET,
-  SAGA_MAX_BUDGET,
-  SAGA_MAX_STEPS,
-  SAGA_DEFAULT_TTL_SEC,
-  SAGA_MIN_TTL_SEC,
-  SAGA_MAX_TTL_SEC,
-  RL_SAGA_MAX,
-  RL_SAGA_WINDOW_SEC,
-  EXPIRE_SAGA_BATCH,
-  SAFETY_DEFAULT_VELOCITY_MAX_TX,
-  SAFETY_DEFAULT_VELOCITY_TX_WINDOW_SEC,
-  SAFETY_DEFAULT_VELOCITY_MAX_USD,
-  SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC,
-  SAFETY_SPIKE_TX_PER_SEC,
-  SAFETY_VELOCITY_PRUNE_HOURS,
-  CREDIT_DEFAULT_LIMIT,
-  CREDIT_MAX_LIMIT,
-  CREDIT_REP_PER_USD,
-  CREDIT_REP_SUCCESS_BONUS,
-  CREDIT_REP_FAIL_PENALTY,
-  CREDIT_REP_TO_LIMIT_RATIO,
-  CREDIT_AUTO_LIMIT,
-  RL_CREDIT_MAX,
-  RL_CREDIT_WINDOW_SEC,
-  SYSTEM_COMMIT,
-  COMMIT_MIN,
-  COMMIT_MAX,
-  COMMIT_DEFAULT_TTL_SEC,
-  COMMIT_MIN_TTL_SEC,
-  COMMIT_MAX_TTL_SEC,
-  RL_COMMIT_MAX,
-  RL_COMMIT_WINDOW_SEC,
-  EXPIRE_COMMIT_BATCH,
-  SYSTEM_CLEARING,
-  CLEARING_DEFAULT_WINDOW_HOURS,
-  CLEARING_MIN_WINDOW_HOURS,
-  CLEARING_MAX_WINDOW_HOURS,
-  CLEARING_MAX_REPOS,
-  RL_CLEARING_MAX,
-  RL_CLEARING_WINDOW_SEC,
-  SYSTEM_WORK,
-  WORK_MIN,
-  WORK_MAX,
-  WORK_DEFAULT_TTL_SEC,
-  WORK_MIN_TTL_SEC,
-  WORK_MAX_TTL_SEC,
-  RL_WORK_MAX,
-  RL_WORK_WINDOW_SEC,
-  EXPIRE_WORK_BATCH,
-  WORK_BLOCK_SELF_ATTEST,
-  WORK_REQUIRE_DISTINCT_ATTESTORS,
-  SYSTEM_CONTINUITY,
-  CONT_MIN_BOND,
-  CONT_MAX_BOND,
-  CONT_DEFAULT_INTERVAL_SEC,
-  CONT_MIN_INTERVAL_SEC,
-  CONT_MAX_INTERVAL_SEC,
-  CONT_DEFAULT_GRACE_SEC,
-  CONT_MIN_GRACE_SEC,
-  CONT_MAX_GRACE_SEC,
-  CONT_DEFAULT_MISS_LIMIT,
-  CONT_MAX_MISS_LIMIT,
-  RL_CONT_MAX,
-  RL_CONT_WINDOW_SEC,
-  EXPIRE_CONT_BATCH,
-  SYSTEM_POOL,
-  POOL_MIN,
-  POOL_MAX,
-  POOL_DEFAULT_TTL_SEC,
-  POOL_MIN_TTL_SEC,
-  POOL_MAX_TTL_SEC,
-  RL_POOL_MAX,
-  RL_POOL_WINDOW_SEC,
-  EXPIRE_POOL_BATCH,
-  SHIELD_LEVEL_NORMAL,
-  SHIELD_LEVEL_WATCH,
-  SHIELD_LEVEL_THROTTLE,
-  SHIELD_LEVEL_FREEZE,
-  SHIELD_LEVEL_EMERGENCY,
-  SHIELD_AUTO_LOCKS_TRIP,
-  SHIELD_AUTO_WINDOW_SEC,
-  SHIELD_COOLDOWN_SEC,
-  SHIELD_MAX_LEVEL,
-  RL_SHIELD_MAX,
-  RL_SHIELD_WINDOW_SEC,
-  SYSTEM_INTENT,
-  INTENT_MIN,
-  INTENT_MAX,
-  INTENT_DEFAULT_TTL_SEC,
-  INTENT_MIN_TTL_SEC,
-  INTENT_MAX_TTL_SEC,
-  RL_INTENT_MAX,
-  RL_INTENT_WINDOW_SEC,
-  EXPIRE_INTENT_BATCH,
-  SYSTEM_HIRE,
-  HIRE_MIN,
-  HIRE_MAX,
-  HIRE_DEFAULT_TTL_SEC,
-  HIRE_MIN_TTL_SEC,
-  HIRE_MAX_TTL_SEC,
-  RL_HIRE_MAX,
-  RL_HIRE_WINDOW_SEC,
-  EXPIRE_HIRE_BATCH,
-  SYSTEM_STANDING,
-  STANDING_MIN,
-  STANDING_MAX,
-  STANDING_MIN_INTERVAL_SEC,
-  STANDING_MAX_INTERVAL_SEC,
-  STANDING_DEFAULT_INTERVAL_SEC,
-  STANDING_MIN_TTL_SEC,
-  STANDING_MAX_TTL_SEC,
-  STANDING_DEFAULT_TTL_SEC,
-  RL_STANDING_MAX,
-  RL_STANDING_WINDOW_SEC,
-  STANDING_RUN_BATCH,
-  SYSTEM_DELEGATE,
-  DELEGATE_MIN,
-  DELEGATE_MAX,
-  DELEGATE_DEFAULT_TTL_SEC,
-  DELEGATE_MIN_TTL_SEC,
-  DELEGATE_MAX_TTL_SEC,
-  RL_DELEGATE_MAX,
-  RL_DELEGATE_WINDOW_SEC,
-  EXPIRE_DELEGATE_BATCH,
-  SYSTEM_DISPUTE,
-  DISPUTE_MIN,
-  DISPUTE_MAX,
-  DISPUTE_DEFAULT_TTL_SEC,
-  DISPUTE_MIN_TTL_SEC,
-  DISPUTE_MAX_TTL_SEC,
-  DISPUTE_DEFAULT_COMPLAINANT_BOND_BPS,
-  DISPUTE_DEFAULT_ARBITER_BOND_BPS,
-  DISPUTE_MIN_ARBITERS,
-  DISPUTE_MAX_ARBITERS,
-  RL_DISPUTE_MAX,
-  RL_DISPUTE_WINDOW_SEC,
-  EXPIRE_DISPUTE_BATCH,
   RL_IP_POST_MAX,
   RL_IP_POST_WINDOW_SEC,
-  INTEGRITY_SAMPLE_LIMIT,
 } from "./shared/constants.js";
 
 /***
@@ -665,8 +345,6 @@ import {
  *           GET /api/security/status (public defense map);
  *           POST /api/admin/integrity (ADMIN_CLEANUP_SECRET — ledger balance audit)
  */
-
-
 
 export default {
   async fetch(request, env, ctx) {
@@ -893,7 +571,6 @@ export default {
           return await handleClearingGet(request, env, cid);
         }
       }
-
 
       if (request.method === "POST" && url.pathname === "/api/dispute/open") {
         return await handleDisputeOpen(request, env, ctx);
@@ -1333,7 +1010,6 @@ export default {
     }
   },
 
-
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
@@ -1388,7 +1064,6 @@ export default {
         } catch (err) {
           console.error("dispute-expire failed:", err && err.message ? err.message : err);
         }
-
 
         try {
           const pruned = await pruneTelemetry(env);
