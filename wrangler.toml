@@ -17,3 +17,8 @@ database_id = "75d9a918-0d02-4db1-99ca-307631be7eaf"
 # Run every 15 minutes — expire held escrows past expires_at
 [triggers]
 crons = ["*/15 * * * *"]
+
+# Users Logs - Only in testing periods
+[observability.logs]
+enabled = true
+
