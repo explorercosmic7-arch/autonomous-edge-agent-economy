@@ -1,6 +1,10 @@
 /**
  * Core ledger — pay, fund, balance, ledger + helpers
+ * Path on GitHub: src/shared/ledger.js
+ *
  * (receipt issue + trace helpers included for pay path)
+ *
+ * REQUIRES: src/shared/credit.js exports debitWithCredit
  */
 import { json, bad } from "./http.js";
 import {
@@ -21,6 +25,7 @@ import {
   ensureAgentLimits,
   recordVelocityEvent,
   addDailySpent,
+  checkVelocity,
 } from "./safety.js";
 import {
   debitWithCredit,
@@ -91,7 +96,6 @@ export async function handlePay(request, env, ctx) {
         return;
       }
     } catch (_) {}
-    // no ctx: still fire-and-forget without blocking too long
     Promise.resolve(p).catch(() => {});
   };
 
@@ -103,13 +107,11 @@ export async function handlePay(request, env, ctx) {
   }
 
   const authUser = await getAuthUser(request, env);
-
   const rlId = authUser
     ? authUser.auth_via === "api_key"
       ? "pay:key:" + (authUser.key_id || authUser.id)
       : "pay:user:" + authUser.id
     : "pay:anon:" + (request.headers.get("CF-Connecting-IP") || "x").slice(0, 64);
-
   const limited = await checkRateLimit(env, rlId, RL_PAY_MAX, RL_PAY_WINDOW_SEC);
   if (limited) {
     return bad(request, "Rate limit: too many payments", 429, {
@@ -121,7 +123,6 @@ export async function handlePay(request, env, ctx) {
   if (!fromRepo && authUser?.default_repo) {
     fromRepo = parseRepo(authUser.default_repo);
   }
-
   const toRepo = parseRepo(body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
   const task = String(body.task || "").slice(0, 500);
@@ -133,12 +134,12 @@ export async function handlePay(request, env, ctx) {
     body.trace_id || body.traceId || request.headers.get("X-Trace-Id")
   );
 
-
   // Delegation chain: child key + X-Delegate-Id spends parent-locked budget
-  const delegateIdHdr =
-    String(request.headers.get("X-Delegate-Id") || body.delegate_id || body.delegation_id || "")
-      .trim();
+  const delegateIdHdr = String(
+    request.headers.get("X-Delegate-Id") || body.delegate_id || body.delegation_id || ""
+  ).trim();
   let activeDelegation = null;
+
   if (delegateIdHdr) {
     if (!authUser || authUser.auth_via !== "api_key" || !authUser.key_id) {
       return bad(request, "X-Delegate-Id requires Authorization: Bearer <child_api_key>", 401, {
@@ -147,13 +148,11 @@ export async function handlePay(request, env, ctx) {
     }
     const sus = rejectIfSuspendedKey(request, authUser);
     if (sus) return sus;
-
     const toRepoEarly = parseRepo(body.to_repo || body.toRepo);
     const amountEarly = parseAmount(body.amount);
     const taskEarly = String(body.task || "").slice(0, 500);
     if (!toRepoEarly) return bad(request, "to_repo must be owner/repo");
     if (amountEarly == null) return bad(request, "amount must be between 0.000001 and 1000000");
-
     const claim = await claimDelegationSpend(env, {
       id: delegateIdHdr,
       childKeyId: authUser.key_id,
@@ -163,13 +162,17 @@ export async function handlePay(request, env, ctx) {
     });
     if (!claim.ok) {
       const st =
-        claim.code === "not_found" ? 404 :
-        claim.code === "table_missing" ? 500 :
-        claim.code === "delegate_key_mismatch" || claim.code === "delegate_allow_to" || claim.code === "delegate_task_prefix"
-          ? 403
-          : claim.code === "delegate_insufficient"
-            ? 402
-            : 400;
+        claim.code === "not_found"
+          ? 404
+          : claim.code === "table_missing"
+            ? 500
+            : claim.code === "delegate_key_mismatch" ||
+                claim.code === "delegate_allow_to" ||
+                claim.code === "delegate_task_prefix"
+              ? 403
+              : claim.code === "delegate_insufficient"
+                ? 402
+                : 400;
       return bad(request, claim.error, st, {
         code: claim.code,
         remaining_usd: claim.remaining_usd,
@@ -177,11 +180,8 @@ export async function handlePay(request, env, ctx) {
       });
     }
     activeDelegation = claim.delegation;
-    // Force from_repo to parent — child spends parent's pocket money
     fromRepo = parseRepo(activeDelegation.parent_repo);
-    // Skip parent wallet debit later — funds already in system/delegate
   }
-
 
   if (!fromRepo) {
     return bad(
@@ -226,8 +226,10 @@ export async function handlePay(request, env, ctx) {
     }
   }
 
-    const settleFrom = activeDelegation ? SYSTEM_DELEGATE : fromRepo;
-  const payTaskLabel = activeDelegation ? ("delegate-spend:" + activeDelegation.id + ":" + task.slice(0, 40)) : task;
+  const settleFrom = activeDelegation ? SYSTEM_DELEGATE : fromRepo;
+  const payTaskLabel = activeDelegation
+    ? "delegate-spend:" + activeDelegation.id + ":" + task.slice(0, 40)
+    : task;
 
   await env.DB.batch([
     env.DB.prepare(
@@ -242,59 +244,59 @@ export async function handlePay(request, env, ctx) {
   let creditDrawn = 0;
   let usedCredit = false;
 
-  // Delegation path: funds already locked in system/delegate — claim reduced remaining
   if (activeDelegation) {
-    fromBalance = null; // parent cash untouched
+    // Funds already locked in system/delegate — claim reduced remaining
+    fromBalance = null;
     creditDrawn = 0;
     usedCredit = false;
-    // Mark as settled from system/delegate below (skip parent debit)
   } else {
-  // Fast cash path
-  const cashDebit = await env.DB.prepare(
-    `UPDATE accounts
-     SET balance = balance - ?1, updated_at = datetime('now')
-     WHERE repo_id = ?2 AND balance >= ?1
-     RETURNING balance`
-  )
-    .bind(amount, fromRepo)
-    .first();
+    // Fast cash path
+    const cashDebit = await env.DB.prepare(
+      `UPDATE accounts
+       SET balance = balance - ?1, updated_at = datetime('now')
+       WHERE repo_id = ?2 AND balance >= ?1
+       RETURNING balance`
+    )
+      .bind(amount, fromRepo)
+      .first();
 
-  if (cashDebit) {
-    fromBalance = Number(cashDebit.balance);
-  } else {
-    const debitRes = await debitWithCredit(env, fromRepo, amount);
-    if (!debitRes.ok) {
-      if (idem && wonLock) {
-        await env.DB.prepare(
-          `DELETE FROM idempotency WHERE key = ? AND status = 'pending'`
-        )
-          .bind(idem)
-          .run()
-          .catch(() => {});
-      }
-      waitUntil(
-        env.DB.prepare(
-          `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
-           VALUES (?1, ?2, ?3, ?4, 'failed', ?5)`
-        )
-          .bind(settleFrom, toRepo, amount, payTaskLabel, Date.now() - t0)
-          .run()
-      );
-      return bad(
-        request,
-        debitRes.error || "Insufficient funds",
-        debitRes.code === "wallet_locked" ? 403 : 402,
-        {
-          code: debitRes.code || "insufficient",
-          available_credit: debitRes.available_credit,
+    if (cashDebit) {
+      fromBalance = Number(cashDebit.balance);
+    } else {
+      // Cash short → debitWithCredit (cash + optional credit line)
+      const debitRes = await debitWithCredit(env, fromRepo, amount);
+      if (!debitRes.ok) {
+        if (idem && wonLock) {
+          await env.DB.prepare(
+            `DELETE FROM idempotency WHERE key = ? AND status = 'pending'`
+          )
+            .bind(idem)
+            .run()
+            .catch(() => {});
         }
-      );
+        waitUntil(
+          env.DB.prepare(
+            `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
+             VALUES (?1, ?2, ?3, ?4, 'failed', ?5)`
+          )
+            .bind(settleFrom, toRepo, amount, payTaskLabel, Date.now() - t0)
+            .run()
+        );
+        return bad(
+          request,
+          debitRes.error || "Insufficient funds",
+          debitRes.code === "wallet_locked" ? 403 : 402,
+          {
+            code: debitRes.code || "insufficient",
+            available_credit: debitRes.available_credit,
+          }
+        );
+      }
+      fromBalance = Number(debitRes.balance);
+      creditDrawn = debitRes.credit_drawn || 0;
+      usedCredit = creditDrawn > 0;
     }
-    fromBalance = Number(debitRes.balance);
-    creditDrawn = debitRes.credit_drawn || 0;
-    usedCredit = creditDrawn > 0;
   }
-  } // end non-delegation debit
 
   if (traceId) {
     try {
@@ -310,6 +312,7 @@ export async function handlePay(request, env, ctx) {
   let txId = null;
 
   async function compensateDebit() {
+    if (activeDelegation) return;
     try {
       await env.DB.prepare(
         `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
@@ -343,9 +346,8 @@ export async function handlePay(request, env, ctx) {
         `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key, trace_id)
          VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6, ?7)
          RETURNING id`
-      ).bind(fromRepo, toRepo, amount, task, latency, idem, traceId),
+      ).bind(settleFrom, toRepo, amount, payTaskLabel, latency, idem, traceId),
     ]);
-    // D1 batch: array of { results: [...] }
     const r0 = batchRes && batchRes[0];
     const r1 = batchRes && batchRes[1];
     const creditRow =
@@ -359,7 +361,6 @@ export async function handlePay(request, env, ctx) {
     if (creditRow && creditRow.balance != null) toBalance = Number(creditRow.balance);
     if (txRow && txRow.id != null) txId = txRow.id;
   } catch (e) {
-    // Fallback without RETURNING / without trace_id column
     try {
       await env.DB.batch([
         env.DB.prepare(
@@ -397,7 +398,6 @@ export async function handlePay(request, env, ctx) {
     if (row) toBalance = Number(row.balance);
   }
 
-  // Receipt before response so clients always get receipt_id when possible
   let receiptId = null;
   let receiptSig = null;
   try {
@@ -405,7 +405,7 @@ export async function handlePay(request, env, ctx) {
       from_repo: fromRepo,
       to_repo: toRepo,
       amount,
-      task,
+      task: payTaskLabel,
       status: "success",
       tx_id: txId,
     });
@@ -417,7 +417,6 @@ export async function handlePay(request, env, ctx) {
     console.log("pay_receipt_err", e && e.message);
   }
 
-  
   if (activeDelegation) {
     try {
       await logDelegateEvent(env, activeDelegation.id, "spent", {
@@ -426,7 +425,13 @@ export async function handlePay(request, env, ctx) {
         to_repo: toRepo,
         note: task,
       });
-      await adjustRep(env, activeDelegation.parent_repo, CREDIT_REP_SUCCESS_BONUS, "delegate_spend", activeDelegation.id);
+      await adjustRep(
+        env,
+        activeDelegation.parent_repo,
+        CREDIT_REP_SUCCESS_BONUS,
+        "delegate_spend",
+        activeDelegation.id
+      );
       if (activeDelegation.created_by) {
         scheduleWebhook(ctx, env, activeDelegation.created_by, "delegate.spent", {
           id: activeDelegation.id,
@@ -447,14 +452,14 @@ export async function handlePay(request, env, ctx) {
     } catch (_) {}
   }
 
-const payload = {
+  const payload = {
     ok: true,
     status: "success",
     replayed: false,
     from_repo: fromRepo,
     to_repo: toRepo,
     amount,
-    task,
+    task: payTaskLabel,
     trace_id: traceId || undefined,
     credit_drawn: creditDrawn || undefined,
     latency_ms: Date.now() - t0,
@@ -468,7 +473,6 @@ const payload = {
     payload.receipt_signature = receiptSig;
   }
 
-  // Post-commit telemetry + idempotency (non-blocking)
   const keyId =
     authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   const today = new Date().toISOString().slice(0, 10);
@@ -495,7 +499,6 @@ const payload = {
           ).bind(fromRepo, Number(amount) || 0, today),
         ]);
       } catch (_) {
-        // ensure row then retry daily bump
         try {
           await ensureAgentLimits(env, fromRepo);
           await addDailySpent(env, fromRepo, amount);
@@ -529,7 +532,6 @@ const payload = {
   return json(request, payload);
 }
 
-
 export async function handleFund(request, env) {
   const t0 = Date.now();
   let body;
@@ -546,7 +548,6 @@ export async function handleFund(request, env) {
   if (amount > FAUCET_MAX_PER_CALL) {
     return bad(request, "Faucet max is $" + FAUCET_MAX_PER_CALL + " per request");
   }
-
   await ensureAccount(env, repo);
   const row = await env.DB.prepare(
     `UPDATE accounts
@@ -556,18 +557,15 @@ export async function handleFund(request, env) {
   )
     .bind(amount, repo, FAUCET_ACCOUNT_CAP)
     .first();
-
   if (!row) {
     return bad(request, "Faucet cap reached ($" + FAUCET_ACCOUNT_CAP + " per agent)", 429);
   }
-
   await env.DB.prepare(
     `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
      VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
   )
     .bind(SYSTEM_FAUCET, repo, amount, task, Date.now() - t0)
     .run();
-
   return json(request, {
     ok: true,
     status: "funded",
@@ -613,16 +611,18 @@ export async function handleLedger(request, url, env) {
   return json(request, { ok: true, count: results.length, transactions: results });
 }
 
-/* ─── Signed payment receipts ───
- * HMAC-SHA256 over canonical JSON using env.RECEIPT_SECRET (or SESSION cookie secret fallback).
- * Agents store receipt_id + signature offline and verify later without trusting the UI.
- */
+/* ─── Signed payment receipts ─── */
+
 export function receiptSecret(env) {
-  return env.RECEIPT_SECRET || env.SESSION_SECRET || env.GOOGLE_CLIENT_SECRET || "a2a-dev-receipt-secret";
+  return (
+    env.RECEIPT_SECRET ||
+    env.SESSION_SECRET ||
+    env.GOOGLE_CLIENT_SECRET ||
+    "a2a-dev-receipt-secret"
+  );
 }
 
 export function canonicalReceiptPayload(p) {
-  // stable field order for HMAC
   return JSON.stringify({
     v: 1,
     id: p.id,
@@ -635,7 +635,10 @@ export function canonicalReceiptPayload(p) {
   });
 }
 
-export async function issuePayReceipt(env, { from_repo, to_repo, amount, task, status, tx_id }) {
+export async function issuePayReceipt(
+  env,
+  { from_repo, to_repo, amount, task, status, tx_id }
+) {
   try {
     const id = "rcpt_" + randomId(12);
     const created_at = new Date().toISOString();
