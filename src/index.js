@@ -190,6 +190,13 @@ import {
 } from "./shared/agents.js";
 
 import { handleMeOverview } from "./shared/meOverview.js";
+import {
+  handlePassportGet,
+  handlePassportHistory,
+  handlePassportIssue,
+  handlePassportVerify,
+  handlePassportMe,
+} from "./shared/passport.js";
 
 import {
   handleMeKeysCreate,
@@ -343,6 +350,10 @@ import {
  * D1:       work_disputes + dispute_arbiters + dispute_events (d1-dispute-migration.sql)
  * Cron:     expireDisputes
  * Overview: GET /api/me/overview — Home aggregate (balance, safety, credit, shield, keys)
+ * Passport: GET /api/passport/:owner/:repo, GET /api/passport/:owner/:repo/history,
+ *           POST /api/passport/issue|verify, GET /api/passport/me
+ *           Portable signed agent economic identity (bands only — no balances)
+ * D1:       agent_passports optional (d1-passport-migration.sql)
  * Security: response security headers on all JSON; Content-Length body cap;
  *           timing-safe admin secret compare; per-IP POST rate limit;
  *           GET /api/security/status (public defense map);
@@ -874,6 +885,11 @@ export default {
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
             me_overview: "GET /api/me/overview",
+            passport_me: "GET /api/passport/me",
+            passport_get: "GET /api/passport/:owner/:repo",
+            passport_history: "GET /api/passport/:owner/:repo/history",
+            passport_issue: "POST /api/passport/issue",
+            passport_verify: "POST /api/passport/verify",
             me_github_repos: "GET /api/me/github/repos",
             me_gitlab_repos: "GET /api/me/gitlab/repos",
             me_repos: "GET /api/me/repos",
@@ -998,6 +1014,36 @@ export default {
         if (id && !id.includes("/")) return await handleDelegateGet(request, env, id);
       }
 
+      /* Agent Economic Passport */
+      if (request.method === "GET" && url.pathname === "/api/passport/me") {
+        return await handlePassportMe(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/passport/issue") {
+        return await handlePassportIssue(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/passport/verify") {
+        return await handlePassportVerify(request, env);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/passport/")) {
+        const rest = url.pathname.slice("/api/passport/".length).replace(/\/$/, "");
+        if (rest) {
+          const parts = rest.split("/").map(function (seg) {
+            try { return decodeURIComponent(seg); } catch (e) { return seg; }
+          });
+          if (parts.length === 1 && parts[0].includes("/")) {
+            return await handlePassportGet(request, env, parts[0]);
+          }
+          if (parts.length === 2 && parts[1] === "history") {
+            return await handlePassportHistory(request, env, parts[0], url);
+          }
+          if (parts.length === 2) {
+            return await handlePassportGet(request, env, parts[0] + "/" + parts[1]);
+          }
+          if (parts.length === 3 && parts[2] === "history") {
+            return await handlePassportHistory(request, env, parts[0] + "/" + parts[1], url);
+          }
+        }
+      }
       if (request.method === "POST" && url.pathname === "/api/pay") {
         return await handlePay(request, env, ctx);
       }
