@@ -265,6 +265,22 @@ function publicClaimsFromStats(stats, provider) {
   };
 }
 
+
+/**
+ * Live public claims for a repo (no signature). Used by Hire accept gate + UI.
+ * Fail-soft: never throws; empty/zero claims on missing data.
+ */
+export async function getPassportClaims(env, repoRaw) {
+  const repo = parseRepo(repoRaw);
+  if (!repo || !repo.includes("/")) return null;
+  try {
+    const { stats, provider } = await buildPassportStats(env, repo);
+    return publicClaimsFromStats(stats, provider);
+  } catch (_) {
+    return null;
+  }
+}
+
 async function signPayload(env, payloadObj) {
   const payload = JSON.stringify(payloadObj);
   const signature = await hmacSha256Hex(passportSecret(env), payload);
