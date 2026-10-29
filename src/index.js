@@ -189,6 +189,8 @@ import {
   handleMeBalance,
 } from "./shared/agents.js";
 
+import { handleMeOverview } from "./shared/meOverview.js";
+
 import {
   handleMeKeysCreate,
   handleMeKeysList,
@@ -259,16 +261,16 @@ import {
   RL_IP_POST_WINDOW_SEC,
 } from "./shared/constants.js";
 
-/***
+/**
  * Autonomous Edge-Agent Economy — Cloudflare Worker + D1
  * Ledger + OAuth + API keys + rate limits + escrow + auto-expire + webhooks
  *
  * INVENTORY (do not delete):
  * Auth:     GET /api/auth/google, GET /api/auth/google/callback,
  *           GET /api/auth/github, GET /api/auth/github/callback,
- *           GET /api/auth/gitlab, GET /api/auth/gitlab/callback, 
+ *           GET /api/auth/gitlab, GET /api/auth/gitlab/callback,
  *           GET /api/auth/me, POST /api/auth/logout
- * Me:       POST /api/me/agent, GET /api/me/balance,
+ * Me:       POST /api/me/agent, GET /api/me/balance, GET /api/me/overview,
  *           GET /api/me/github/repos, GET /api/me/gitlab/repos, GET /api/me/repos
  * Agents:   GET /api/agents, GET /api/agents/search, GET /api/agents/rank, POST /api/agents/scan
  *           Capabilities-aware index (AP-Capabilities / wrangler.toml)
@@ -340,6 +342,7 @@ import {
  *           Bonded arbitration over work claims — slash / release / split (supreme court)
  * D1:       work_disputes + dispute_arbiters + dispute_events (d1-dispute-migration.sql)
  * Cron:     expireDisputes
+ * Overview: GET /api/me/overview — Home aggregate (balance, safety, credit, shield, keys)
  * Security: response security headers on all JSON; Content-Length body cap;
  *           timing-safe admin secret compare; per-IP POST rate limit;
  *           GET /api/security/status (public defense map);
@@ -421,6 +424,9 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/me/balance") {
         return await handleMeBalance(request, env);
       }
+      if (request.method === "GET" && url.pathname === "/api/me/overview") {
+        return await handleMeOverview(request, env);
+      }
       if (request.method === "GET" && url.pathname === "/api/me/github/repos") {
         return await handleMeGithubRepos(request, env);
       }
@@ -490,7 +496,7 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/escrow") {
         return await handleEscrowList(request, url, env);
       }
-      
+
       if (request.method === "POST" && url.pathname === "/api/admin/sandbox-cleanup") {
         return await handleAdminSandboxCleanup(request, env);
       }
@@ -731,7 +737,6 @@ export default {
         }
       }
 
-      
       if (request.method === "GET" && url.pathname === "/api/shield") {
         return await handleShieldPublic(request, env);
       }
@@ -868,6 +873,7 @@ export default {
             auth_github: "GET /api/auth/github",
             me_agent: "POST /api/me/agent",
             me_balance: "GET /api/me/balance",
+            me_overview: "GET /api/me/overview",
             me_github_repos: "GET /api/me/github/repos",
             me_gitlab_repos: "GET /api/me/gitlab/repos",
             me_repos: "GET /api/me/repos",
@@ -966,6 +972,7 @@ export default {
           },
         });
       }
+
       if (request.method === "GET" && url.pathname === "/health") {
         const edge = getRequestEdge(request);
         return json(request, {
@@ -1025,7 +1032,6 @@ export default {
         } catch (err) {
           console.error("escrow-expire failed:", err && err.message ? err.message : err);
         }
-
         try {
           const st = await processStandingOrders(env, ctx);
           console.log(
@@ -1038,7 +1044,6 @@ export default {
         } catch (err) {
           console.error("standing-run failed:", err && err.message ? err.message : err);
         }
-
         try {
           const dg = await expireDelegations(env, ctx);
           console.log(
@@ -1051,7 +1056,6 @@ export default {
         } catch (err) {
           console.error("delegate-expire failed:", err && err.message ? err.message : err);
         }
-
         try {
           const dsp = await expireDisputes(env, ctx);
           console.log(
@@ -1064,7 +1068,6 @@ export default {
         } catch (err) {
           console.error("dispute-expire failed:", err && err.message ? err.message : err);
         }
-
         try {
           const pruned = await pruneTelemetry(env);
           console.log(
