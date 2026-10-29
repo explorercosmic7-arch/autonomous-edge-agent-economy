@@ -1,4 +1,4 @@
-/**
+/** 
  * Shared Hire Protocol — RFQ → Quote → Accept → Complete / Cancel + expire.
  *
  * Passport gate on Accept:
