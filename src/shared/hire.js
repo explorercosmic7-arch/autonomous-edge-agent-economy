@@ -1,5 +1,12 @@
 /**
  * Shared Hire Protocol — RFQ → Quote → Accept → Complete / Cancel + expire.
+ *
+ * Passport gate on Accept:
+ *   - Always attaches provider passport claims on success (soft).
+ *   - require_passport=true or passport_strict=true → hard block when:
+ *       dispute_rate > max_dispute_rate (default 0.25)
+ *       OR (require_history && settled_tx_band === "0")
+ *   - Body override: max_dispute_rate (0..1), require_history (bool)
  */
 import { json, bad } from "./http.js";
 import {
@@ -13,6 +20,7 @@ import { ensureAccount } from "./accounts.js";
 import { debitWithCredit, adjustRep } from "./credit.js";
 import { scheduleWebhook } from "./webhooks.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
+import { getPassportClaims } from "./passport.js";
 import {
   SYSTEM_HIRE,
   HIRE_MIN,
@@ -26,10 +34,12 @@ import {
   CREDIT_REP_SUCCESS_BONUS,
 } from "./constants.js";
 
+const DEFAULT_MAX_DISPUTE_RATE = 0.25;
+
 /* ─── Hire Protocol (RFQ → Quote → Accept → Complete / Cancel) ───
  * POST /api/hire/rfq       { task, budget_usd, capability?, ttl_seconds?, buyer_repo? }
  * POST /api/hire/quote     { rfq_id, amount_usd, eta_seconds?, note?, provider_repo? }
- * POST /api/hire/accept    { quote_id }  — hold funds, open job
+ * POST /api/hire/accept    { quote_id, require_passport?, passport_strict?, max_dispute_rate?, require_history? }
  * POST /api/hire/complete  { job_id }    — pay provider
  * POST /api/hire/cancel    { rfq_id? | job_id? }
  * GET  /api/hire           ?repo=&status=
@@ -43,6 +53,56 @@ export function parseHireTtl(body) {
     return Math.floor(sec);
   }
   return HIRE_DEFAULT_TTL_SEC;
+}
+
+/**
+ * Evaluate provider passport for hire accept.
+ * Returns { claims, warnings[], blocked, block_reason }.
+ */
+export async function evaluateHirePassport(env, providerRepo, opts = {}) {
+  const strict = !!(opts.require_passport || opts.passport_strict || opts.strict);
+  let maxRate = Number(opts.max_dispute_rate);
+  if (!Number.isFinite(maxRate) || maxRate < 0 || maxRate > 1) {
+    maxRate = DEFAULT_MAX_DISPUTE_RATE;
+  }
+  const requireHistory = !!opts.require_history;
+
+  const claims = await getPassportClaims(env, providerRepo);
+  const warnings = [];
+  let blocked = false;
+  let block_reason = null;
+
+  if (!claims) {
+    warnings.push("passport_unavailable");
+    if (strict) {
+      blocked = true;
+      block_reason = "provider_passport_unavailable";
+    }
+    return { claims: null, warnings, blocked, block_reason, max_dispute_rate: maxRate };
+  }
+
+  const rate = Number(claims.dispute_rate) || 0;
+  if (rate > maxRate) {
+    warnings.push("high_dispute_rate");
+    if (strict) {
+      blocked = true;
+      block_reason = "provider_dispute_rate_exceeded";
+    }
+  }
+
+  if (requireHistory && (claims.settled_tx_band === "0" || !claims.settled_tx_band)) {
+    warnings.push("no_settlement_history");
+    if (strict) {
+      blocked = true;
+      block_reason = "provider_no_settlement_history";
+    }
+  }
+
+  if ((Number(claims.rep_score) || 0) < 0) {
+    warnings.push("negative_rep");
+  }
+
+  return { claims, warnings, blocked, block_reason, max_dispute_rate: maxRate };
 }
 
 export async function logHireEvent(env, { rfq_id, quote_id, job_id, event, actor_repo, amount, note } = {}) {
@@ -114,6 +174,7 @@ export async function handleHireRfq(request, env, ctx) {
 
   let buyer = parseRepo(body.buyer_repo || body.from_repo);
   if (!buyer && authUser.default_repo) buyer = parseRepo(authUser.default_repo);
+
   const task = String(body.task || "").trim().slice(0, 500);
   const budget = parseAmount(body.budget_usd ?? body.budget ?? body.amount);
   const capability = body.capability ? String(body.capability).slice(0, 200) : null;
@@ -212,6 +273,7 @@ export async function handleHireQuote(request, env, ctx) {
   const rfqId = String(body.rfq_id || body.id || "").trim();
   let provider = parseRepo(body.provider_repo || body.from_repo);
   if (!provider && authUser.default_repo) provider = parseRepo(authUser.default_repo);
+
   const amount = parseAmount(body.amount_usd ?? body.amount);
   const eta = body.eta_seconds != null ? Math.floor(Number(body.eta_seconds)) : null;
   const note = body.note ? String(body.note).slice(0, 500) : null;
@@ -249,7 +311,6 @@ export async function handleHireQuote(request, env, ctx) {
     });
   }
 
-  // One open quote per provider per RFQ
   try {
     const existing = await env.DB.prepare(
       `SELECT id FROM hire_quotes
@@ -263,6 +324,12 @@ export async function handleHireQuote(request, env, ctx) {
         quote_id: existing.id,
       });
     }
+  } catch (_) {}
+
+  // Soft: attach provider passport on quote response (agents can filter before accept)
+  let provider_passport = null;
+  try {
+    provider_passport = await getPassportClaims(env, provider);
   } catch (_) {}
 
   const qid = "hq_" + randomId(12);
@@ -312,6 +379,7 @@ export async function handleHireQuote(request, env, ctx) {
       note,
       status: "open",
     },
+    provider_passport,
     latency_ms: Date.now() - t0,
   });
 }
@@ -352,6 +420,31 @@ export async function handleHireAccept(request, env, ctx) {
   const buyer = rfq.buyer_repo;
   const provider = quote.provider_repo;
 
+  /* ── Passport gate (soft by default; strict when requested) ── */
+  const passportEval = await evaluateHirePassport(env, provider, {
+    require_passport: body.require_passport,
+    passport_strict: body.passport_strict,
+    strict: body.strict,
+    max_dispute_rate: body.max_dispute_rate,
+    require_history: body.require_history,
+  });
+
+  if (passportEval.blocked) {
+    return bad(
+      request,
+      "Hire blocked by passport policy: " + (passportEval.block_reason || "provider_risk"),
+      403,
+      {
+        code: passportEval.block_reason || "passport_gate",
+        provider_repo: provider,
+        provider_passport: passportEval.claims,
+        passport_warnings: passportEval.warnings,
+        max_dispute_rate: passportEval.max_dispute_rate,
+        hint: "Omit require_passport / passport_strict for soft mode (accept + warnings only)",
+      }
+    );
+  }
+
   authUser._policyCtx = { to_repo: provider, task: "hire:" + (rfq.task || "").slice(0, 80) };
   const blocked = await safetyGate(request, env, authUser, buyer, amount);
   if (blocked) return blocked;
@@ -365,6 +458,7 @@ export async function handleHireAccept(request, env, ctx) {
   }
 
   const jobId = "hj_" + randomId(12);
+
   try {
     await ensureAccount(env, SYSTEM_HIRE);
     await env.DB.batch([
@@ -435,6 +529,7 @@ export async function handleHireAccept(request, env, ctx) {
       provider_repo: provider,
       amount_usd: amount,
       status: "held",
+      passport_warnings: passportEval.warnings,
     });
   }
 
@@ -450,6 +545,9 @@ export async function handleHireAccept(request, env, ctx) {
       task: rfq.task,
       status: "held",
     },
+    provider_passport: passportEval.claims,
+    passport_warnings: passportEval.warnings,
+    passport_gate: passportEval.warnings.length ? "soft_warn" : "clear",
     latency_ms: Date.now() - t0,
     hint: "Provider delivers work. Buyer POST /api/hire/complete { job_id } to pay out.",
   });
@@ -476,17 +574,13 @@ export async function handleHireComplete(request, env, ctx) {
     return bad(request, "Job not held (status=" + job.status + ")", 400);
   }
 
-  const allowed =
-    authUser.id === job.created_by ||
-    (authUser.default_repo &&
-      (authUser.default_repo === job.buyer_repo || authUser.default_repo === job.provider_repo));
-  // Only buyer completes (pays out) — provider cannot self-release
   const isBuyer =
     authUser.id === job.created_by ||
     (authUser.default_repo && authUser.default_repo === job.buyer_repo);
   if (!isBuyer) return bad(request, "Only the buyer can complete / release this job", 403);
 
   const amount = Number(job.amount_usd);
+
   const claim = await env.DB.prepare(
     `UPDATE hire_jobs
      SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now')
@@ -499,6 +593,7 @@ export async function handleHireComplete(request, env, ctx) {
 
   await ensureAccount(env, job.provider_repo);
   await ensureAccount(env, SYSTEM_HIRE);
+
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
@@ -523,6 +618,7 @@ export async function handleHireComplete(request, env, ctx) {
     actor_repo: job.buyer_repo,
     amount,
   });
+
   await adjustRep(env, job.provider_repo, CREDIT_REP_SUCCESS_BONUS, "hire_complete", jobId);
   await adjustRep(env, job.buyer_repo, CREDIT_REP_SUCCESS_BONUS, "hire_buyer", jobId);
 
@@ -560,7 +656,6 @@ export async function handleHireCancel(request, env, ctx) {
   const jobId = body.job_id ? String(body.job_id).trim() : "";
   const rfqId = body.rfq_id ? String(body.rfq_id).trim() : "";
 
-  // Cancel held job → refund buyer
   if (jobId) {
     const job = await loadHireJob(env, jobId);
     if (!job) return bad(request, "Job not found", 404);
@@ -610,7 +705,6 @@ export async function handleHireCancel(request, env, ctx) {
     });
   }
 
-  // Cancel open RFQ
   if (!rfqId) return bad(request, "rfq_id or job_id required");
   const rfq = await loadHireRfq(env, rfqId);
   if (!rfq) return bad(request, "RFQ not found", 404);
@@ -654,7 +748,6 @@ export async function handleHireGet(request, env, id) {
   id = String(id || "").trim();
   if (!id) return bad(request, "id required");
 
-  // Try RFQ first, then job
   const rfq = await loadHireRfq(env, id);
   if (rfq) {
     let quotes = [];
@@ -753,7 +846,6 @@ export async function expireHireRfqs(env, ctx) {
   let expired = 0;
   let refundedJobs = 0;
   try {
-    // Expire open RFQs
     const q = await env.DB.prepare(
       `SELECT id, created_by FROM hire_rfqs
        WHERE status = 'open'
@@ -790,13 +882,8 @@ export async function expireHireRfqs(env, ctx) {
         console.log("hire_rfq_expire", row.id, e && e.message);
       }
     }
-
-    // Note: held jobs are not auto-expired here (buyer must complete/cancel).
-    // Optional future: TTL on jobs.
   } catch (e) {
     return { expired: 0, error: e.message, latency_ms: Date.now() - t0 };
   }
   return { expired, refunded_jobs: refundedJobs, latency_ms: Date.now() - t0 };
 }
-
-
