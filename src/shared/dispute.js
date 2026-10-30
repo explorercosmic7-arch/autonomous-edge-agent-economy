@@ -476,19 +476,23 @@ export async function handleDisputeOpen(request, env, ctx) {
   const providerRepo = parseRepo(claim.provider_repo);
   if (!buyerRepo || !providerRepo) return bad(request, "Claim missing buyer/provider", 400);
 
-  // Only buyer (complainant) may open
-  const isBuyer =
-    (authUser.default_repo && authUser.default_repo === buyerRepo) ||
-    authUser.id === claim.created_by;
-  // Allow if session user and default matches buyer
-  const allowed =
-    (authUser.default_repo && authUser.default_repo === buyerRepo) ||
-    (authUser.auth_via === "session" && authUser.default_repo === buyerRepo);
-  if (!allowed && !(authUser.default_repo === buyerRepo)) {
-    // soft: allow if default_repo is buyer
-    if (authUser.default_repo !== buyerRepo) {
-      return bad(request, "Only the buyer may open a dispute on this claim", 403, { code: "not_buyer" });
-    }
+  // Only buyer (complainant) may open.
+  // Allow when:
+  //  - default_repo is the claim buyer, OR
+  //  - same account that created the claim (API key / session — Lab multi-agent keys), OR
+  //  - same account that locked the claim (locked_by), if column present
+  const isBuyerRepo =
+    !!(authUser.default_repo && authUser.default_repo === buyerRepo);
+  const isClaimCreator =
+    !!(authUser.id && claim.created_by && authUser.id === claim.created_by);
+  const isLocker =
+    !!(authUser.id && claim.locked_by && authUser.id === claim.locked_by);
+  if (!isBuyerRepo && !isClaimCreator && !isLocker) {
+    return bad(request, "Only the buyer may open a dispute on this claim", 403, {
+      code: "not_buyer",
+      buyer_repo: buyerRepo,
+      default_repo: authUser.default_repo || null,
+    });
   }
 
   const openCount = await countOpenDisputeForClaim(env, claimId);
