@@ -10,7 +10,7 @@ import {
 import { checkRateLimit } from "./rateLimit.js";
 import { getAuthUser } from "./auth.js";
 import { ensureAccount } from "./accounts.js";
-import { adjustRep } from "./credit.js";
+import { adjustRep, debitWithCredit } from "./credit.js";
 import { scheduleWebhook } from "./webhooks.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
 import {
