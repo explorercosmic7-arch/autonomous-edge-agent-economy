@@ -1,4 +1,4 @@
-/**
+/** 
  * Shared reputation-backed credit — limits, draw, repay, rep adjust.
  * Path on GitHub: src/shared/credit.js
  *
