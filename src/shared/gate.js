@@ -1,6 +1,6 @@
 /**
  * Shared safety gate — lockWallet, safetyGate, safetyRecordSpend.
- * Orchestrates auth / shield / policy / velocity / daily budget checks.
+ * Orchestrates auth / shield / policy / velocity / agent + fleet budget checks.
  */
 import {
   ensureAgentLimits,
@@ -11,6 +11,8 @@ import {
   checkDailyBudget,
   recordVelocityEvent,
   addDailySpent,
+  checkFleetBudget,
+  addFleetSpent,
 } from "./safety.js";
 import {
   checkShieldGate,
@@ -58,7 +60,6 @@ export async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx
   }
 }
 
-
 export async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (!fromRepo) return null;
 
@@ -74,39 +75,69 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
     return bad(request, locked.reason, 403, { code: "wallet_locked" });
   }
 
-  // Policy-as-code (allow/deny, max_amount, task prefix) — optional toRepo/task via authUser._policyCtx
+  // Policy-as-code (allow/deny, max_amount, task prefix)
   const pctx = (authUser && authUser._policyCtx) || {};
   const polHit = await checkSpendPolicy(env, fromRepo, amount, pctx.to_repo, pctx.task);
   if (polHit) {
     return bad(request, polHit.error, 403, { code: polHit.code || "policy_denied" });
   }
 
+  // Per-agent daily budget
   const budgetHit = await checkDailyBudget(env, fromRepo, amount);
   if (budgetHit) {
     return bad(request, budgetHit.error, 429, { code: budgetHit.code });
   }
 
+  // Fleet (account-wide) budget — only when we know the user
+  const uid = authUser && authUser.id;
+  if (uid) {
+    const fleetHit = await checkFleetBudget(env, uid, amount);
+    if (fleetHit && fleetHit.hard) {
+      return bad(request, fleetHit.error, 429, {
+        code: fleetHit.code,
+        daily_spent: fleetHit.daily_spent,
+        monthly_spent: fleetHit.monthly_spent,
+      });
+    }
+    // Soft warn: log + webhook, do not block
+    if (fleetHit && fleetHit.warn) {
+      await logSafetyEvent(env, "fleet.budget_warn", {
+        user_id: uid,
+        repo_id: fromRepo,
+        reason: fleetHit.error,
+        meta: {
+          daily_spent: fleetHit.daily_spent,
+          daily_budget: fleetHit.daily_budget,
+        },
+      });
+      scheduleWebhook(null, env, uid, "fleet.budget_warn", {
+        repo_id: fromRepo,
+        reason: fleetHit.error,
+        daily_spent: fleetHit.daily_spent,
+        daily_budget: fleetHit.daily_budget,
+      });
+    }
+  }
+
   const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   const vel = await checkVelocity(env, fromRepo, amount, keyId);
   if (vel) {
-    // Persistent spike → kill-switch
     if (vel.spike && keyId) {
-      const uid = authUser && authUser.id;
+      const u = authUser && authUser.id;
       await suspendApiKey(env, keyId, vel.error, {
         repo_id: fromRepo,
-        user_id: uid,
+        user_id: u,
       });
       await lockWallet(env, fromRepo, vel.error, {
         api_key_id: keyId,
-        user_id: uid,
+        user_id: u,
       });
       await logSafetyEvent(env, "agent.runaway_loop", {
         repo_id: fromRepo,
         api_key_id: keyId,
-        user_id: uid,
+        user_id: u,
         reason: vel.error,
       });
-      // Quarantine agent under Edge Shield (auto cool-down)
       try {
         await setShieldLevel(env, fromRepo, SHIELD_LEVEL_FREEZE, "runaway_loop: " + vel.error, {
           cooldownSec: SHIELD_COOLDOWN_SEC,
@@ -115,14 +146,13 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
       } catch (e) {
         console.log("shield_trip_on_spike", e && e.message);
       }
-      if (uid) {
-        // fire-and-forget (no ctx in gate path)
-        scheduleWebhook(null, env, uid, "agent.runaway_loop", {
+      if (u) {
+        scheduleWebhook(null, env, u, "agent.runaway_loop", {
           repo_id: fromRepo,
           reason: vel.error,
           api_key_id: keyId,
         });
-        scheduleWebhook(null, env, uid, "shield.quarantine", {
+        scheduleWebhook(null, env, u, "shield.quarantine", {
           repo_id: fromRepo,
           reason: vel.error,
           level: SHIELD_LEVEL_FREEZE,
@@ -138,12 +168,13 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
   return null;
 }
 
-/** Call after a successful debit to update velocity + daily spent. */
+/** Call after a successful debit to update velocity + agent daily + fleet spent. */
 export async function safetyRecordSpend(env, authUser, fromRepo, amount) {
   if (!fromRepo || !amount) return;
   const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   await recordVelocityEvent(env, fromRepo, amount, keyId);
   await addDailySpent(env, fromRepo, amount);
+  if (authUser && authUser.id) {
+    await addFleetSpent(env, authUser.id, amount);
+  }
 }
-
-
