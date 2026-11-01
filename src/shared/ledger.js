@@ -40,7 +40,7 @@ import {
   claimDelegationSpend,
   logDelegateEvent,
 } from "./delegate.js";
-import { consumeApprovedAllowance } from "./approval.js";
+import { validateApprovedAllowance, markApprovalConsumed } from "./approval.js";
 import {
   RL_PAY_MAX,
   RL_PAY_WINDOW_SEC,
@@ -199,7 +199,7 @@ export async function handlePay(request, env, ctx) {
       request.headers.get("X-Approval-Id") || body.approval_id || ""
     ).trim();
     if (approvalHdr) {
-      const used = await consumeApprovedAllowance(env, authUser, approvalHdr, {
+      const used = await validateApprovedAllowance(env, authUser, approvalHdr, {
         fromRepo,
         toRepo,
         amount,
@@ -211,6 +211,7 @@ export async function handlePay(request, env, ctx) {
         });
       }
       authUser._approvalConsumed = true;
+      authUser._approvalId = approvalHdr;
     }
 
     authUser._policyCtx = {
@@ -472,6 +473,13 @@ export async function handlePay(request, env, ctx) {
     try {
       await safetyRecordSpend(env, authUser, fromRepo, amount);
     } catch (_) {}
+  }
+  if (authUser && authUser._approvalId) {
+    try {
+      await markApprovalConsumed(env, authUser._approvalId, authUser.id);
+    } catch (e) {
+      console.log("approval_consume_post_pay", e && e.message);
+    }
   }
 
   const payload = {
