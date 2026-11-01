@@ -1,0 +1,112 @@
+/**
+ * Me fleet — GET|POST /api/me/fleet
+ * Account-wide daily/monthly spend caps (fleet_limits).
+ */
+import { json, bad } from "./http.js";
+import { getSessionUser } from "./auth.js";
+import {
+  ensureFleetLimits,
+  getFleetLimits,
+  fleetStatus,
+  logSafetyEvent,
+} from "./safety.js";
+
+export async function handleMeFleetGet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  const fleet = await fleetStatus(env, user.id);
+  return json(request, {
+    ok: true,
+    user_id: user.id,
+    fleet: fleet || {
+      daily_budget: null,
+      monthly_budget: null,
+      daily_spent: 0,
+      monthly_spent: 0,
+      daily_remaining: null,
+      monthly_remaining: null,
+      warn_bps: 8000,
+      at_warn: false,
+    },
+  });
+}
+
+export async function handleMeFleetSet(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+
+  await ensureFleetLimits(env, user.id);
+
+  const parseOpt = (v) => {
+    if (v === null || v === "" || v === undefined) return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < 0) return undefined;
+    return n;
+  };
+
+  const daily = parseOpt(body.daily_budget);
+  const monthly = parseOpt(body.monthly_budget);
+  const warnRaw = parseOpt(body.warn_bps);
+
+  if ("daily_budget" in body && daily === undefined) {
+    return bad(request, "daily_budget invalid");
+  }
+  if ("monthly_budget" in body && monthly === undefined) {
+    return bad(request, "monthly_budget invalid");
+  }
+  if ("warn_bps" in body && warnRaw === undefined) {
+    return bad(request, "warn_bps invalid");
+  }
+
+  let warnBps = null;
+  if ("warn_bps" in body) {
+    warnBps = Math.floor(warnRaw);
+    if (warnBps < 1000 || warnBps > 9900) {
+      return bad(request, "warn_bps must be 1000–9900 (10%–99%)");
+    }
+  }
+
+  const sets = [];
+  const binds = [];
+  const add = (col, val, present) => {
+    if (!present) return;
+    sets.push(col + " = ?" + (binds.length + 1));
+    binds.push(val);
+  };
+
+  add("daily_budget", daily, "daily_budget" in body);
+  add("monthly_budget", monthly, "monthly_budget" in body);
+  add("warn_bps", warnBps, "warn_bps" in body);
+
+  if (!sets.length) return bad(request, "No fields to update");
+
+  sets.push("updated_at = datetime('now')");
+  binds.push(user.id);
+
+  await env.DB.prepare(
+    `UPDATE fleet_limits SET ${sets.join(", ")} WHERE user_id = ?${binds.length}`
+  )
+    .bind(...binds)
+    .run();
+
+  await logSafetyEvent(env, "fleet.limits_updated", {
+    user_id: user.id,
+    reason: "dashboard",
+    meta: body,
+  });
+
+  const fleet = await fleetStatus(env, user.id);
+  return json(request, {
+    ok: true,
+    user_id: user.id,
+    fleet,
+  });
+}
