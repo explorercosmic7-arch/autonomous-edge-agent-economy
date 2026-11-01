@@ -269,6 +269,15 @@ import {
 } from "./shared/meFleet.js";
 
 import {
+  handleMeApprovalSettingsGet,
+  handleMeApprovalSettingsSet,
+  handleMeApprovalsList,
+  handleMeApprovalsDecide,
+} from "./shared/meApproval.js";
+
+import { expirePendingApprovals } from "./shared/approval.js";
+
+import {
   RL_IP_POST_MAX,
   RL_IP_POST_WINDOW_SEC,
 } from "./shared/constants.js";
@@ -354,6 +363,9 @@ import {
  *           Bonded arbitration over work claims — slash / release / split (supreme court)
  * D1:       work_disputes + dispute_arbiters + dispute_events (d1-dispute-migration.sql)
  * Cron:     expireDisputes
+ * Approval: GET|POST /api/me/approval-settings, GET /api/me/approvals,
+ *           POST /api/me/approvals/decide — human-in-the-loop spend gates
+ * D1:       user_approval_settings + approval_requests (d1-approval-migration.sql)
  * Overview: GET /api/me/overview — Home aggregate (balance, safety, credit, shield, keys)
  * Passport: GET /api/passport/:owner/:repo, GET /api/passport/:owner/:repo/history,
  *           POST /api/passport/issue|verify, GET /api/passport/me
@@ -841,21 +853,24 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/me/safety/unlock") {
         return await handleMeSafetyUnlock(request, env);
       }
-            if (request.method === "GET" && url.pathname === "/api/me/safety") {
-        return await handleMeSafetyGet(request, env);
-      }
-      if (request.method === "POST" && url.pathname === "/api/me/safety") {
-        return await handleMeSafetySet(request, env);
-      }
-      if (request.method === "POST" && url.pathname === "/api/me/safety/unlock") {
-        return await handleMeSafetyUnlock(request, env);
-      }
-
       if (request.method === "GET" && url.pathname === "/api/me/fleet") {
         return await handleMeFleetGet(request, env);
       }
       if (request.method === "POST" && url.pathname === "/api/me/fleet") {
         return await handleMeFleetSet(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/me/approval-settings") {
+        return await handleMeApprovalSettingsGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/approval-settings") {
+        return await handleMeApprovalSettingsSet(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/approvals") {
+        return await handleMeApprovalsList(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/approvals/decide") {
+        return await handleMeApprovalsDecide(request, env);
       }
       if (request.method === "POST" && url.pathname === "/api/me/keys/unsuspend") {
         return await handleMeKeysUnsuspend(request, env);
@@ -941,6 +956,9 @@ export default {
             me_safety: "GET|POST /api/me/safety",
             me_safety_unlock: "POST /api/me/safety/unlock",
             me_fleet: "GET|POST /api/me/fleet",
+            me_approval_settings: "GET|POST /api/me/approval-settings",
+            me_approvals: "GET /api/me/approvals",
+            me_approvals_decide: "POST /api/me/approvals/decide",
             shield: "GET /api/shield",
             me_shield: "GET /api/me/shield",
             me_shield_release: "POST /api/me/shield/release",
@@ -1267,6 +1285,17 @@ export default {
           );
         } catch (err) {
           console.error("hire-expire failed:", err && err.message ? err.message : err);
+        }
+        try {
+          await expirePendingApprovals(env, null);
+          console.log(
+            JSON.stringify({
+              cron: "approval-expire",
+              scheduledTime: event.scheduledTime,
+            })
+          );
+        } catch (err) {
+          console.error("approval-expire failed:", err && err.message ? err.message : err);
         }
       })()
     );
