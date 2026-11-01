@@ -1,24 +1,42 @@
 /**
  * Me fleet — GET|POST /api/me/fleet
  * Account-wide daily/monthly spend caps (fleet_limits).
+ * Auth: session cookie OR API key (same user_id as key owner).
  */
 import { json, bad } from "./http.js";
-import { getSessionUser } from "./auth.js";
+import { getAuthUser, rejectIfSuspendedKey } from "./auth.js";
 import {
   ensureFleetLimits,
-  getFleetLimits,
   fleetStatus,
   logSafetyEvent,
 } from "./safety.js";
 
+async function requireFleetUser(request, env) {
+  const user = await getAuthUser(request, env);
+  if (!user) return { error: bad(request, "Sign in required", 401) };
+  const sus = rejectIfSuspendedKey(request, user);
+  if (sus) return { error: sus };
+  if (user.edge_blocked || user._edge_blocked) {
+    return {
+      error: bad(request, user._edge_error || "Edge binding blocked", 403, {
+        code: user._edge_code || "edge_bound",
+      }),
+    };
+  }
+  if (!user.id) return { error: bad(request, "Sign in required", 401) };
+  return { user };
+}
+
 export async function handleMeFleetGet(request, env) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
+  const auth = await requireFleetUser(request, env);
+  if (auth.error) return auth.error;
+  const user = auth.user;
 
   const fleet = await fleetStatus(env, user.id);
   return json(request, {
     ok: true,
     user_id: user.id,
+    auth_via: user.auth_via || "session",
     fleet: fleet || {
       daily_budget: null,
       monthly_budget: null,
@@ -33,8 +51,16 @@ export async function handleMeFleetGet(request, env) {
 }
 
 export async function handleMeFleetSet(request, env) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
+  const auth = await requireFleetUser(request, env);
+  if (auth.error) return auth.error;
+  const user = auth.user;
+
+  // Optional: only session can *change* caps (keep agents from self-raising limits)
+  if (user.auth_via === "api_key") {
+    return bad(request, "Fleet limits can only be changed from the signed-in dashboard", 403, {
+      code: "fleet_session_only",
+    });
+  }
 
   let body;
   try {
@@ -56,15 +82,9 @@ export async function handleMeFleetSet(request, env) {
   const monthly = parseOpt(body.monthly_budget);
   const warnRaw = parseOpt(body.warn_bps);
 
-  if ("daily_budget" in body && daily === undefined) {
-    return bad(request, "daily_budget invalid");
-  }
-  if ("monthly_budget" in body && monthly === undefined) {
-    return bad(request, "monthly_budget invalid");
-  }
-  if ("warn_bps" in body && warnRaw === undefined) {
-    return bad(request, "warn_bps invalid");
-  }
+  if ("daily_budget" in body && daily === undefined) return bad(request, "daily_budget invalid");
+  if ("monthly_budget" in body && monthly === undefined) return bad(request, "monthly_budget invalid");
+  if ("warn_bps" in body && warnRaw === undefined) return bad(request, "warn_bps invalid");
 
   let warnBps = null;
   if ("warn_bps" in body) {
@@ -104,9 +124,5 @@ export async function handleMeFleetSet(request, env) {
   });
 
   const fleet = await fleetStatus(env, user.id);
-  return json(request, {
-    ok: true,
-    user_id: user.id,
-    fleet,
-  });
+  return json(request, { ok: true, user_id: user.id, fleet });
 }
