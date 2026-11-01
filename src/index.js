@@ -841,6 +841,22 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/me/safety/unlock") {
         return await handleMeSafetyUnlock(request, env);
       }
+            if (request.method === "GET" && url.pathname === "/api/me/safety") {
+        return await handleMeSafetyGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/safety") {
+        return await handleMeSafetySet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/safety/unlock") {
+        return await handleMeSafetyUnlock(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/me/fleet") {
+        return await handleMeFleetGet(request, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/fleet") {
+        return await handleMeFleetSet(request, env);
+      }
       if (request.method === "POST" && url.pathname === "/api/me/keys/unsuspend") {
         return await handleMeKeysUnsuspend(request, env);
       }
@@ -924,6 +940,7 @@ export default {
             stream_list: "GET /api/stream",
             me_safety: "GET|POST /api/me/safety",
             me_safety_unlock: "POST /api/me/safety/unlock",
+            me_fleet: "GET|POST /api/me/fleet",
             shield: "GET /api/shield",
             me_shield: "GET /api/me/shield",
             me_shield_release: "POST /api/me/shield/release",
