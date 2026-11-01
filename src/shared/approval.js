@@ -6,8 +6,11 @@
  *  - Account-wide settings (user_id), same pattern as fleet_limits.
  *  - Rules OR'd: amount threshold, new counterparty, task prefix match.
  *  - Soft alerts (webhook only) separate from hard approval holds.
+ *  - X-Approval-Id is validated before gate; marked consumed only AFTER
+ *    a successful pay (so velocity/fleet failures do not burn the approval).
  *
- * Used by: safetyGate (check), meApproval routes (settings / list / decide).
+ * Used by: safetyGate (check), meApproval routes (settings / list / decide),
+ *          ledger handlePay (validate + mark consumed).
  */
 import { randomId, parseRepo } from "./utils.js";
 import { logSafetyEvent } from "./safety.js";
@@ -82,20 +85,19 @@ export function serializeApprovalSettings(row) {
 async function hasPaidCounterpartyBefore(env, userId, toRepo) {
   if (!userId || !toRepo) return true; // fail open on missing data
   try {
-    // Prefer transactions tied to user's agents via api_keys / from_repo ownership
-    // Lightweight: any successful ledger row to this to_repo from same user keys
+    // Ledger uses status 'success' (not ok/settled)
     const row = await env.DB.prepare(
       `SELECT 1 AS ok FROM transactions t
        WHERE t.to_repo = ?1
-         AND t.status IN ('ok','settled','released','completed','paid')
+         AND t.status = 'success'
          AND (
-           t.user_id = ?2
-           OR t.from_repo IN (
+           t.from_repo IN (
              SELECT default_repo FROM users WHERE id = ?2 AND default_repo IS NOT NULL
            )
            OR EXISTS (
              SELECT 1 FROM api_keys k
-             WHERE k.user_id = ?2 AND k.id = t.api_key_id
+             WHERE k.user_id = ?2
+               AND (k.id = t.api_key_id OR k.repo_id = t.from_repo)
            )
          )
        LIMIT 1`
@@ -104,25 +106,24 @@ async function hasPaidCounterpartyBefore(env, userId, toRepo) {
       .first();
     if (row) return true;
   } catch (_) {
-    // Schema variants: try simpler query
     try {
+      // Fallback: any success to this peer from same default agent only
       const row2 = await env.DB.prepare(
-        `SELECT 1 AS ok FROM transactions
-         WHERE to_repo = ?1 AND from_repo LIKE ?2
+        `SELECT 1 AS ok FROM transactions t
+         WHERE t.to_repo = ?1 AND t.status = 'success'
+           AND t.from_repo = (SELECT default_repo FROM users WHERE id = ?2 LIMIT 1)
          LIMIT 1`
       )
-        .bind(toRepo, "%")
+        .bind(toRepo, userId)
         .first();
-      // Fall through — without reliable history, treat as known to avoid noise
       if (row2) return true;
     } catch (__) {}
   }
-  // Second path: prior *approved* approvals to same peer count as known
   try {
     const prior = await env.DB.prepare(
       `SELECT 1 AS ok FROM approval_requests
        WHERE user_id = ?1 AND to_repo = ?2
-         AND status IN ('approved')
+         AND status IN ('approved', 'consumed')
        LIMIT 1`
     )
       .bind(userId, toRepo)
@@ -136,7 +137,7 @@ async function hasPaidCounterpartyBefore(env, userId, toRepo) {
 
 /**
  * Evaluate approval + alert rules for a proposed spend.
- * Returns { needApproval, softAlert, rule_code, reason, settings } or nulls.
+ * Returns { needApproval, softAlert, rule_code, reason, settings }.
  */
 export async function evaluateApprovalRules(
   env,
@@ -252,6 +253,7 @@ export async function createApprovalRequest(
     MAX_TTL,
     Math.max(MIN_TTL, Number(ttl_seconds) || DEFAULT_TTL)
   );
+  // UTC wall clock compatible with SQLite datetime('now')
   const expiresAt = new Date(Date.now() + ttl * 1000)
     .toISOString()
     .replace("T", " ")
@@ -360,10 +362,26 @@ export async function listApprovalRequests(env, userId, { status, limit } = {}) 
   }
 }
 
+export async function countPendingApprovals(env, userId) {
+  if (!userId) return 0;
+  try {
+    await expirePendingApprovals(env, userId);
+    const row = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM approval_requests
+       WHERE user_id = ?1 AND status = 'pending'
+         AND expires_at >= datetime('now')`
+    )
+      .bind(userId)
+      .first();
+    return Number(row && row.n) || 0;
+  } catch (_) {
+    return 0;
+  }
+}
+
 /**
  * Main gate helper for safetyGate.
- * If approval required: creates pending request, webhooks, returns block payload object
- * (caller turns into Response via bad()).
+ * If approval required: creates pending request, webhooks, returns block payload.
  * Soft alerts only fire webhook + log.
  *
  * @returns {null | { block: true, code, error, approval_id, expires_at, rule_code, status }}
@@ -496,8 +514,7 @@ export async function checkApprovalGate(
 
 /**
  * Decide approve | reject on a pending request.
- * Approve does NOT auto-pay — agent/client must retry /api/pay after approve
- * (simple, avoids double-spend races). We set a short allow-token window optional later.
+ * Approve does NOT auto-pay — agent must retry /api/pay with X-Approval-Id.
  */
 export async function decideApproval(
   env,
@@ -575,8 +592,6 @@ export async function decideApproval(
     status,
   });
 
-  // Mark a short-lived allow on approved: store expires in pay_meta flag
-  // Client should pass X-Approval-Id on the next pay within TTL remnant.
   return {
     ok: true,
     id,
@@ -585,28 +600,30 @@ export async function decideApproval(
     to_repo: row.to_repo,
     amount: row.amount,
     task: row.task,
-    // Agent must retry pay with header X-Approval-Id: id after approve
-    next: status === "approved"
-      ? {
-          action: "retry_pay",
-          header: "X-Approval-Id",
-          approval_id: id,
-          body: {
-            from_repo: row.from_repo,
-            to_repo: row.to_repo,
-            amount: row.amount,
-            task: row.task,
-          },
-        }
-      : null,
+    next:
+      status === "approved"
+        ? {
+            action: "retry_pay",
+            header: "X-Approval-Id",
+            approval_id: id,
+            body: {
+              from_repo: row.from_repo,
+              to_repo: row.to_repo,
+              amount: row.amount,
+              task: row.task,
+            },
+          }
+        : null,
   };
 }
 
 /**
- * After approve, agent retries pay with X-Approval-Id.
- * Validate the approval covers this spend and is approved + fresh.
+ * Validate an approved allowance for this pay — does NOT burn the id.
+ * Call markApprovalConsumed only after a successful debit.
+ *
+ * Alias: consumeApprovedAllowance (legacy name kept for imports).
  */
-export async function consumeApprovedAllowance(
+export async function validateApprovedAllowance(
   env,
   authUser,
   approvalId,
@@ -615,6 +632,7 @@ export async function consumeApprovedAllowance(
   if (!approvalId || !authUser || !authUser.id) {
     return { ok: false, error: "approval id required", code: "approval_id" };
   }
+  await expirePendingApprovals(env, authUser.id);
   const row = await getApprovalRequest(env, approvalId);
   if (!row || row.user_id !== authUser.id) {
     return { ok: false, error: "Invalid approval", code: "approval_invalid" };
@@ -622,13 +640,28 @@ export async function consumeApprovedAllowance(
   if (row.status === "pending") {
     return { ok: false, error: "Still pending approval", code: "approval_pending" };
   }
-  if (row.status === "rejected" || row.status === "expired" || row.status === "cancelled") {
+  if (row.status === "rejected" || row.status === "expired") {
     return { ok: false, error: "Approval " + row.status, code: "approval_" + row.status };
+  }
+  if (row.status === "consumed" || row.status === "cancelled") {
+    return { ok: false, error: "Approval already used", code: "approval_consumed" };
   }
   if (row.status !== "approved") {
     return { ok: false, error: "Approval not approved", code: "approval_invalid" };
   }
-  // Match economics (tolerance for float)
+  // Still within original expires_at
+  try {
+    const fresh = await env.DB.prepare(
+      `SELECT 1 AS ok FROM approval_requests
+       WHERE id = ?1 AND status = 'approved' AND expires_at >= datetime('now')`
+    )
+      .bind(approvalId)
+      .first();
+    if (!fresh) {
+      return { ok: false, error: "Approval expired", code: "expired" };
+    }
+  } catch (_) {}
+
   if (String(row.from_repo) !== String(fromRepo)) {
     return { ok: false, error: "from_repo mismatch", code: "approval_mismatch" };
   }
@@ -638,15 +671,36 @@ export async function consumeApprovedAllowance(
   if (Math.abs(Number(row.amount) - Number(amount)) > 1e-9) {
     return { ok: false, error: "amount mismatch", code: "approval_mismatch" };
   }
-  // One-shot: mark cancelled/consumed so it cannot be reused
+  return { ok: true, approval_id: approvalId, row };
+}
+
+/** @deprecated name — same as validateApprovedAllowance (no burn). */
+export async function consumeApprovedAllowance(env, authUser, approvalId, ctx) {
+  return validateApprovedAllowance(env, authUser, approvalId, ctx);
+}
+
+/**
+ * Mark approved id as consumed — call only after successful settlement.
+ * Atomic: only one concurrent pay can win.
+ */
+export async function markApprovalConsumed(env, approvalId, userId) {
+  if (!approvalId) return { ok: false };
   try {
-    await env.DB.prepare(
+    const res = await env.DB.prepare(
       `UPDATE approval_requests
-       SET status = 'cancelled', resolve_note = 'consumed', resolved_at = datetime('now')
-       WHERE id = ?1 AND status = 'approved'`
+       SET status = 'consumed',
+           resolve_note = 'consumed',
+           resolved_at = datetime('now')
+       WHERE id = ?1
+         AND status = 'approved'
+         AND (?2 IS NULL OR user_id = ?2)`
     )
-      .bind(approvalId)
+      .bind(approvalId, userId || null)
       .run();
-  } catch (_) {}
-  return { ok: true, approval_id: approvalId };
+    const changes = (res && res.meta && res.meta.changes) || 0;
+    return { ok: changes > 0, changes };
+  } catch (e) {
+    console.log("mark_approval_consumed", e && e.message);
+    return { ok: false };
+  }
 }
