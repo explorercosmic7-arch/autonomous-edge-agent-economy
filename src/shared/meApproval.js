@@ -14,6 +14,7 @@ import {
   listApprovalRequests,
   decideApproval,
   expirePendingApprovals,
+  countPendingApprovals,
 } from "./approval.js";
 
 async function requireUser(request, env, { sessionOnly = false } = {}) {
@@ -152,7 +153,7 @@ export async function handleMeApprovalsList(request, env) {
     limit,
   });
 
-  const pending = rows.filter((r) => r.status === "pending").length;
+  const pending = await countPendingApprovals(env, auth.user.id);
   return json(request, {
     ok: true,
     user_id: auth.user.id,
