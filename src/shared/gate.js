@@ -1,6 +1,11 @@
 /**
  * Shared safety gate — lockWallet, safetyGate, safetyRecordSpend.
  * Orchestrates auth / shield / policy / velocity / agent + fleet budget / approval checks.
+ *
+ * Order (important):
+ *  shield → wallet lock → policy → daily → fleet → **approval** → velocity
+ * Approval before velocity so a large intentional pay returns approval_required
+ * instead of velocity_usd when both would apply.
  */
 import {
   ensureAgentLimits,
@@ -31,7 +36,7 @@ import {
 } from "./constants.js";
 import { checkApprovalGate } from "./approval.js";
 
-/* ─── Safety: lockWallet (needs adjustRep + scheduleWebhook); rest in shared/safety.js ─── */
+/* ─── Safety: lockWallet ─── */
 
 export async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx } = {}) {
   await ensureAgentLimits(env, repoId);
@@ -120,6 +125,29 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
     }
   }
 
+  // Approval gates BEFORE velocity — human hold is clearer than velocity for large intentional spends.
+  // Skip if this pay already validated an approved X-Approval-Id.
+  if (uid && !authUser._approvalConsumed) {
+    try {
+      const appr = await checkApprovalGate(env, authUser, fromRepo, amount, {
+        toRepo: pctx.to_repo,
+        task: pctx.task,
+        idempotency_key: pctx.idempotency_key,
+      });
+      if (appr && appr.block) {
+        return bad(request, appr.error, 403, {
+          code: appr.code || "approval_required",
+          approval_id: appr.approval_id,
+          expires_at: appr.expires_at,
+          rule_code: appr.rule_code,
+          status: appr.status,
+        });
+      }
+    } catch (e) {
+      console.log("approval_gate", e && e.message);
+    }
+  }
+
   const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   const vel = await checkVelocity(env, fromRepo, amount, keyId);
   if (vel) {
@@ -164,28 +192,6 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
       code: vel.code,
       retry_after_sec: vel.retry_after_sec,
     });
-  }
-
-  // Approval gates (human-in-the-loop) — skip if this pay already consumed an approved id
-  if (uid && !authUser._approvalConsumed) {
-    try {
-      const appr = await checkApprovalGate(env, authUser, fromRepo, amount, {
-        toRepo: pctx.to_repo,
-        task: pctx.task,
-        idempotency_key: pctx.idempotency_key,
-      });
-      if (appr && appr.block) {
-        return bad(request, appr.error, 403, {
-          code: appr.code || "approval_required",
-          approval_id: appr.approval_id,
-          expires_at: appr.expires_at,
-          rule_code: appr.rule_code,
-          status: appr.status,
-        });
-      }
-    } catch (e) {
-      console.log("approval_gate", e && e.message);
-    }
   }
 
   return null;
