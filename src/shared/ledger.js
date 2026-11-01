@@ -40,6 +40,7 @@ import {
   claimDelegationSpend,
   logDelegateEvent,
 } from "./delegate.js";
+import { consumeApprovedAllowance } from "./approval.js";
 import {
   RL_PAY_MAX,
   RL_PAY_WINDOW_SEC,
@@ -139,7 +140,6 @@ export async function handlePay(request, env, ctx) {
     request.headers.get("X-Delegate-Id") || body.delegate_id || body.delegation_id || ""
   ).trim();
   let activeDelegation = null;
-
   if (delegateIdHdr) {
     if (!authUser || authUser.auth_via !== "api_key" || !authUser.key_id) {
       return bad(request, "X-Delegate-Id requires Authorization: Bearer <child_api_key>", 401, {
@@ -194,7 +194,30 @@ export async function handlePay(request, env, ctx) {
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
 
   if (authUser) {
-    authUser._policyCtx = { to_repo: toRepo, task };
+    // One-shot allow after human approve (retry pay with X-Approval-Id)
+    const approvalHdr = String(
+      request.headers.get("X-Approval-Id") || body.approval_id || ""
+    ).trim();
+    if (approvalHdr) {
+      const used = await consumeApprovedAllowance(env, authUser, approvalHdr, {
+        fromRepo,
+        toRepo,
+        amount,
+        task,
+      });
+      if (!used.ok) {
+        return bad(request, used.error || "Approval invalid", 403, {
+          code: used.code || "approval_invalid",
+        });
+      }
+      authUser._approvalConsumed = true;
+    }
+
+    authUser._policyCtx = {
+      to_repo: toRepo,
+      task,
+      idempotency_key: idem,
+    };
     const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
     if (blocked) return blocked;
   } else {
@@ -259,7 +282,6 @@ export async function handlePay(request, env, ctx) {
     )
       .bind(amount, fromRepo)
       .first();
-
     if (cashDebit) {
       fromBalance = Number(cashDebit.balance);
     } else {
