@@ -1,5 +1,6 @@
 /**
  * Streaming micro-pay — start / meter / stop / list
+ * Scoped API keys: applyScopeVerb(authUser, "stream", toRepo)
  */
 import { json, bad } from "./http.js";
 import {
@@ -11,6 +12,7 @@ import { checkRateLimit } from "./rateLimit.js";
 import { getAuthUser } from "./auth.js";
 import { ensureAccount } from "./accounts.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
+import { applyScopeVerb } from "./scopes.js";
 import {
   RL_STREAM_MAX,
   RL_STREAM_WINDOW_SEC,
@@ -19,17 +21,10 @@ import {
   STREAM_MAX_BUDGET,
 } from "./constants.js";
 
-/* ─── Streaming micro-pay ───
- * Start: debit budget from from_repo → system/stream (held)
- * Meter: move rate*units from held spent tracking → to_repo
- * Stop:  refund (budget - spent) to from_repo
- */
-
 export async function handleStreamStart(request, env) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   const rlId =
     authUser.auth_via === "api_key"
       ? "stream:key:" + (authUser.key_id || authUser.id)
@@ -40,14 +35,12 @@ export async function handleStreamStart(request, env) {
       retry_after_sec: limited.retry_after_sec,
     });
   }
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   let fromRepo = parseRepo(body.from_repo || body.fromRepo);
   if (!fromRepo && authUser.default_repo) {
     fromRepo = parseRepo(authUser.default_repo);
@@ -61,7 +54,6 @@ export async function handleStreamStart(request, env) {
     String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
       .trim()
       .slice(0, 128) || null;
-
   if (!fromRepo) return bad(request, "from_repo required (or set default agent)");
   if (!toRepo) return bad(request, "to_repo required");
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
@@ -70,13 +62,12 @@ export async function handleStreamStart(request, env) {
   }
   if (rate == null || rate <= 0) return bad(request, "rate_per_unit must be > 0");
   if (rate > budget) return bad(request, "rate_per_unit cannot exceed budget");
-
+  applyScopeVerb(authUser, "stream", toRepo);
   {
     authUser._policyCtx = { to_repo: toRepo, task };
     const blocked = await safetyGate(request, env, authUser, fromRepo, budget);
     if (blocked) return blocked;
   }
-
   if (idem) {
     try {
       const existing = await env.DB.prepare(
@@ -91,10 +82,8 @@ export async function handleStreamStart(request, env) {
       return bad(request, "streams table missing — run d1-stream-migration.sql", 500);
     }
   }
-
   await ensureAccount(env, fromRepo);
   await ensureAccount(env, toRepo);
-
   const debit = await env.DB.prepare(
     `UPDATE accounts
      SET balance = balance - ?1, updated_at = datetime('now')
@@ -103,11 +92,8 @@ export async function handleStreamStart(request, env) {
   )
     .bind(budget, fromRepo)
     .first();
-
   if (!debit) return bad(request, "Insufficient funds", 402);
-
   const id = "str_" + randomId(12);
-
   try {
     await env.DB.batch([
       env.DB.prepare(
@@ -141,7 +127,6 @@ export async function handleStreamStart(request, env) {
       ),
     ]);
   } catch (e) {
-    // refund on insert failure
     await env.DB.prepare(
       `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
     )
@@ -149,9 +134,7 @@ export async function handleStreamStart(request, env) {
       .run();
     return bad(request, "Stream create failed: " + (e.message || e), 500);
   }
-
   await safetyRecordSpend(env, authUser, fromRepo, budget);
-
   return json(request, {
     ok: true,
     status: "open",
@@ -178,19 +161,16 @@ export async function handleStreamMeter(request, env) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const id = String(body.id || "").trim();
   const units = Number(body.units);
   if (!id) return bad(request, "id required");
   if (!Number.isFinite(units) || units <= 0) return bad(request, "units must be > 0");
-
   let row;
   try {
     row = await env.DB.prepare(`SELECT * FROM streams WHERE id = ?1`).bind(id).first();
@@ -201,13 +181,12 @@ export async function handleStreamMeter(request, env) {
   if (row.status !== "open") {
     return bad(request, "Stream is not open (status=" + row.status + ")");
   }
-
   const allowed =
     authUser.id === row.created_by ||
     (authUser.default_repo &&
       (authUser.default_repo === row.from_repo || authUser.default_repo === row.to_repo));
   if (!allowed) return bad(request, "Not authorized to meter this stream", 403);
-
+  applyScopeVerb(authUser, "stream", row.to_repo);
   const remaining = Number(row.budget) - Number(row.spent);
   if (remaining <= 0) {
     await env.DB.prepare(
@@ -217,16 +196,13 @@ export async function handleStreamMeter(request, env) {
       .run();
     return bad(request, "Stream budget exhausted", 402);
   }
-
   let cost = Math.round(units * Number(row.rate_per_unit) * 1e6) / 1e6;
   let unitsApplied = units;
   if (cost > remaining) {
     cost = remaining;
     unitsApplied = Math.round((remaining / Number(row.rate_per_unit)) * 1e6) / 1e6;
   }
-
   await ensureAccount(env, row.to_repo);
-
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE streams
@@ -252,10 +228,8 @@ export async function handleStreamMeter(request, env) {
       Date.now() - t0
     ),
   ]);
-
   const updated = await env.DB.prepare(`SELECT * FROM streams WHERE id = ?1`).bind(id).first();
   const rem = Number(updated.budget) - Number(updated.spent);
-
   return json(request, {
     ok: true,
     id,
@@ -273,17 +247,14 @@ export async function handleStreamStop(request, env) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const id = String(body.id || "").trim();
   if (!id) return bad(request, "id required");
-
   let row;
   try {
     row = await env.DB.prepare(`SELECT * FROM streams WHERE id = ?1`).bind(id).first();
@@ -294,12 +265,11 @@ export async function handleStreamStop(request, env) {
   if (row.status !== "open" && row.status !== "exhausted") {
     return bad(request, "Stream already stopped (status=" + row.status + ")");
   }
-
   const allowed =
     authUser.id === row.created_by ||
     (authUser.default_repo && authUser.default_repo === row.from_repo);
   if (!allowed) return bad(request, "Not authorized to stop this stream", 403);
-
+  applyScopeVerb(authUser, "stream", row.to_repo);
   const claim = await env.DB.prepare(
     `UPDATE streams
      SET status = 'stopped', stopped_at = datetime('now'), updated_at = datetime('now')
@@ -309,7 +279,6 @@ export async function handleStreamStop(request, env) {
     .bind(id)
     .first();
   if (!claim) return bad(request, "Stream not stoppable (race)");
-
   const refund = Math.max(0, Math.round((Number(claim.budget) - Number(claim.spent)) * 1e6) / 1e6);
   if (refund > 0) {
     await ensureAccount(env, claim.from_repo);
@@ -331,7 +300,6 @@ export async function handleStreamStop(request, env) {
       ),
     ]);
   }
-
   return json(request, {
     ok: true,
     status: "stopped",
@@ -346,12 +314,10 @@ export async function handleStreamList(request, url, env) {
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 25), 1), 100);
   const repo = (url.searchParams.get("repo") || "").trim();
   const status = (url.searchParams.get("status") || "").trim();
-
   let sql = `SELECT id, from_repo, to_repo, task, status, budget, rate_per_unit, unit_label,
                     spent, units_metered, created_by, created_at, stopped_at
              FROM streams WHERE 1=1`;
   const binds = [];
-
   if (repo) {
     if (!parseRepo(repo)) return bad(request, "repo must be owner/repo");
     sql += ` AND (from_repo = ? OR to_repo = ?)`;
@@ -363,7 +329,6 @@ export async function handleStreamList(request, url, env) {
   }
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   binds.push(limit);
-
   try {
     const { results } = await env.DB.prepare(sql).bind(...binds).all();
     return json(request, { ok: true, count: results.length, streams: results });
