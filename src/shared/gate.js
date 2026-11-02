@@ -3,9 +3,12 @@
  * Orchestrates auth / shield / policy / velocity / agent + fleet budget / approval checks.
  *
  * Order (important):
- *  shield → wallet lock → policy → daily → fleet → **approval** → velocity
+ *  key scope → shield → wallet lock → policy → daily → fleet → **approval** → velocity
  * Approval before velocity so a large intentional pay returns approval_required
  * instead of velocity_usd when both would apply.
+ *
+ * Scoped API keys: handlers may set authUser._scopeVerb = "pay"|"hire"|"escrow"|"stream".
+ * Default verb when amount is present: "pay". Session auth skips scope checks.
  */
 import {
   ensureAgentLimits,
@@ -35,6 +38,7 @@ import {
   SHIELD_COOLDOWN_SEC,
 } from "./constants.js";
 import { checkApprovalGate } from "./approval.js";
+import { checkKeyScope } from "./scopes.js";
 
 /* ─── Safety: lockWallet ─── */
 export async function lockWallet(
@@ -74,6 +78,30 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (!fromRepo) return null;
   const sus = rejectIfSuspendedKey(request, authUser);
   if (sus) return sus;
+
+  // Scoped API key — least privilege (verbs / max amount / to_repo allowlist)
+  // Handlers set authUser._scopeVerb; default "pay" when amount is present.
+  const pctxEarly = (authUser && authUser._policyCtx) || {};
+  if (authUser && authUser.auth_via === "api_key") {
+    const verb =
+      (authUser._scopeVerb && String(authUser._scopeVerb)) ||
+      (amount != null ? "pay" : "read");
+    const scopeHit = checkKeyScope(authUser, verb, {
+      amount,
+      toRepo: pctxEarly.to_repo || authUser._scopeToRepo || null,
+    });
+    if (scopeHit) {
+      return bad(request, scopeHit.error, scopeHit.status || 403, {
+        code: scopeHit.code || "key_scope_denied",
+        required: scopeHit.required,
+        verbs: scopeHit.verbs,
+        max_amount_usd: scopeHit.max_amount_usd,
+        amount: scopeHit.amount,
+        to_repo: scopeHit.to_repo,
+        to_repo_allow: scopeHit.to_repo_allow,
+      });
+    }
+  }
 
   // Edge Shield: global freeze / agent quarantine
   const shieldBlock = await checkShieldGate(request, env, fromRepo);
