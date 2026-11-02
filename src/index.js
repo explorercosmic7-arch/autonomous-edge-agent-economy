@@ -214,6 +214,7 @@ import {
   handleMeWebhookSet,
   handleMeWebhookClear,
   handleMeWebhookDeliveries,
+  handleMeWebhookTest,
 } from "./shared/webhookApi.js";
 
 import {
@@ -297,7 +298,7 @@ import {
  *           Capabilities-aware index (AP-Capabilities / wrangler.toml)
  * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
  * Webhook:  GET|POST /api/me/webhook, POST /api/me/webhook/clear
- *           GET /api/me/webhook/deliveries
+ *           GET /api/me/webhook/deliveries, POST /api/me/webhook/test (signed ping)
  * Ledger:   POST /api/pay (fast cash path + batched settle + waitUntil post-commit),
  *           POST /api/fund, GET /api/balance, GET /api/ledger
  * Escrow:   POST /api/escrow/hold|release|refund (hold: waitUntil post-commit like pay),
@@ -510,6 +511,9 @@ export default {
       }
       if (request.method === "GET" && url.pathname === "/api/me/webhook/deliveries") {
         return await handleMeWebhookDeliveries(request, env, url);
+      }
+      if (request.method === "POST" && url.pathname === "/api/me/webhook/test") {
+        return await handleMeWebhookTest(request, env);
       }
 
       if (request.method === "POST" && url.pathname === "/api/escrow/hold") {
@@ -941,6 +945,7 @@ export default {
             me_webhook: "GET|POST /api/me/webhook",
             me_webhook_clear: "POST /api/me/webhook/clear",
             me_webhook_deliveries: "GET /api/me/webhook/deliveries",
+            me_webhook_test: "POST /api/me/webhook/test",
             escrow_hold: "POST /api/escrow/hold",
             escrow_release: "POST /api/escrow/release",
             escrow_refund: "POST /api/escrow/refund",
