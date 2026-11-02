@@ -297,6 +297,7 @@ import {
  * Agents:   GET /api/agents, GET /api/agents/search, GET /api/agents/rank, POST /api/agents/scan
  *           Capabilities-aware index (AP-Capabilities / wrangler.toml)
  * Keys:     POST|GET /api/me/keys, POST /api/me/keys/revoke
+ *           Scoped keys: verbs read|pay|hire|escrow|stream, max_amount_usd, to_repo_allow (scopes.js + d1-key-scopes-migration.sql)
  * Webhook:  GET|POST /api/me/webhook, POST /api/me/webhook/clear
  *           GET /api/me/webhook/deliveries, POST /api/me/webhook/test (signed ping)
  * Ledger:   POST /api/pay (fast cash path + batched settle + waitUntil post-commit),
