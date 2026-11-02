@@ -1,8 +1,11 @@
 /**
  * Shared safety helpers — agent limits, velocity, daily budget, fleet budget, wallet checks.
  * lockWallet stays in gate.js (needs adjustRep + scheduleWebhook).
+ *
+ * Fleet hard-block rule (fixed):
+ *   only when (spent_today + this_payment) > daily_budget
+ * Empty / null / non-finite budgets = unlimited (opt-in caps).
  */
-
 import { randomId } from "./utils.js";
 import {
   SAFETY_DEFAULT_VELOCITY_MAX_TX,
@@ -11,6 +14,21 @@ import {
   SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC,
   SAFETY_SPIKE_TX_PER_SEC,
 } from "./constants.js";
+
+const EPS = 1e-9;
+
+/** Parse money-like DB/JSON values. null/""/invalid → null (unlimited for budgets). */
+function parseMoney(v) {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function parseSpent(v) {
+  const n = parseMoney(v);
+  return n == null || n < 0 ? 0 : n;
+}
 
 /* ─── Safety helpers (budget / velocity / lock / kill-switch) ─── */
 
@@ -123,18 +141,22 @@ export async function recordVelocityEvent(env, repoId, amount, apiKeyId) {
  */
 export async function checkVelocity(env, repoId, amount, apiKeyId) {
   const lim = await getAgentLimits(env, repoId);
-  const maxTx = (lim && lim.velocity_max_tx != null)
-    ? Number(lim.velocity_max_tx)
-    : SAFETY_DEFAULT_VELOCITY_MAX_TX;
-  const txWindow = (lim && lim.velocity_tx_window_sec != null)
-    ? Number(lim.velocity_tx_window_sec)
-    : SAFETY_DEFAULT_VELOCITY_TX_WINDOW_SEC;
-  const maxUsd = (lim && lim.velocity_max_usd != null)
-    ? Number(lim.velocity_max_usd)
-    : SAFETY_DEFAULT_VELOCITY_MAX_USD;
-  const usdWindow = (lim && lim.velocity_window_sec != null)
-    ? Number(lim.velocity_window_sec)
-    : SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC;
+  const maxTx =
+    lim && lim.velocity_max_tx != null
+      ? Number(lim.velocity_max_tx)
+      : SAFETY_DEFAULT_VELOCITY_MAX_TX;
+  const txWindow =
+    lim && lim.velocity_tx_window_sec != null
+      ? Number(lim.velocity_tx_window_sec)
+      : SAFETY_DEFAULT_VELOCITY_TX_WINDOW_SEC;
+  const maxUsd =
+    lim && lim.velocity_max_usd != null
+      ? Number(lim.velocity_max_usd)
+      : SAFETY_DEFAULT_VELOCITY_MAX_USD;
+  const usdWindow =
+    lim && lim.velocity_window_sec != null
+      ? Number(lim.velocity_window_sec)
+      : SAFETY_DEFAULT_VELOCITY_USD_WINDOW_SEC;
 
   try {
     const spike = await env.DB.prepare(
@@ -165,11 +187,7 @@ export async function checkVelocity(env, repoId, amount, apiKeyId) {
       return {
         code: "velocity_tx",
         error:
-          "Velocity limit: max " +
-          maxTx +
-          " transactions / " +
-          txWindow +
-          "s",
+          "Velocity limit: max " + maxTx + " transactions / " + txWindow + "s",
         retry_after_sec: txWindow,
       };
     }
@@ -181,15 +199,10 @@ export async function checkVelocity(env, repoId, amount, apiKeyId) {
       .bind(repoId, "-" + usdWindow + " seconds")
       .first();
     const spentWindow = Number(usdSum?.s || 0) + (Number(amount) || 0);
-    if (spentWindow > maxUsd) {
+    if (spentWindow > maxUsd + EPS) {
       return {
         code: "velocity_usd",
-        error:
-          "Velocity limit: max $" +
-          maxUsd +
-          " / " +
-          usdWindow +
-          "s",
+        error: "Velocity limit: max $" + maxUsd + " / " + usdWindow + "s",
         retry_after_sec: usdWindow,
       };
     }
@@ -205,10 +218,12 @@ export async function checkVelocity(env, repoId, amount, apiKeyId) {
  */
 export async function checkDailyBudget(env, repoId, amount) {
   const lim = await getAgentLimits(env, repoId);
-  if (!lim || lim.daily_budget == null) return null;
+  if (!lim) return null;
+  const budget = parseMoney(lim.daily_budget);
+  if (budget == null) return null; // unlimited
 
   const today = new Date().toISOString().slice(0, 10);
-  let dailySpent = Number(lim.daily_spent || 0);
+  let dailySpent = parseSpent(lim.daily_spent);
   const windowStart = lim.daily_window_start
     ? String(lim.daily_window_start).slice(0, 10)
     : null;
@@ -226,14 +241,17 @@ export async function checkDailyBudget(env, repoId, amount) {
     } catch (_) {}
   }
 
-  if (dailySpent + Number(amount) > Number(lim.daily_budget)) {
+  const amt = Number(amount) || 0;
+  if (dailySpent + amt > budget + EPS) {
     return {
       code: "daily_budget",
       error:
-        "Daily budget cap reached ($" +
-        lim.daily_budget +
-        "). Spent today: $" +
-        dailySpent.toFixed(6),
+        "Agent daily budget exceeded: this payment $" +
+        amt.toFixed(6) +
+        " + spent $" +
+        dailySpent.toFixed(6) +
+        " > cap $" +
+        budget.toFixed(6),
     };
   }
   return null;
@@ -304,25 +322,27 @@ export async function getFleetLimits(env, userId) {
 /**
  * Account-wide daily + monthly caps.
  * Returns null if OK / unlimited.
- * Hard block: { hard: true, code, error, daily_spent?, monthly_spent? }
- * Soft warn only: { hard: false, warn: true, code: "fleet_budget_warn", ... }
- * Caller should only block on hard === true.
+ * Hard block only when spent + amount > budget (strictly over).
+ * Soft warn: { hard: false, warn: true, code: "fleet_budget_warn", ... }
  */
 export async function checkFleetBudget(env, userId, amount) {
   if (!userId) return null;
   const lim = await getFleetLimits(env, userId);
   if (!lim) return null;
 
-  const hasDaily = lim.daily_budget != null;
-  const hasMonthly = lim.monthly_budget != null;
-  if (!hasDaily && !hasMonthly) return null;
+  // Opt-in: null / empty / non-finite = no fleet cap
+  const dailyBudget = parseMoney(lim.daily_budget);
+  const monthlyBudget = parseMoney(lim.monthly_budget);
+  if (dailyBudget == null && monthlyBudget == null) return null;
 
-  const amt = Number(amount) || 0;
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt < 0) return null;
+
   const today = new Date().toISOString().slice(0, 10);
-  const month = today.slice(0, 7); // YYYY-MM
+  const month = today.slice(0, 7);
 
-  let dailySpent = Number(lim.daily_spent || 0);
-  let monthlySpent = Number(lim.monthly_spent || 0);
+  let dailySpent = parseSpent(lim.daily_spent);
+  let monthlySpent = parseSpent(lim.monthly_spent);
   const dayStart = lim.daily_window_start
     ? String(lim.daily_window_start).slice(0, 10)
     : null;
@@ -353,40 +373,65 @@ export async function checkFleetBudget(env, userId, amount) {
     console.log("fleet_window_reset", e && e.message);
   }
 
-  if (hasDaily && dailySpent + amt > Number(lim.daily_budget)) {
-    return {
-      hard: true,
-      code: "fleet_daily_budget",
-      error:
-        "Fleet daily budget reached ($" +
-        lim.daily_budget +
-        "). Account spent today: $" +
-        dailySpent.toFixed(6),
-      daily_spent: dailySpent,
-      monthly_spent: monthlySpent,
-    };
+  // Daily hard stop — only if over remaining room
+  if (dailyBudget != null) {
+    const remaining = dailyBudget - dailySpent;
+    if (amt > remaining + EPS) {
+      return {
+        hard: true,
+        code: "fleet_daily_budget",
+        error:
+          "Fleet daily budget exceeded: this payment $" +
+          amt.toFixed(6) +
+          " + spent $" +
+          dailySpent.toFixed(6) +
+          " > cap $" +
+          dailyBudget.toFixed(6) +
+          " (remaining $" +
+          Math.max(0, remaining).toFixed(6) +
+          ")",
+        daily_spent: dailySpent,
+        monthly_spent: monthlySpent,
+        daily_budget: dailyBudget,
+        amount: amt,
+        remaining: Math.max(0, remaining),
+      };
+    }
   }
 
-  if (hasMonthly && monthlySpent + amt > Number(lim.monthly_budget)) {
-    return {
-      hard: true,
-      code: "fleet_monthly_budget",
-      error:
-        "Fleet monthly budget reached ($" +
-        lim.monthly_budget +
-        "). Account spent this month: $" +
-        monthlySpent.toFixed(6),
-      daily_spent: dailySpent,
-      monthly_spent: monthlySpent,
-    };
+  if (monthlyBudget != null) {
+    const remainingM = monthlyBudget - monthlySpent;
+    if (amt > remainingM + EPS) {
+      return {
+        hard: true,
+        code: "fleet_monthly_budget",
+        error:
+          "Fleet monthly budget exceeded: this payment $" +
+          amt.toFixed(6) +
+          " + spent $" +
+          monthlySpent.toFixed(6) +
+          " > cap $" +
+          monthlyBudget.toFixed(6) +
+          " (remaining $" +
+          Math.max(0, remainingM).toFixed(6) +
+          ")",
+        daily_spent: dailySpent,
+        monthly_spent: monthlySpent,
+        monthly_budget: monthlyBudget,
+        amount: amt,
+        remaining: Math.max(0, remainingM),
+      };
+    }
   }
 
-  // Soft warn at warn_bps of daily (default 80%)
-  if (hasDaily) {
-    const warnBps = lim.warn_bps != null ? Number(lim.warn_bps) : 8000;
-    const cap = Number(lim.daily_budget);
+  // Soft warn at warn_bps of daily (default 80%) — never hard
+  if (dailyBudget != null && dailyBudget > 0) {
+    const warnBps =
+      lim.warn_bps != null && Number.isFinite(Number(lim.warn_bps))
+        ? Number(lim.warn_bps)
+        : 8000;
     const after = dailySpent + amt;
-    if (cap > 0 && after * 10000 >= cap * warnBps) {
+    if (after * 10000 >= dailyBudget * warnBps - EPS) {
       return {
         hard: false,
         warn: true,
@@ -395,13 +440,14 @@ export async function checkFleetBudget(env, userId, amount) {
           "Fleet daily budget warning: $" +
           after.toFixed(6) +
           " / $" +
-          cap +
+          dailyBudget.toFixed(6) +
           " (" +
           Math.round(warnBps / 100) +
           "%)",
         daily_spent: dailySpent,
         monthly_spent: monthlySpent,
-        daily_budget: cap,
+        daily_budget: dailyBudget,
+        amount: amt,
       };
     }
   }
@@ -410,10 +456,12 @@ export async function checkFleetBudget(env, userId, amount) {
 }
 
 export async function addFleetSpent(env, userId, amount) {
-  if (!userId || !amount) return;
+  if (!userId) return;
+  const amt = Number(amount);
+  if (!Number.isFinite(amt) || amt <= 0) return;
+
   const today = new Date().toISOString().slice(0, 10);
   const month = today.slice(0, 7);
-  const amt = Number(amount) || 0;
   try {
     await ensureFleetLimits(env, userId);
     const lim = await env.DB.prepare(
@@ -430,8 +478,8 @@ export async function addFleetSpent(env, userId, amount) {
       ? String(lim.monthly_window_start).slice(0, 7)
       : null;
 
-    let dailySpent = Number(lim?.daily_spent || 0);
-    let monthlySpent = Number(lim?.monthly_spent || 0);
+    let dailySpent = parseSpent(lim?.daily_spent);
+    let monthlySpent = parseSpent(lim?.monthly_spent);
     if (dayStart !== today) dailySpent = 0;
     if (monthStart !== month) monthlySpent = 0;
 
@@ -470,8 +518,8 @@ export async function fleetStatus(env, userId) {
 
   const today = new Date().toISOString().slice(0, 10);
   const month = today.slice(0, 7);
-  let dailySpent = Number(lim.daily_spent || 0);
-  let monthlySpent = Number(lim.monthly_spent || 0);
+  let dailySpent = parseSpent(lim.daily_spent);
+  let monthlySpent = parseSpent(lim.monthly_spent);
   const dayStart = lim.daily_window_start
     ? String(lim.daily_window_start).slice(0, 10)
     : null;
@@ -481,13 +529,16 @@ export async function fleetStatus(env, userId) {
   if (dayStart !== today) dailySpent = 0;
   if (monthStart !== month) monthlySpent = 0;
 
-  const dailyBudget = lim.daily_budget != null ? Number(lim.daily_budget) : null;
-  const monthlyBudget = lim.monthly_budget != null ? Number(lim.monthly_budget) : null;
-  const warnBps = lim.warn_bps != null ? Number(lim.warn_bps) : 8000;
+  const dailyBudget = parseMoney(lim.daily_budget);
+  const monthlyBudget = parseMoney(lim.monthly_budget);
+  const warnBps =
+    lim.warn_bps != null && Number.isFinite(Number(lim.warn_bps))
+      ? Number(lim.warn_bps)
+      : 8000;
   const atWarn =
     dailyBudget != null &&
     dailyBudget > 0 &&
-    dailySpent * 10000 >= dailyBudget * warnBps;
+    dailySpent * 10000 >= dailyBudget * warnBps - EPS;
 
   return {
     daily_budget: dailyBudget,
