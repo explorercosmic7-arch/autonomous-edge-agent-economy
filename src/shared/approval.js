@@ -85,7 +85,6 @@ export function serializeApprovalSettings(row) {
 async function hasPaidCounterpartyBefore(env, userId, toRepo) {
   if (!userId || !toRepo) return true; // fail open on missing data
   try {
-    // Ledger uses status 'success' (not ok/settled)
     const row = await env.DB.prepare(
       `SELECT 1 AS ok FROM transactions t
        WHERE t.to_repo = ?1
@@ -107,7 +106,6 @@ async function hasPaidCounterpartyBefore(env, userId, toRepo) {
     if (row) return true;
   } catch (_) {
     try {
-      // Fallback: any success to this peer from same default agent only
       const row2 = await env.DB.prepare(
         `SELECT 1 AS ok FROM transactions t
          WHERE t.to_repo = ?1 AND t.status = 'success'
@@ -146,11 +144,9 @@ export async function evaluateApprovalRules(
 ) {
   const settingsRow = await getApprovalSettings(env, userId);
   const settings = serializeApprovalSettings(settingsRow);
-
   if (!settings.enabled) {
     return { needApproval: false, softAlert: false, settings };
   }
-
   const amt = Number(amount) || 0;
   const taskStr = String(task || "").toLowerCase();
   let needApproval = false;
@@ -158,7 +154,6 @@ export async function evaluateApprovalRules(
   let rule_code = null;
   let reason = null;
 
-  // 1) Hard: amount threshold
   if (
     settings.approve_over_usd != null &&
     Number.isFinite(settings.approve_over_usd) &&
@@ -171,7 +166,6 @@ export async function evaluateApprovalRules(
     ).toFixed(6)}`;
   }
 
-  // 2) Soft alert threshold (never blocks by itself)
   if (
     settings.alert_over_usd != null &&
     Number.isFinite(settings.alert_over_usd) &&
@@ -180,7 +174,6 @@ export async function evaluateApprovalRules(
     softAlert = true;
   }
 
-  // Soft warn band under approve_over (e.g. 80% of threshold)
   if (
     !needApproval &&
     settings.approve_over_usd != null &&
@@ -199,7 +192,6 @@ export async function evaluateApprovalRules(
     }
   }
 
-  // 3) Task prefix list
   if (!needApproval && settings.approve_task_prefixes.length) {
     for (const p of settings.approve_task_prefixes) {
       if (p && taskStr.includes(p)) {
@@ -211,7 +203,6 @@ export async function evaluateApprovalRules(
     }
   }
 
-  // 4) New counterparty
   if (!needApproval && settings.approve_new_counterparty && toRepo) {
     const known = await hasPaidCounterpartyBefore(env, userId, toRepo);
     if (!known) {
@@ -253,12 +244,10 @@ export async function createApprovalRequest(
     MAX_TTL,
     Math.max(MIN_TTL, Number(ttl_seconds) || DEFAULT_TTL)
   );
-  // UTC wall clock compatible with SQLite datetime('now')
   const expiresAt = new Date(Date.now() + ttl * 1000)
     .toISOString()
     .replace("T", " ")
     .replace(/\.\d{3}Z$/, "");
-
   await env.DB.prepare(
     `INSERT INTO approval_requests (
        id, user_id, from_repo, to_repo, amount, task,
@@ -283,7 +272,6 @@ export async function createApprovalRequest(
       expiresAt
     )
     .run();
-
   return {
     id,
     status: "pending",
@@ -297,9 +285,39 @@ export async function createApprovalRequest(
   };
 }
 
-/** Expire stale pending rows (best-effort). */
+/**
+ * Expire stale pending rows (best-effort).
+ * Emits approval.expired webhooks for rows that transition (capped).
+ */
 export async function expirePendingApprovals(env, userId = null) {
   try {
+    // Snapshot a few rows about to expire so we can notify
+    let toNotify = [];
+    try {
+      if (userId) {
+        const { results } = await env.DB.prepare(
+          `SELECT id, user_id, from_repo, to_repo, amount, task, rule_code
+           FROM approval_requests
+           WHERE user_id = ?1 AND status = 'pending'
+             AND expires_at < datetime('now')
+           LIMIT 25`
+        )
+          .bind(userId)
+          .all();
+        toNotify = results || [];
+      } else {
+        const { results } = await env.DB.prepare(
+          `SELECT id, user_id, from_repo, to_repo, amount, task, rule_code
+           FROM approval_requests
+           WHERE status = 'pending' AND expires_at < datetime('now')
+           LIMIT 40`
+        ).all();
+        toNotify = results || [];
+      }
+    } catch (_) {
+      toNotify = [];
+    }
+
     if (userId) {
       await env.DB.prepare(
         `UPDATE approval_requests
@@ -315,6 +333,28 @@ export async function expirePendingApprovals(env, userId = null) {
          SET status = 'expired', resolved_at = datetime('now'), resolve_note = 'ttl'
          WHERE status = 'pending' AND expires_at < datetime('now')`
       ).run();
+    }
+
+    for (const row of toNotify) {
+      try {
+        await logSafetyEvent(env, "approval.expired", {
+          user_id: row.user_id,
+          repo_id: row.from_repo,
+          reason: "ttl",
+          meta: { approval_id: row.id, amount: row.amount },
+        });
+        scheduleWebhook(null, env, row.user_id, "approval.expired", {
+          approval_id: row.id,
+          repo_id: row.from_repo,
+          to_repo: row.to_repo,
+          amount: row.amount,
+          task: row.task || null,
+          rule_code: row.rule_code || null,
+          status: "expired",
+        });
+      } catch (e) {
+        console.log("approval_expired_webhook", e && e.message);
+      }
     }
   } catch (e) {
     console.log("expire_approvals", e && e.message);
@@ -334,7 +374,11 @@ export async function getApprovalRequest(env, id) {
   }
 }
 
-export async function listApprovalRequests(env, userId, { status, limit } = {}) {
+export async function listApprovalRequests(
+  env,
+  userId,
+  { status, limit } = {}
+) {
   await expirePendingApprovals(env, userId);
   const lim = Math.min(50, Math.max(1, Number(limit) || 20));
   try {
@@ -381,10 +425,6 @@ export async function countPendingApprovals(env, userId) {
 
 /**
  * Main gate helper for safetyGate.
- * If approval required: creates pending request, webhooks, returns block payload.
- * Soft alerts only fire webhook + log.
- *
- * @returns {null | { block: true, code, error, approval_id, expires_at, rule_code, status }}
  */
 export async function checkApprovalGate(
   env,
@@ -394,7 +434,6 @@ export async function checkApprovalGate(
   { toRepo, task, idempotency_key, ctx } = {}
 ) {
   if (!authUser || !authUser.id || !fromRepo) return null;
-
   const userId = authUser.id;
   const to = parseRepo(toRepo) || String(toRepo || "").trim() || null;
   const evalResult = await evaluateApprovalRules(env, userId, {
@@ -403,10 +442,8 @@ export async function checkApprovalGate(
     amount,
     task,
   });
-
   if (!evalResult) return null;
 
-  // Soft alert only
   if (evalResult.softAlert && !evalResult.needApproval) {
     try {
       await logSafetyEvent(env, "approval.alert", {
@@ -430,7 +467,6 @@ export async function checkApprovalGate(
 
   if (!evalResult.needApproval) return null;
 
-  // Dedup: reuse open pending for same from/to/amount/task within window
   try {
     const existing = await env.DB.prepare(
       `SELECT id, expires_at, rule_code, reason, status FROM approval_requests
@@ -489,7 +525,6 @@ export async function checkApprovalGate(
       to_repo: to,
     },
   });
-
   scheduleWebhook(ctx || null, env, userId, "approval.requested", {
     approval_id: req.id,
     repo_id: fromRepo,
@@ -535,7 +570,6 @@ export async function decideApproval(
     };
   }
 
-  // Expired check
   try {
     const still = await env.DB.prepare(
       `SELECT 1 AS ok FROM approval_requests
@@ -551,6 +585,13 @@ export async function decideApproval(
       )
         .bind(id)
         .run();
+      scheduleWebhook(null, env, userId, "approval.expired", {
+        approval_id: id,
+        repo_id: row.from_repo,
+        to_repo: row.to_repo,
+        amount: row.amount,
+        status: "expired",
+      });
       return { ok: false, error: "Approval expired", code: "expired" };
     }
   } catch (_) {}
@@ -560,7 +601,6 @@ export async function decideApproval(
     return { ok: false, error: "decision must be approve or reject" };
   }
   const status = dec === "approve" ? "approved" : "rejected";
-
   await env.DB.prepare(
     `UPDATE approval_requests
      SET status = ?2,
@@ -583,7 +623,6 @@ export async function decideApproval(
     reason: note || status,
     meta: { approval_id: id, to_repo: row.to_repo, amount: row.amount },
   });
-
   scheduleWebhook(null, env, userId, "approval." + status, {
     approval_id: id,
     repo_id: row.from_repo,
@@ -620,8 +659,6 @@ export async function decideApproval(
 /**
  * Validate an approved allowance for this pay — does NOT burn the id.
  * Call markApprovalConsumed only after a successful debit.
- *
- * Alias: consumeApprovedAllowance (legacy name kept for imports).
  */
 export async function validateApprovedAllowance(
   env,
@@ -638,18 +675,33 @@ export async function validateApprovedAllowance(
     return { ok: false, error: "Invalid approval", code: "approval_invalid" };
   }
   if (row.status === "pending") {
-    return { ok: false, error: "Still pending approval", code: "approval_pending" };
+    return {
+      ok: false,
+      error: "Still pending approval",
+      code: "approval_pending",
+    };
   }
   if (row.status === "rejected" || row.status === "expired") {
-    return { ok: false, error: "Approval " + row.status, code: "approval_" + row.status };
+    return {
+      ok: false,
+      error: "Approval " + row.status,
+      code: "approval_" + row.status,
+    };
   }
   if (row.status === "consumed" || row.status === "cancelled") {
-    return { ok: false, error: "Approval already used", code: "approval_consumed" };
+    return {
+      ok: false,
+      error: "Approval already used",
+      code: "approval_consumed",
+    };
   }
   if (row.status !== "approved") {
-    return { ok: false, error: "Approval not approved", code: "approval_invalid" };
+    return {
+      ok: false,
+      error: "Approval not approved",
+      code: "approval_invalid",
+    };
   }
-  // Still within original expires_at
   try {
     const fresh = await env.DB.prepare(
       `SELECT 1 AS ok FROM approval_requests
@@ -661,15 +713,26 @@ export async function validateApprovedAllowance(
       return { ok: false, error: "Approval expired", code: "expired" };
     }
   } catch (_) {}
-
   if (String(row.from_repo) !== String(fromRepo)) {
-    return { ok: false, error: "from_repo mismatch", code: "approval_mismatch" };
+    return {
+      ok: false,
+      error: "from_repo mismatch",
+      code: "approval_mismatch",
+    };
   }
   if (String(row.to_repo) !== String(toRepo || "")) {
-    return { ok: false, error: "to_repo mismatch", code: "approval_mismatch" };
+    return {
+      ok: false,
+      error: "to_repo mismatch",
+      code: "approval_mismatch",
+    };
   }
   if (Math.abs(Number(row.amount) - Number(amount)) > 1e-9) {
-    return { ok: false, error: "amount mismatch", code: "approval_mismatch" };
+    return {
+      ok: false,
+      error: "amount mismatch",
+      code: "approval_mismatch",
+    };
   }
   return { ok: true, approval_id: approvalId, row };
 }
@@ -681,11 +744,12 @@ export async function consumeApprovedAllowance(env, authUser, approvalId, ctx) {
 
 /**
  * Mark approved id as consumed — call only after successful settlement.
- * Atomic: only one concurrent pay can win.
+ * Emits approval.consumed webhook when transition succeeds.
  */
 export async function markApprovalConsumed(env, approvalId, userId) {
   if (!approvalId) return { ok: false };
   try {
+    const row = await getApprovalRequest(env, approvalId);
     const res = await env.DB.prepare(
       `UPDATE approval_requests
        SET status = 'consumed',
@@ -698,6 +762,21 @@ export async function markApprovalConsumed(env, approvalId, userId) {
       .bind(approvalId, userId || null)
       .run();
     const changes = (res && res.meta && res.meta.changes) || 0;
+    if (changes > 0 && row) {
+      const uid = userId || row.user_id;
+      try {
+        scheduleWebhook(null, env, uid, "approval.consumed", {
+          approval_id: approvalId,
+          repo_id: row.from_repo,
+          to_repo: row.to_repo,
+          amount: row.amount,
+          task: row.task || null,
+          status: "consumed",
+        });
+      } catch (e) {
+        console.log("approval_consumed_webhook", e && e.message);
+      }
+    }
     return { ok: changes > 0, changes };
   } catch (e) {
     console.log("mark_approval_consumed", e && e.message);
