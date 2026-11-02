@@ -5,6 +5,7 @@
  * (receipt issue + trace helpers included for pay path)
  *
  * REQUIRES: src/shared/credit.js exports debitWithCredit
+ * Scoped API keys: applyScopeVerb(authUser, "pay", toRepo) before safetyGate
  */
 import { json, bad } from "./http.js";
 import {
@@ -41,6 +42,7 @@ import {
   logDelegateEvent,
 } from "./delegate.js";
 import { validateApprovedAllowance, markApprovalConsumed } from "./approval.js";
+import { applyScopeVerb } from "./scopes.js";
 import {
   RL_PAY_MAX,
   RL_PAY_WINDOW_SEC,
@@ -99,14 +101,12 @@ export async function handlePay(request, env, ctx) {
     } catch (_) {}
     Promise.resolve(p).catch(() => {});
   };
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const authUser = await getAuthUser(request, env);
   const rlId = authUser
     ? authUser.auth_via === "api_key"
@@ -119,7 +119,6 @@ export async function handlePay(request, env, ctx) {
       retry_after_sec: limited.retry_after_sec,
     });
   }
-
   let fromRepo = parseRepo(body.from_repo || body.fromRepo);
   if (!fromRepo && authUser?.default_repo) {
     fromRepo = parseRepo(authUser.default_repo);
@@ -153,6 +152,8 @@ export async function handlePay(request, env, ctx) {
     const taskEarly = String(body.task || "").slice(0, 500);
     if (!toRepoEarly) return bad(request, "to_repo must be owner/repo");
     if (amountEarly == null) return bad(request, "amount must be between 0.000001 and 1000000");
+    // Child key still needs pay scope for delegated spend
+    applyScopeVerb(authUser, "pay", toRepoEarly);
     const claim = await claimDelegationSpend(env, {
       id: delegateIdHdr,
       childKeyId: authUser.key_id,
@@ -194,6 +195,9 @@ export async function handlePay(request, env, ctx) {
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
 
   if (authUser) {
+    // Scoped API key — pay verb + max amount + to_repo allowlist
+    applyScopeVerb(authUser, "pay", toRepo);
+
     // One-shot allow after human approve (retry pay with X-Approval-Id)
     const approvalHdr = String(
       request.headers.get("X-Approval-Id") || body.approval_id || ""
@@ -213,7 +217,6 @@ export async function handlePay(request, env, ctx) {
       authUser._approvalConsumed = true;
       authUser._approvalId = approvalHdr;
     }
-
     authUser._policyCtx = {
       to_repo: toRepo,
       task,
@@ -267,14 +270,11 @@ export async function handlePay(request, env, ctx) {
   let fromBalance = null;
   let creditDrawn = 0;
   let usedCredit = false;
-
   if (activeDelegation) {
-    // Funds already locked in system/delegate — claim reduced remaining
     fromBalance = null;
     creditDrawn = 0;
     usedCredit = false;
   } else {
-    // Fast cash path
     const cashDebit = await env.DB.prepare(
       `UPDATE accounts
        SET balance = balance - ?1, updated_at = datetime('now')
@@ -286,7 +286,6 @@ export async function handlePay(request, env, ctx) {
     if (cashDebit) {
       fromBalance = Number(cashDebit.balance);
     } else {
-      // Cash short → debitWithCredit (cash + optional credit line)
       const debitRes = await debitWithCredit(env, fromRepo, amount);
       if (!debitRes.ok) {
         if (idem && wonLock) {
@@ -474,6 +473,7 @@ export async function handlePay(request, env, ctx) {
       await safetyRecordSpend(env, authUser, fromRepo, amount);
     } catch (_) {}
   }
+
   if (authUser && authUser._approvalId) {
     try {
       await markApprovalConsumed(env, authUser._approvalId, authUser.id);
@@ -507,7 +507,6 @@ export async function handlePay(request, env, ctx) {
     authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   const today = new Date().toISOString().slice(0, 10);
   const payloadJson = JSON.stringify(payload);
-
   waitUntil(
     (async () => {
       try {
@@ -558,7 +557,6 @@ export async function handlePay(request, env, ctx) {
       }
     })()
   );
-
   return json(request, payload);
 }
 
@@ -569,6 +567,14 @@ export async function handleFund(request, env) {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
+  }
+  // Faucet is owner/session plane — API keys cannot fund (least privilege)
+  const authUser = await getAuthUser(request, env);
+  if (authUser && authUser.auth_via === "api_key") {
+    return bad(request, "Faucet requires signed-in session (not API key)", 403, {
+      code: "key_scope_denied",
+      required: "session",
+    });
   }
   const repo = parseRepo(body.repo || body.to_repo || body.toRepo);
   const amount = parseAmount(body.amount);
