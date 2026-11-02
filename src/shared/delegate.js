@@ -1,5 +1,6 @@
 /**
  * Shared Delegation — parent authority / child pocket money + expireDelegations cron.
+ * Scoped API keys: applyScopeVerb(authUser, "pay", ...) on open (locks parent funds).
  */
 import { json, bad } from "./http.js";
 import {
@@ -13,6 +14,7 @@ import { ensureAccount } from "./accounts.js";
 import { debitWithCredit } from "./credit.js";
 import { scheduleWebhook } from "./webhooks.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
+import { applyScopeVerb } from "./scopes.js";
 import {
   SYSTEM_DELEGATE,
   DELEGATE_MIN,
@@ -24,20 +26,6 @@ import {
   RL_DELEGATE_WINDOW_SEC,
   EXPIRE_DELEGATE_BATCH,
 } from "./constants.js";
-
-/* ─── Delegation chains (parent authority / child pocket money) ───
- * Parent locks budget → system/delegate. Child API key spends with:
- *   Authorization: Bearer a2a_…child_key
- *   X-Delegate-Id: dg_…
- * Constraints: allow_to, task_prefix, max_per_spend, remaining, TTL.
- * Parent revokes instantly. Extends intent + policy + colo bind on the key.
- *
- * POST /api/delegate/open   { parent_repo?, child_key_id, budget, allow_to?, task_prefix?, max_per_spend?, ttl_seconds?, label?, child_repo? }
- * POST /api/delegate/revoke { id }
- * GET  /api/delegate        ?repo=&status=
- * GET  /api/delegate/:id
- * Cron: expireDelegations
- */
 
 export function parseDelegateTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
@@ -108,10 +96,6 @@ export async function loadDelegation(env, id) {
   }
 }
 
-/**
- * Resolve and claim a spend against a delegation.
- * Returns { ok, delegation, remaining } or { ok:false, error, code, status? }.
- */
 export async function claimDelegationSpend(env, { id, childKeyId, toRepo, amount, task }) {
   const row = await loadDelegation(env, id);
   if (!row) {
@@ -160,7 +144,6 @@ export async function claimDelegationSpend(env, { id, childKeyId, toRepo, amount
       remaining_usd: remaining,
     };
   }
-
   const claim = await env.DB.prepare(
     `UPDATE delegations
      SET remaining_usd = remaining_usd - ?2,
@@ -182,7 +165,6 @@ export async function handleDelegateOpen(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   const rlId =
     authUser.auth_via === "api_key"
       ? "dg:key:" + (authUser.key_id || authUser.id)
@@ -191,14 +173,12 @@ export async function handleDelegateOpen(request, env, ctx) {
   if (limited) {
     return bad(request, "Rate limit: delegate ops", 429, { retry_after_sec: limited.retry_after_sec });
   }
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   let parentRepo = parseRepo(body.parent_repo || body.from_repo || body.parent);
   if (!parentRepo && authUser.default_repo) parentRepo = parseRepo(authUser.default_repo);
   const childKeyId = String(body.child_key_id || body.key_id || body.child_key || "").trim();
@@ -220,7 +200,6 @@ export async function handleDelegateOpen(request, env, ctx) {
         : null;
   if (body.max_per_spend === "" || body.max_per_spend === null) maxPer = null;
   const label = body.label ? String(body.label).slice(0, 200) : null;
-
   if (!parentRepo) return bad(request, "parent_repo required (or set default agent)");
   if (!childKeyId) return bad(request, "child_key_id required (API key id from /api/me/keys)");
   if (budget == null || budget < DELEGATE_MIN || budget > DELEGATE_MAX) {
@@ -230,8 +209,6 @@ export async function handleDelegateOpen(request, env, ctx) {
   if (maxPer != null && (maxPer < DELEGATE_MIN || maxPer > budget)) {
     return bad(request, "max_per_spend must be between min amount and budget");
   }
-
-  // Child key must exist, active, and belong to same user (family of keys)
   let keyRow;
   try {
     keyRow = await env.DB.prepare(
@@ -254,11 +231,11 @@ export async function handleDelegateOpen(request, env, ctx) {
       code: "child_key_not_yours",
     });
   }
-
+  // Opening a delegation spends parent funds — requires pay scope
+  applyScopeVerb(authUser, "pay", SYSTEM_DELEGATE);
   authUser._policyCtx = { to_repo: SYSTEM_DELEGATE, task: "delegate:open" };
   const blocked = await safetyGate(request, env, authUser, parentRepo, budget);
   if (blocked) return blocked;
-
   const debitRes = await debitWithCredit(env, parentRepo, budget);
   if (!debitRes.ok) {
     return bad(request, debitRes.error || "Insufficient funds", debitRes.code === "wallet_locked" ? 403 : 402, {
@@ -266,10 +243,8 @@ export async function handleDelegateOpen(request, env, ctx) {
       available_credit: debitRes.available_credit,
     });
   }
-
   const id = "dg_" + randomId(12);
   const modifier = "+" + ttlSec + " seconds";
-
   try {
     await ensureAccount(env, SYSTEM_DELEGATE);
     await env.DB.batch([
@@ -326,14 +301,12 @@ export async function handleDelegateOpen(request, env, ctx) {
       500
     );
   }
-
   await safetyRecordSpend(env, authUser, parentRepo, budget);
   await logDelegateEvent(env, id, "opened", {
     actor_repo: parentRepo,
     amount: budget,
     note: label || ("key:" + (keyRow.key_prefix || childKeyId)),
   });
-
   if (authUser.id) {
     scheduleWebhook(ctx, env, authUser.id, "delegate.opened", {
       id,
@@ -349,7 +322,6 @@ export async function handleDelegateOpen(request, env, ctx) {
       status: "open",
     });
   }
-
   return json(request, {
     ok: true,
     delegation: {
@@ -379,7 +351,6 @@ export async function handleDelegateRevoke(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   let body;
   try {
     body = await request.json();
@@ -388,18 +359,16 @@ export async function handleDelegateRevoke(request, env, ctx) {
   }
   const id = String(body.id || "").trim();
   if (!id) return bad(request, "id required");
-
   const row = await loadDelegation(env, id);
   if (!row) return bad(request, "Delegation not found", 404);
   if (row.status !== "open") {
     return bad(request, "Delegation not open (status=" + row.status + ")", 400);
   }
-
   const allowed =
     authUser.id === row.created_by ||
     (authUser.default_repo && authUser.default_repo === row.parent_repo);
   if (!allowed) return bad(request, "Not authorized to revoke this delegation", 403);
-
+  applyScopeVerb(authUser, "pay", row.parent_repo);
   const claim = await env.DB.prepare(
     `UPDATE delegations
      SET status = 'revoked', revoked_at = datetime('now'), closed_at = datetime('now'), updated_at = datetime('now')
@@ -409,7 +378,6 @@ export async function handleDelegateRevoke(request, env, ctx) {
     .bind(id)
     .first();
   if (!claim) return bad(request, "Revoke race", 409);
-
   const refund = Number(claim.remaining_usd || 0);
   if (refund > 0) {
     await ensureAccount(env, row.parent_repo);
@@ -427,13 +395,11 @@ export async function handleDelegateRevoke(request, env, ctx) {
       ).bind(SYSTEM_DELEGATE, row.parent_repo, refund, "delegate-revoke-refund:" + id, Date.now() - t0),
     ]);
   }
-
   await logDelegateEvent(env, id, "revoked", {
     actor_repo: row.parent_repo,
     amount: refund,
     note: "parent_revoke",
   });
-
   if (row.created_by) {
     scheduleWebhook(ctx, env, row.created_by, "delegate.revoked", {
       id,
@@ -443,7 +409,6 @@ export async function handleDelegateRevoke(request, env, ctx) {
       status: "revoked",
     });
   }
-
   return json(request, {
     ok: true,
     id,
@@ -490,7 +455,6 @@ export async function handleDelegateList(request, url, env) {
   const repo = (url.searchParams.get("repo") || "").trim();
   const status = (url.searchParams.get("status") || "").trim();
   const keyId = (url.searchParams.get("child_key_id") || url.searchParams.get("key_id") || "").trim();
-
   let sql = `SELECT id, parent_repo, child_key_id, child_repo, budget_usd, remaining_usd,
                     allow_to, task_prefix, max_per_spend, status, ttl_seconds, expires_at, label, created_at
              FROM delegations WHERE 1=1`;
@@ -510,7 +474,6 @@ export async function handleDelegateList(request, url, env) {
   }
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   binds.push(limit);
-
   try {
     const { results } = await env.DB.prepare(sql).bind(...binds).all();
     const rows = (results || []).map((r) => ({
@@ -591,5 +554,3 @@ export async function expireDelegations(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
-
-
