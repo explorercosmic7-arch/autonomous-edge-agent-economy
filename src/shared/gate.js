@@ -37,8 +37,12 @@ import {
 import { checkApprovalGate } from "./approval.js";
 
 /* ─── Safety: lockWallet ─── */
-
-export async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx } = {}) {
+export async function lockWallet(
+  env,
+  repoId,
+  reason,
+  { api_key_id, user_id, ctx } = {}
+) {
   await ensureAgentLimits(env, repoId);
   await env.DB.prepare(
     `UPDATE agent_limits
@@ -68,7 +72,6 @@ export async function lockWallet(env, repoId, reason, { api_key_id, user_id, ctx
 
 export async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (!fromRepo) return null;
-
   const sus = rejectIfSuspendedKey(request, authUser);
   if (sus) return sus;
 
@@ -83,9 +86,17 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
 
   // Policy-as-code (allow/deny, max_amount, task prefix)
   const pctx = (authUser && authUser._policyCtx) || {};
-  const polHit = await checkSpendPolicy(env, fromRepo, amount, pctx.to_repo, pctx.task);
+  const polHit = await checkSpendPolicy(
+    env,
+    fromRepo,
+    amount,
+    pctx.to_repo,
+    pctx.task
+  );
   if (polHit) {
-    return bad(request, polHit.error, 403, { code: polHit.code || "policy_denied" });
+    return bad(request, polHit.error, 403, {
+      code: polHit.code || "policy_denied",
+    });
   }
 
   // Per-agent daily budget
@@ -99,6 +110,32 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
   if (uid) {
     const fleetHit = await checkFleetBudget(env, uid, amount);
     if (fleetHit && fleetHit.hard) {
+      try {
+        await logSafetyEvent(env, "fleet.budget_exceeded", {
+          user_id: uid,
+          repo_id: fromRepo,
+          reason: fleetHit.error,
+          meta: {
+            code: fleetHit.code,
+            daily_spent: fleetHit.daily_spent,
+            monthly_spent: fleetHit.monthly_spent,
+            amount,
+          },
+        });
+        scheduleWebhook(null, env, uid, "fleet.budget_exceeded", {
+          repo_id: fromRepo,
+          reason: fleetHit.error,
+          code: fleetHit.code,
+          daily_spent: fleetHit.daily_spent,
+          monthly_spent: fleetHit.monthly_spent,
+          daily_budget: fleetHit.daily_budget,
+          monthly_budget: fleetHit.monthly_budget,
+          amount: Number(amount),
+          remaining: fleetHit.remaining,
+        });
+      } catch (e) {
+        console.log("fleet_hard_webhook", e && e.message);
+      }
       return bad(request, fleetHit.error, 429, {
         code: fleetHit.code,
         daily_spent: fleetHit.daily_spent,
@@ -148,7 +185,8 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
     }
   }
 
-  const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
+  const keyId =
+    authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   const vel = await checkVelocity(env, fromRepo, amount, keyId);
   if (vel) {
     if (vel.spike && keyId) {
@@ -168,9 +206,13 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
         reason: vel.error,
       });
       try {
-        await setShieldLevel(env, fromRepo, SHIELD_LEVEL_FREEZE, "runaway_loop: " + vel.error, {
-          cooldownSec: SHIELD_COOLDOWN_SEC,
-        });
+        await setShieldLevel(
+          env,
+          fromRepo,
+          SHIELD_LEVEL_FREEZE,
+          "runaway_loop: " + vel.error,
+          { cooldownSec: SHIELD_COOLDOWN_SEC }
+        );
         await maybeAutoTripGlobalShield(env);
       } catch (e) {
         console.log("shield_trip_on_spike", e && e.message);
@@ -193,14 +235,14 @@ export async function safetyGate(request, env, authUser, fromRepo, amount) {
       retry_after_sec: vel.retry_after_sec,
     });
   }
-
   return null;
 }
 
 /** Call after a successful debit to update velocity + agent daily + fleet spent. */
 export async function safetyRecordSpend(env, authUser, fromRepo, amount) {
   if (!fromRepo || !amount) return;
-  const keyId = authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
+  const keyId =
+    authUser && authUser.auth_via === "api_key" ? authUser.key_id : null;
   await recordVelocityEvent(env, fromRepo, amount, keyId);
   await addDailySpent(env, fromRepo, amount);
   if (authUser && authUser.id) {
