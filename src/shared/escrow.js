@@ -1,6 +1,6 @@
 /**
  * Escrow — hold / release / refund / list
- * (expireHeldEscrows lives in shared/expire.js)
+ * Scoped API keys: applyScopeVerb(authUser, "escrow", toRepo)
  */
 import { json, bad } from "./http.js";
 import {
@@ -15,13 +15,12 @@ import { ensureAccount } from "./accounts.js";
 import { debitWithCredit } from "./credit.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
 import { scheduleWebhook } from "./webhooks.js";
+import { applyScopeVerb } from "./scopes.js";
 import {
   RL_ESCROW_MAX,
   RL_ESCROW_WINDOW_SEC,
   SYSTEM_ESCROW,
 } from "./constants.js";
-
-/* ─── Escrow (agent banking) ─── */
 
 export async function handleEscrowHold(request, env, ctx) {
   const t0 = Date.now();
@@ -34,10 +33,8 @@ export async function handleEscrowHold(request, env, ctx) {
     } catch (_) {}
     Promise.resolve(p).catch(() => {});
   };
-
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   const rlId =
     authUser.auth_via === "api_key"
       ? "escrow:key:" + (authUser.key_id || authUser.id)
@@ -48,14 +45,12 @@ export async function handleEscrowHold(request, env, ctx) {
       retry_after_sec: limited.retry_after_sec,
     });
   }
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   let fromRepo = parseRepo(body.from_repo || body.fromRepo);
   if (!fromRepo && authUser.default_repo) {
     fromRepo = parseRepo(authUser.default_repo);
@@ -68,7 +63,6 @@ export async function handleEscrowHold(request, env, ctx) {
     String(request.headers.get("Idempotency-Key") || body.idempotency_key || "")
       .trim()
       .slice(0, 128) || null;
-
   if (!fromRepo) return bad(request, "from_repo required (or set default agent)");
   if (!toRepo) return bad(request, "to_repo required");
   if (fromRepo === toRepo) return bad(request, "from_repo and to_repo must differ");
@@ -76,13 +70,12 @@ export async function handleEscrowHold(request, env, ctx) {
   if (ttlSec == null) {
     return bad(request, "ttl_hours / ttl_seconds out of range (min 10s, max 720h)");
   }
-
+  applyScopeVerb(authUser, "escrow", toRepo);
   {
     authUser._policyCtx = { to_repo: toRepo, task };
     const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
     if (blocked) return blocked;
   }
-
   if (idem) {
     const existing = await env.DB.prepare(
       `SELECT * FROM escrows WHERE idempotency_key = ?1`
@@ -97,10 +90,8 @@ export async function handleEscrowHold(request, env, ctx) {
       });
     }
   }
-
   await ensureAccount(env, fromRepo);
   await ensureAccount(env, toRepo);
-
   const debitRes = await debitWithCredit(env, fromRepo, amount);
   if (!debitRes.ok) {
     return bad(request, debitRes.error || "Insufficient funds", debitRes.code === "wallet_locked" ? 403 : 402, {
@@ -110,10 +101,8 @@ export async function handleEscrowHold(request, env, ctx) {
   }
   const debit = { balance: debitRes.balance };
   const creditDrawn = debitRes.credit_drawn || 0;
-
   const id = "esc_" + randomId(12);
   const modifier = "+" + ttlSec + " seconds";
-
   let storedExpires = null;
   try {
     await env.DB.batch([
@@ -138,7 +127,6 @@ export async function handleEscrowHold(request, env, ctx) {
       .first();
     storedExpires = stored?.expires_at || null;
   } catch (e) {
-    // best-effort compensate debit if insert failed
     try {
       await env.DB.prepare(
         `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
@@ -148,10 +136,7 @@ export async function handleEscrowHold(request, env, ctx) {
     } catch (_) {}
     return bad(request, "Escrow hold failed: " + (e.message || e), 500);
   }
-
-  // Post-commit: velocity + daily spend (non-blocking) — same pattern as pay
   waitUntil(safetyRecordSpend(env, authUser, fromRepo, amount));
-
   return json(request, {
     ok: true,
     status: "held",
@@ -175,31 +160,26 @@ export async function handleEscrowRelease(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const id = String(body.id || "").trim();
   if (!id) return bad(request, "id required");
-
   const esc = await env.DB.prepare(`SELECT * FROM escrows WHERE id = ?1`).bind(id).first();
   if (!esc) return bad(request, "Escrow not found", 404);
   if (esc.status !== "held") {
     return bad(request, "Escrow is not held (status=" + esc.status + ")");
   }
-
   const allowed =
     authUser.id === esc.created_by ||
     (authUser.default_repo &&
       (authUser.default_repo === esc.from_repo || authUser.default_repo === esc.to_repo));
   if (!allowed) return bad(request, "Not authorized to release this escrow", 403);
-
+  applyScopeVerb(authUser, "escrow", esc.to_repo);
   await ensureAccount(env, esc.to_repo);
-
   const claim = await env.DB.prepare(
     `UPDATE escrows
      SET status = 'released', released_at = datetime('now'), updated_at = datetime('now')
@@ -209,7 +189,6 @@ export async function handleEscrowRelease(request, env, ctx) {
     .bind(id)
     .first();
   if (!claim) return bad(request, "Escrow is not held (race)");
-
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE accounts
@@ -221,7 +200,6 @@ export async function handleEscrowRelease(request, env, ctx) {
        VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
     ).bind(SYSTEM_ESCROW, esc.to_repo, esc.amount, "escrow-release:" + id, Date.now() - t0),
   ]);
-
   if (esc.created_by) {
     scheduleWebhook(ctx, env, esc.created_by, "escrow.released", {
       id: esc.id,
@@ -234,7 +212,6 @@ export async function handleEscrowRelease(request, env, ctx) {
       released_by: authUser.id,
     });
   }
-
   return json(request, {
     ok: true,
     status: "released",
@@ -249,30 +226,25 @@ export async function handleEscrowRefund(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
-
   let body;
   try {
     body = await request.json();
   } catch {
     return bad(request, "Invalid JSON body");
   }
-
   const id = String(body.id || "").trim();
   if (!id) return bad(request, "id required");
-
   const esc = await env.DB.prepare(`SELECT * FROM escrows WHERE id = ?1`).bind(id).first();
   if (!esc) return bad(request, "Escrow not found", 404);
   if (esc.status !== "held") {
     return bad(request, "Escrow is not held (status=" + esc.status + ")");
   }
-
   const allowed =
     authUser.id === esc.created_by ||
     (authUser.default_repo && authUser.default_repo === esc.from_repo);
   if (!allowed) return bad(request, "Not authorized to refund this escrow", 403);
-
+  applyScopeVerb(authUser, "escrow", esc.from_repo);
   await ensureAccount(env, esc.from_repo);
-
   const claim = await env.DB.prepare(
     `UPDATE escrows
      SET status = 'refunded', refunded_at = datetime('now'), updated_at = datetime('now')
@@ -282,7 +254,6 @@ export async function handleEscrowRefund(request, env, ctx) {
     .bind(id)
     .first();
   if (!claim) return bad(request, "Escrow is not held (race)");
-
   await env.DB.batch([
     env.DB.prepare(
       `UPDATE accounts
@@ -294,7 +265,6 @@ export async function handleEscrowRefund(request, env, ctx) {
        VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
     ).bind(SYSTEM_ESCROW, esc.from_repo, esc.amount, "escrow-refund:" + id, Date.now() - t0),
   ]);
-
   if (esc.created_by) {
     scheduleWebhook(ctx, env, esc.created_by, "escrow.refunded", {
       id: esc.id,
@@ -307,7 +277,6 @@ export async function handleEscrowRefund(request, env, ctx) {
       refunded_by: authUser.id,
     });
   }
-
   return json(request, {
     ok: true,
     status: "refunded",
@@ -322,12 +291,10 @@ export async function handleEscrowList(request, url, env) {
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 25), 1), 100);
   const repo = (url.searchParams.get("repo") || "").trim();
   const status = (url.searchParams.get("status") || "").trim();
-
   let sql = `SELECT id, from_repo, to_repo, amount, task, status, created_by,
                     expires_at, released_at, refunded_at, created_at
              FROM escrows WHERE 1=1`;
   const binds = [];
-
   if (repo) {
     if (!parseRepo(repo)) return bad(request, "repo must be owner/repo");
     sql += ` AND (from_repo = ? OR to_repo = ?)`;
@@ -339,7 +306,6 @@ export async function handleEscrowList(request, url, env) {
   }
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   binds.push(limit);
-
   const { results } = await env.DB.prepare(sql).bind(...binds).all();
   return json(request, { ok: true, count: results.length, escrows: results });
 }
