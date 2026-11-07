@@ -289,6 +289,9 @@ export async function handleSplitCreate(request, env, ctx) {
            WHERE repo_id = ?2`
         ).bind(leg.amount_usd, leg.repo)
       );
+      // Per-leg unique idempotency (transactions.idempotency_key is UNIQUE globally)
+      const legIdem =
+        (idem ? idem + ":" : "split:") + splitId + ":" + leg.repo;
       stmts.push(
         env.DB.prepare(
           `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
@@ -299,7 +302,7 @@ export async function handleSplitCreate(request, env, ctx) {
           leg.amount_usd,
           "split:" + splitId + ":" + (task || "").slice(0, 40),
           latency,
-          idem
+          legIdem
         )
       );
     }
