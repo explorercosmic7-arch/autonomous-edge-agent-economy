@@ -16,7 +16,7 @@ import { ensureAccount } from "./accounts.js";
 import { debitWithCredit } from "./credit.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
 import { scheduleWebhook } from "./webhooks.js";
-import { applyScopeVerb, assertKeyScope } from "./scopes.js";
+import { applyScopeVerb, checkKeyScope } from "./scopes.js";
 import {
   RL_SPLIT_MAX,
   RL_SPLIT_WINDOW_SEC,
@@ -164,9 +164,9 @@ export async function handleSplitCreate(request, env, ctx) {
 
   // Scope: max amount + each to_repo allowlist
   if (authUser.auth_via === "api_key") {
-    const scopeHit = assertKeyScope(authUser, "pay", {
+    const scopeHit = checkKeyScope(authUser, "pay", {
       amount,
-      to_repo: legsIn[0].repo,
+      toRepo: legsIn[0].repo,
     });
     if (scopeHit) {
       return bad(request, scopeHit.error, 403, {
@@ -176,14 +176,14 @@ export async function handleSplitCreate(request, env, ctx) {
       });
     }
     for (const leg of legsIn) {
-      const h = assertKeyScope(authUser, "pay", {
+      const h = checkKeyScope(authUser, "pay", {
         amount: 0,
-        to_repo: leg.repo,
+        toRepo: leg.repo,
       });
       if (h && h.code === "key_repo_denied") {
         return bad(request, h.error, 403, {
           code: h.code,
-          to_repo: leg.repo,
+          toRepo: leg.repo,
         });
       }
     }
@@ -191,7 +191,7 @@ export async function handleSplitCreate(request, env, ctx) {
 
   // Gate on total (fleet / approval / velocity / agent budget)
   authUser._policyCtx = {
-    to_repo: legsIn[0].repo,
+    toRepo: legsIn[0].repo,
     task: task || "revenue-split",
     idempotency_key: idem,
   };
