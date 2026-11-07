@@ -61,7 +61,6 @@ function parseRecipients(raw) {
   return { legs };
 }
 
-/** Split amount across legs; last leg absorbs residual so total matches. */
 function allocateAmounts(total, legs) {
   const out = [];
   let allocated = 0;
@@ -162,14 +161,13 @@ export async function handleSplitCreate(request, env, ctx) {
     });
   }
 
-  // Scope: max amount + each to_repo allowlist
   if (authUser.auth_via === "api_key") {
     const scopeHit = checkKeyScope(authUser, "pay", {
       amount,
       toRepo: legsIn[0].repo,
     });
     if (scopeHit) {
-      return bad(request, scopeHit.error, 403, {
+      return bad(request, scopeHit.error, scopeHit.status || 403, {
         code: scopeHit.code,
         required: scopeHit.required,
         max_amount_usd: scopeHit.max_amount_usd,
@@ -181,17 +179,16 @@ export async function handleSplitCreate(request, env, ctx) {
         toRepo: leg.repo,
       });
       if (h && h.code === "key_repo_denied") {
-        return bad(request, h.error, 403, {
+        return bad(request, h.error, h.status || 403, {
           code: h.code,
-          toRepo: leg.repo,
+          to_repo: leg.repo,
         });
       }
     }
   }
 
-  // Gate on total (fleet / approval / velocity / agent budget)
   authUser._policyCtx = {
-    toRepo: legsIn[0].repo,
+    to_repo: legsIn[0].repo,
     task: task || "revenue-split",
     idempotency_key: idem,
   };
@@ -309,7 +306,6 @@ export async function handleSplitCreate(request, env, ctx) {
 
     await env.DB.batch(stmts);
   } catch (e) {
-    // Compensate debit
     try {
       await env.DB.prepare(
         `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
