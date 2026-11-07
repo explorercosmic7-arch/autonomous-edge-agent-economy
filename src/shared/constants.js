@@ -229,3 +229,4 @@ export const RL_SPLIT_WINDOW_SEC = 60;
 export const RL_IP_POST_MAX = 120;             // global per-IP POST budget
 export const RL_IP_POST_WINDOW_SEC = 60;
 export const INTEGRITY_SAMPLE_LIMIT = 500;     // max accounts scanned per integrity run
+
