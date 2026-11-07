@@ -225,6 +225,12 @@ import {
 } from "./shared/ledger.js";
 
 import {
+  handleSplitCreate,
+  handleSplitGet,
+  handleSplitList,
+} from "./shared/split.js";
+
+import {
   handleEscrowHold,
   handleEscrowRelease,
   handleEscrowRefund,
@@ -300,6 +306,9 @@ import {
  *           Scoped keys: verbs read|pay|hire|escrow|stream, max_amount_usd, to_repo_allow (scopes.js + d1-key-scopes-migration.sql)
  * Webhook:  GET|POST /api/me/webhook, POST /api/me/webhook/clear
  *           GET /api/me/webhook/deliveries, POST /api/me/webhook/test (signed ping)
+ * Split:    POST /api/split, GET /api/split, GET /api/split/:id
+ *           Revenue split — one debit → N credits by bps (sum 10000)
+ * D1:       revenue_splits + revenue_split_legs (d1-split-migration.sql)
  * Ledger:   POST /api/pay (fast cash path + batched settle + waitUntil post-commit),
  *           POST /api/fund, GET /api/balance, GET /api/ledger
  * Escrow:   POST /api/escrow/hold|release|refund (hold: waitUntil post-commit like pay),
@@ -917,6 +926,9 @@ export default {
           endpoints: {
             health: "GET /health",
             pay: "POST /api/pay",
+            split: "POST /api/split",
+            split_list: "GET /api/split",
+            split_get: "GET /api/split/:id",
             fund: "POST /api/fund",
             balance: "GET /api/balance?repo=owner/repo",
             ledger: "GET /api/ledger",
@@ -1090,6 +1102,19 @@ export default {
           }
         }
       }
+      if (request.method === "POST" && url.pathname === "/api/split") {
+        return await handleSplitCreate(request, env, ctx);
+      }
+      if (request.method === "GET" && url.pathname === "/api/split") {
+        return await handleSplitList(request, url, env);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/split/")) {
+        const sid = url.pathname.slice("/api/split/".length).replace(/\/$/, "");
+        if (sid && !sid.includes("/")) {
+          return await handleSplitGet(request, env, sid);
+        }
+      }
+
       if (request.method === "POST" && url.pathname === "/api/pay") {
         return await handlePay(request, env, ctx);
       }
