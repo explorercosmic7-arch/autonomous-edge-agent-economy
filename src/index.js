@@ -231,6 +231,14 @@ import {
 } from "./shared/split.js";
 
 import {
+  handleWillUpsert,
+  handleWillGet,
+  handleWillRevoke,
+  handleWillExecute,
+  handleWillExecutionsList,
+} from "./shared/will.js";
+
+import {
   handleEscrowHold,
   handleEscrowRelease,
   handleEscrowRefund,
@@ -309,6 +317,8 @@ import {
  * Split:    POST /api/split, GET /api/split, GET /api/split/:id
  *           Revenue split — one debit → N credits by bps (sum 10000)
  * D1:       revenue_splits + revenue_split_legs (d1-split-migration.sql)
+ * Will:     PUT|GET /api/will, POST /api/will/revoke|execute, GET /api/will/executions
+ *           Agent death/retire → heirs by bps (d1-will-migration.sql)
  * Ledger:   POST /api/pay (fast cash path + batched settle + waitUntil post-commit),
  *           POST /api/fund, GET /api/balance, GET /api/ledger
  * Escrow:   POST /api/escrow/hold|release|refund (hold: waitUntil post-commit like pay),
@@ -927,6 +937,10 @@ export default {
             health: "GET /health",
             pay: "POST /api/pay",
             split: "POST /api/split",
+            will: "PUT|GET /api/will",
+            will_execute: "POST /api/will/execute",
+            will_revoke: "POST /api/will/revoke",
+            will_executions: "GET /api/will/executions",
             split_list: "GET /api/split",
             split_get: "GET /api/split/:id",
             fund: "POST /api/fund",
@@ -1102,6 +1116,23 @@ export default {
           }
         }
       }
+      /* Agent Will */
+      if (request.method === "PUT" && url.pathname === "/api/will") {
+        return await handleWillUpsert(request, env, ctx);
+      }
+      if (request.method === "GET" && url.pathname === "/api/will") {
+        return await handleWillGet(request, url, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/will/revoke") {
+        return await handleWillRevoke(request, env, ctx);
+      }
+      if (request.method === "POST" && url.pathname === "/api/will/execute") {
+        return await handleWillExecute(request, env, ctx);
+      }
+      if (request.method === "GET" && url.pathname === "/api/will/executions") {
+        return await handleWillExecutionsList(request, url, env);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/split") {
         return await handleSplitCreate(request, env, ctx);
       }
@@ -1332,4 +1363,3 @@ export default {
     );
   },
 };
-
