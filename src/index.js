@@ -937,7 +937,7 @@ export default {
             health: "GET /health",
             pay: "POST /api/pay",
             split: "POST /api/split",
-            will: "PUT|GET /api/will",
+            will: "PUT|POST|GET /api/will",
             will_execute: "POST /api/will/execute",
             will_revoke: "POST /api/will/revoke",
             will_executions: "GET /api/will/executions",
@@ -1116,8 +1116,8 @@ export default {
           }
         }
       }
-      /* Agent Will */
-      if (request.method === "PUT" && url.pathname === "/api/will") {
+      /* Agent Will — POST preferred (CORS allowlist is GET/POST only on some deploys) */
+      if ((request.method === "PUT" || request.method === "POST") && url.pathname === "/api/will") {
         return await handleWillUpsert(request, env, ctx);
       }
       if (request.method === "GET" && url.pathname === "/api/will") {
