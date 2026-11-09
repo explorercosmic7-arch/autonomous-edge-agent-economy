@@ -188,11 +188,17 @@ export async function handleWillUpsert(request, env, ctx) {
 
   let reserve = 0;
   if (body.reserve_usd != null || body.reserve != null) {
-    const r = parseAmount(body.reserve_usd ?? body.reserve);
-    if (r == null || r < 0 || r > WILL_MAX_RESERVE) {
-      return bad(request, "reserve_usd invalid");
+    const raw = body.reserve_usd ?? body.reserve;
+    // 0 is valid (pay out full balance). parseAmount often rejects 0 as "no amount".
+    if (raw === 0 || raw === "0" || raw === 0.0) {
+      reserve = 0;
+    } else {
+      const r = parseAmount(raw);
+      if (r == null || r < 0 || r > WILL_MAX_RESERVE) {
+        return bad(request, "reserve_usd invalid", 400, { code: "reserve_invalid" });
+      }
+      reserve = r;
     }
-    reserve = r;
   }
   const auto =
     body.auto_on_continuity_fail === true ||
