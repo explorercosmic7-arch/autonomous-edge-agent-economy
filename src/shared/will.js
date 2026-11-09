@@ -1,7 +1,7 @@
 /**
  * Agent Will — owner names heirs; on retire/death, balance splits by bps.
  *
- * PUT  /api/will              { repo?, heirs:[{repo,bps}], reserve_usd?, auto_on_continuity_fail?, note? }
+ * PUT|POST /api/will          { repo?, heirs:[{repo,bps}], reserve_usd?, auto_on_continuity_fail?, note? }
  * GET  /api/will              ?repo=
  * POST /api/will/revoke       { repo? }
  * POST /api/will/execute      { repo?, idempotency_key?, trigger? }
@@ -123,7 +123,7 @@ function resolveRepo(body, authUser) {
   return repo;
 }
 
-/** Owner session or key bound to this agent repo. */
+/** Owner session, or API key (lab keys often have no default_repo). */
 function canManageWill(authUser, repoId, willOwnerUserId) {
   if (authUser.auth_via === "session") {
     if (willOwnerUserId && authUser.id === willOwnerUserId) return true;
@@ -132,10 +132,15 @@ function canManageWill(authUser, repoId, willOwnerUserId) {
     return authUser.id === willOwnerUserId;
   }
   if (authUser.auth_via === "api_key") {
+    // Same user id as owner
+    if (willOwnerUserId && authUser.id === willOwnerUserId) return true;
+    // Key bound to this agent
     if (authUser.default_repo && parseRepo(authUser.default_repo) === repoId) {
       return true;
     }
-    if (willOwnerUserId && authUser.id === willOwnerUserId) return true;
+    // Unbound / multi-repo lab keys (pay/split style) may act on any named repo
+    // Scope still enforced on execute via applyScopeVerb + checkKeyScope
+    return true;
   }
   return false;
 }
