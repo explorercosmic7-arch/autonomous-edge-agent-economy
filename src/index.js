@@ -28,6 +28,7 @@ import {
   handleAdminIntegrity,
   handleAdminSandboxCleanup,
 } from "./shared/security.js";
+import { handleMeSecurityEvents } from "./shared/securityMeEvents.js";
 
 import {
   handleIntentCreate,
@@ -207,6 +208,7 @@ import {
   handleMeKeySelf,
   handleEdgeInfo,
   handleMeKeysUnsuspend,
+  handleMeKeysRotate,
 } from "./shared/keys.js";
 
 import {
@@ -899,6 +901,12 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/me/keys/unsuspend") {
         return await handleMeKeysUnsuspend(request, env);
       }
+      if (request.method === "POST" && url.pathname === "/api/me/keys/rotate") {
+        return await handleMeKeysRotate(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/me/security-events") {
+        return await handleMeSecurityEvents(request, url, env);
+      }
 
       if (request.method === "GET" && url.pathname === "/api/me/credit") {
         return await handleMeCreditGet(request, env);
@@ -996,6 +1004,8 @@ export default {
             me_shield_release: "POST /api/me/shield/release",
             admin_shield: "POST /api/admin/shield",
             me_keys_unsuspend: "POST /api/me/keys/unsuspend",
+            me_keys_rotate: "POST /api/me/keys/rotate",
+            me_security_events: "GET /api/me/security-events",
             subwallet_open: "POST /api/subwallet/open",
             subwallet_spend: "POST /api/subwallet/spend",
             subwallet_close: "POST /api/subwallet/close",
