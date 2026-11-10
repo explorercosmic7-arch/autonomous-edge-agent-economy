@@ -1,4 +1,4 @@
-/**
+/** 
  * Immutable security event log + anomaly detection (burst / denial storm).
  *
  * Table: security_events (append-only from app code — INSERT only).
