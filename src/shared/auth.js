@@ -1,6 +1,7 @@
 /**
  * Shared auth — sessions, API keys, colo/IP binding, getAuthUser.
  * Key scopes attached via scopes.js (least privilege).
+ * TTL (expires_at) + permanent disable (disabled_at) enforced for API keys.
  */
 import { parseCookies, sha256Hex, COOKIE_NAME } from "./utils.js";
 import { getRequestEdge, hashIp } from "./edge.js";
@@ -8,9 +9,22 @@ import { logSafetyEvent } from "./safety.js";
 import { bad } from "./http.js";
 import { DASHBOARD_URL } from "./constants.js";
 import { parseScopes, attachKeyScopes } from "./scopes.js";
+import { recordSecurityEvent } from "./securityLog.js";
+
+function isExpiredAt(expiresAt) {
+  if (!expiresAt) return false;
+  try {
+    const s = String(expiresAt).trim();
+    // D1 stores "YYYY-MM-DD HH:MM:SS" — treat as UTC
+    const t = Date.parse(s.includes("T") ? s : s.replace(" ", "T") + "Z");
+    if (!Number.isFinite(t)) return false;
+    return t < Date.now();
+  } catch {
+    return false;
+  }
+}
 
 /* ─── Auth ─── */
-
 export async function getSessionUser(request, env) {
   const cookies = parseCookies(request.headers.get("Cookie"));
   const sid = cookies[COOKIE_NAME];
@@ -36,7 +50,6 @@ export async function getSessionUser(request, env) {
  * Security: if a valid session already exists, OAuth callbacks must not
  * silently switch identity. User must POST /api/auth/logout first, then
  * sign in with the other provider.
- * Returns Response redirect when blocked; null when OK to continue OAuth.
  */
 export async function rejectIfAlreadySignedIn(request, env) {
   const existing = await getSessionUser(request, env);
@@ -50,13 +63,11 @@ export async function rejectIfAlreadySignedIn(request, env) {
 /**
  * Enforce colo/IP binding on an API key row.
  * Returns null if OK, or { code, error, ... } if blocked.
- * May learn-bind on first use (mode=learn).
  */
 export async function enforceKeyBinding(env, keyRow, request) {
   if (!keyRow || !keyRow.key_id) return null;
   let mode = (keyRow.bind_mode || "").toLowerCase().trim();
   if (!mode || mode === "none" || mode === "off") {
-    // Still record last edge for visibility
     try {
       const edge = getRequestEdge(request);
       const ipHash = await hashIp(edge.ip);
@@ -73,7 +84,6 @@ export async function enforceKeyBinding(env, keyRow, request) {
   const ipHash = await hashIp(edge.ip);
   let boundColo = keyRow.bound_colo ? String(keyRow.bound_colo).toUpperCase() : null;
   let boundIp = keyRow.bound_ip_hash || null;
-  // Learn: pin on first successful sighting
   if (mode === "learn" && !boundColo && !boundIp) {
     try {
       await env.DB.prepare(
@@ -96,7 +106,6 @@ export async function enforceKeyBinding(env, keyRow, request) {
     }
     return null;
   }
-  // If edge metadata missing (local / non-CF), allow — do not lock out operators offline
   if (!edge.colo && !ipHash) {
     return null;
   }
@@ -112,7 +121,6 @@ export async function enforceKeyBinding(env, keyRow, request) {
       (coloOk || ipOk || (!boundColo && !boundIp));
   else if (mode === "either" || mode === "learn") allowed = coloOk || ipOk;
   else allowed = true;
-  // First-use pin for colo/ip/both when bounds empty
   if (
     !allowed &&
     (mode === "colo" || mode === "ip" || mode === "both") &&
@@ -142,7 +150,6 @@ export async function enforceKeyBinding(env, keyRow, request) {
     } catch (_) {}
     return null;
   }
-  // Violation
   try {
     await env.DB.prepare(
       `UPDATE api_keys
@@ -184,6 +191,7 @@ export async function getApiKeyUser(request, env) {
   try {
     row = await env.DB.prepare(
       `SELECT k.id AS key_id, k.user_id, k.revoked_at, k.suspended_at, k.suspend_reason,
+              k.expires_at, k.disabled_at, k.disabled_reason,
               k.bound_colo, k.bound_ip_hash, k.bind_mode, k.last_colo, k.bind_violations,
               k.scopes_json, k.max_amount_usd,
               u.id, u.email, u.name, u.picture, u.provider, u.default_repo
@@ -194,11 +202,11 @@ export async function getApiKeyUser(request, env) {
       .bind(hash)
       .first();
   } catch (_) {
-    // columns may be missing until ALTER — fall back progressively
     try {
       row = await env.DB.prepare(
         `SELECT k.id AS key_id, k.user_id, k.revoked_at, k.suspended_at, k.suspend_reason,
                 k.bound_colo, k.bound_ip_hash, k.bind_mode, k.last_colo, k.bind_violations,
+                k.scopes_json, k.max_amount_usd,
                 u.id, u.email, u.name, u.picture, u.provider, u.default_repo
          FROM api_keys k
          JOIN users u ON u.id = k.user_id
@@ -231,16 +239,42 @@ export async function getApiKeyUser(request, env) {
     }
   }
   if (!row || row.revoked_at) return null;
-
-  // Attach scopes early (even for suspended / edge-blocked paths)
   attachKeyScopes(row, row);
+
+  // Permanent disable (denial storm) — before suspend so message is clear
+  if (row.disabled_at) {
+    row._disabled = true;
+    row._disabled_reason = row.disabled_reason || "API key permanently disabled";
+    return row;
+  }
+
+  // TTL
+  if (row.expires_at && isExpiredAt(row.expires_at)) {
+    row._expired = true;
+    row._expire_reason = "API key expired (TTL)";
+    // fire-and-forget audit (once per request is fine)
+    try {
+      await recordSecurityEvent(
+        env,
+        {
+          kind: "key.expired",
+          severity: "warn",
+          user_id: row.id || row.user_id,
+          key_id: row.key_id,
+          reason: "ttl",
+        },
+        request
+      );
+    } catch (_) {}
+    return row;
+  }
 
   if (row.suspended_at) {
     row._suspended = true;
     row._suspend_reason = row.suspend_reason || "API key suspended";
     return row;
   }
-  // Colo / IP binding — stolen keys fail off-edge
+
   try {
     const edgeBlock = await enforceKeyBinding(env, row, request);
     if (edgeBlock) {
@@ -265,6 +299,22 @@ export async function getAuthUser(request, env) {
   if (session) return { ...session, auth_via: "session" };
   const keyUser = await getApiKeyUser(request, env);
   if (keyUser) {
+    if (keyUser._disabled) {
+      return {
+        ...keyUser,
+        auth_via: "api_key",
+        disabled: true,
+        suspended: true,
+      };
+    }
+    if (keyUser._expired) {
+      return {
+        ...keyUser,
+        auth_via: "api_key",
+        expired: true,
+        suspended: true,
+      };
+    }
     if (keyUser._suspended) {
       return { ...keyUser, auth_via: "api_key", suspended: true };
     }
@@ -283,13 +333,29 @@ export async function getAuthUser(request, env) {
   return null;
 }
 
-/** Return 403 Response if auth user is a suspended API key; else null. */
+/** Return 403 Response if auth user is a suspended/disabled/expired API key; else null. */
 export function rejectIfSuspendedKey(request, authUser) {
-  if (
-    authUser &&
-    authUser.auth_via === "api_key" &&
-    (authUser.suspended || authUser._suspended)
-  ) {
+  if (!authUser || authUser.auth_via !== "api_key") return null;
+
+  if (authUser.disabled || authUser._disabled) {
+    return bad(
+      request,
+      authUser._disabled_reason ||
+        authUser.disabled_reason ||
+        "API key permanently disabled",
+      403,
+      { code: "key_disabled" }
+    );
+  }
+  if (authUser.expired || authUser._expired) {
+    return bad(
+      request,
+      authUser._expire_reason || "API key expired (TTL)",
+      403,
+      { code: "key_expired" }
+    );
+  }
+  if (authUser.suspended || authUser._suspended) {
     return bad(
       request,
       authUser._suspend_reason ||
@@ -299,11 +365,7 @@ export function rejectIfSuspendedKey(request, authUser) {
       { code: "key_suspended" }
     );
   }
-  if (
-    authUser &&
-    authUser.auth_via === "api_key" &&
-    (authUser.edge_blocked || authUser._edge_blocked)
-  ) {
+  if (authUser.edge_blocked || authUser._edge_blocked) {
     const meta = authUser._edge_meta || {};
     return bad(
       request,
@@ -320,5 +382,4 @@ export function rejectIfSuspendedKey(request, authUser) {
   return null;
 }
 
-// Re-export parseScopes for handlers that import from auth
 export { parseScopes };
