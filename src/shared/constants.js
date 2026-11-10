@@ -220,3 +220,12 @@ export const RL_WILL_WINDOW_SEC = 60;
 export const RL_IP_POST_MAX = 120;
 export const RL_IP_POST_WINDOW_SEC = 60;
 export const INTEGRITY_SAMPLE_LIMIT = 500;
+
+/* ── Immutable audit log + anomaly (security_events) ── */
+export const ANOMALY_BURST_MAX = 100;
+export const ANOMALY_BURST_WINDOW_SEC = 1;
+export const ANOMALY_DENY_MAX = 30;
+export const ANOMALY_DENY_WINDOW_SEC = 60;
+export const SECURITY_EVENTS_LIST_MAX = 50;
+export const KEY_TTL_MIN_HOURS = 1;
+export const KEY_TTL_MAX_HOURS = 24 * 90;
