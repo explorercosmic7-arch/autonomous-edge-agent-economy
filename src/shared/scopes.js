@@ -1,4 +1,4 @@
-/**
+/** 
  * Scoped API keys — least-privilege verbs, amount ceilings, to_repo allowlists.
  * Scope denials are recorded to security_events (immutable audit) + denial-storm check.
  */
