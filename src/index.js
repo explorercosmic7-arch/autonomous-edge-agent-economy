@@ -1,4 +1,4 @@
-import {
+import { 
   securityHeaders,
   corsHeaders,
   json,
