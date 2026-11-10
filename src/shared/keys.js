@@ -1,6 +1,8 @@
 /**
- * API keys + edge binding — create/list/revoke/bind/unbind, me/key, edge info, unsuspend
+ * API keys + edge binding — create/list/revoke/bind/unbind, me/key, edge info,
+ * unsuspend, rotate, TTL (expires_at).
  * Scoped keys: verbs, max_amount_usd, to_repo_allow (see scopes.js)
+ * Security events: key.create | key.revoke | key.rotate | key.unsuspend
  */
 import { json, bad } from "./http.js";
 import { randomId, sha256Hex } from "./utils.js";
@@ -8,10 +10,13 @@ import { checkRateLimit } from "./rateLimit.js";
 import { getSessionUser, getAuthUser, rejectIfSuspendedKey } from "./auth.js";
 import { getRequestEdge, hashIp } from "./edge.js";
 import { logSafetyEvent } from "./safety.js";
+import { recordSecurityEvent } from "./securityLog.js";
 import {
   MAX_KEYS_PER_USER,
   RL_KEY_CREATE_MAX,
   RL_KEY_CREATE_WINDOW_SEC,
+  KEY_TTL_MIN_HOURS,
+  KEY_TTL_MAX_HOURS,
 } from "./constants.js";
 import {
   scopesFromCreateBody,
@@ -21,8 +26,23 @@ import {
   SCOPE_VERBS,
 } from "./scopes.js";
 
-/* ─── API keys ─── */
+function parseTtlHours(body) {
+  if (!body) return null;
+  const raw =
+    body.ttl_hours != null
+      ? body.ttl_hours
+      : body.ttl != null
+        ? body.ttl
+        : body.expires_in_hours;
+  if (raw == null || raw === "" || raw === false) return null;
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (n < KEY_TTL_MIN_HOURS) return KEY_TTL_MIN_HOURS;
+  if (n > KEY_TTL_MAX_HOURS) return KEY_TTL_MAX_HOURS;
+  return n;
+}
 
+/* ─── API keys ─── */
 export async function handleMeKeysCreate(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
@@ -52,12 +72,10 @@ export async function handleMeKeysCreate(request, env) {
   if ((countRow?.c || 0) >= MAX_KEYS_PER_USER) {
     return bad(request, "Max " + MAX_KEYS_PER_USER + " active keys per user", 429);
   }
-
   const scopes = scopesFromCreateBody(body);
   const scopesJson = scopesToJson(scopes);
   const maxAmountCol =
     scopes.max_amount_usd != null ? Number(scopes.max_amount_usd) : null;
-
   const id = randomId(12);
   const secret = "a2a_" + randomId(24);
   const keyHash = await sha256Hex(secret);
@@ -75,18 +93,26 @@ export async function handleMeKeysCreate(request, env) {
     boundIp = await hashIp(edge.ip);
   }
   const pinNow = !!(bindMode && bindMode !== "learn");
+  const ttlHours = parseTtlHours(body);
+  const expiresAt = ttlHours
+    ? new Date(Date.now() + ttlHours * 3600 * 1000)
+        .toISOString()
+        .replace("T", " ")
+        .slice(0, 19)
+    : null;
 
   let insertedWithScopes = false;
+  let insertedWithTtl = false;
   try {
     await env.DB.prepare(
       `INSERT INTO api_keys (
          id, user_id, key_hash, key_prefix, label,
          bind_mode, bound_colo, bound_ip_hash, bound_at,
-         scopes_json, max_amount_usd, scope_version
+         scopes_json, max_amount_usd, scope_version, expires_at
        ) VALUES (
          ?1, ?2, ?3, ?4, ?5,
          ?6, ?7, ?8, ?9,
-         ?10, ?11, 1
+         ?10, ?11, 1, ?12
        )`
     )
       .bind(
@@ -100,16 +126,24 @@ export async function handleMeKeysCreate(request, env) {
         pinNow ? boundIp : null,
         pinNow ? new Date().toISOString().replace("T", " ").slice(0, 19) : null,
         scopesJson,
-        maxAmountCol
+        maxAmountCol,
+        expiresAt
       )
       .run();
     insertedWithScopes = true;
+    insertedWithTtl = true;
   } catch (_) {
-    // Fallback without scope columns (migration not applied yet)
     try {
       await env.DB.prepare(
-        `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, bind_mode, bound_colo, bound_ip_hash, bound_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
+        `INSERT INTO api_keys (
+           id, user_id, key_hash, key_prefix, label,
+           bind_mode, bound_colo, bound_ip_hash, bound_at,
+           scopes_json, max_amount_usd, scope_version
+         ) VALUES (
+           ?1, ?2, ?3, ?4, ?5,
+           ?6, ?7, ?8, ?9,
+           ?10, ?11, 1
+         )`
       )
         .bind(
           id,
@@ -120,19 +154,59 @@ export async function handleMeKeysCreate(request, env) {
           bindMode || null,
           pinNow ? boundColo : null,
           pinNow ? boundIp : null,
-          pinNow ? new Date().toISOString().replace("T", " ").slice(0, 19) : null
+          pinNow ? new Date().toISOString().replace("T", " ").slice(0, 19) : null,
+          scopesJson,
+          maxAmountCol
         )
         .run();
+      insertedWithScopes = true;
     } catch (__) {
-      await env.DB.prepare(
-        `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label)
-         VALUES (?1, ?2, ?3, ?4, ?5)`
-      )
-        .bind(id, user.id, keyHash, keyPrefix, label)
-        .run();
-      bindMode = "";
+      try {
+        await env.DB.prepare(
+          `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, bind_mode, bound_colo, bound_ip_hash, bound_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
+        )
+          .bind(
+            id,
+            user.id,
+            keyHash,
+            keyPrefix,
+            label,
+            bindMode || null,
+            pinNow ? boundColo : null,
+            pinNow ? boundIp : null,
+            pinNow ? new Date().toISOString().replace("T", " ").slice(0, 19) : null
+          )
+          .run();
+      } catch (___) {
+        await env.DB.prepare(
+          `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label)
+           VALUES (?1, ?2, ?3, ?4, ?5)`
+        )
+          .bind(id, user.id, keyHash, keyPrefix, label)
+          .run();
+        bindMode = "";
+      }
     }
   }
+
+  await recordSecurityEvent(
+    env,
+    {
+      kind: "key.create",
+      severity: "info",
+      user_id: user.id,
+      key_id: id,
+      reason: "dashboard_create",
+      meta: {
+        label,
+        ttl_hours: ttlHours,
+        legacy: !!scopes.legacy,
+        verbs: scopes.verbs,
+      },
+    },
+    request
+  );
 
   const view = scopesPublicView(scopes);
   return json(request, {
@@ -143,6 +217,8 @@ export async function handleMeKeysCreate(request, env) {
     key: secret,
     bind_mode: bindMode || null,
     bound_colo: bindMode && bindMode !== "learn" ? boundColo : null,
+    expires_at: insertedWithTtl ? expiresAt : null,
+    ttl_hours: insertedWithTtl ? ttlHours : null,
     scopes: view,
     scopes_persisted: insertedWithScopes,
     available_verbs: SCOPE_VERBS,
@@ -150,12 +226,16 @@ export async function handleMeKeysCreate(request, env) {
     hint:
       "Copy now. The full key is never shown again." +
       (bindMode ? " Edge binding: " + bindMode + "." : "") +
+      (expiresAt ? " Expires: " + expiresAt + "." : "") +
       (view.legacy
         ? " Scope: full (legacy)."
         : " Scope: " + view.label + ".") +
       (insertedWithScopes
         ? ""
-        : " Run d1-key-scopes-migration.sql to persist scopes on new keys."),
+        : " Run d1-key-scopes-migration.sql to persist scopes on new keys.") +
+      (ttlHours && !insertedWithTtl
+        ? " Run d1-security-events.sql for TTL column."
+        : ""),
   });
 }
 
@@ -166,7 +246,7 @@ export async function handleMeKeysList(request, env) {
   try {
     const q = await env.DB.prepare(
       `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at,
-              suspended_at, suspend_reason,
+              suspended_at, suspend_reason, expires_at, disabled_at, disabled_reason,
               bound_colo, bind_mode, last_colo, bind_violations, bound_at,
               scopes_json, max_amount_usd, scope_version
        FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
@@ -179,7 +259,8 @@ export async function handleMeKeysList(request, env) {
       const q = await env.DB.prepare(
         `SELECT id, key_prefix, label, created_at, revoked_at, last_used_at,
                 suspended_at, suspend_reason,
-                bound_colo, bind_mode, last_colo, bind_violations, bound_at
+                bound_colo, bind_mode, last_colo, bind_violations, bound_at,
+                scopes_json, max_amount_usd, scope_version
          FROM api_keys WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50`
       )
         .bind(user.id)
@@ -225,6 +306,11 @@ export async function handleMeKeysList(request, env) {
         suspended: !!k.suspended_at,
         suspended_at: k.suspended_at || null,
         suspend_reason: k.suspend_reason || null,
+        expires_at: k.expires_at || null,
+        expired: !!(k.expires_at && new Date(String(k.expires_at).replace(" ", "T") + "Z").getTime() < Date.now()),
+        disabled: !!k.disabled_at,
+        disabled_at: k.disabled_at || null,
+        disabled_reason: k.disabled_reason || null,
         bind_mode: k.bind_mode || null,
         bound_colo: k.bound_colo || null,
         last_colo: k.last_colo || null,
@@ -383,7 +469,7 @@ export async function handleMeKeySelf(request, env) {
     row = await env.DB.prepare(
       `SELECT id, key_prefix, label, bind_mode, bound_colo, last_colo,
               bind_violations, bound_at, last_used_at, created_at,
-              scopes_json, max_amount_usd
+              scopes_json, max_amount_usd, expires_at, disabled_at
        FROM api_keys WHERE id = ?1`
     )
       .bind(authUser.key_id)
@@ -420,6 +506,8 @@ export async function handleMeKeySelf(request, env) {
           bind_violations: Number(row.bind_violations || 0),
           bound_at: row.bound_at || null,
           last_used_at: row.last_used_at || null,
+          expires_at: row.expires_at || null,
+          disabled: !!row.disabled_at,
           scopes: scopesPublicView(scopes),
         }
       : null,
@@ -463,7 +551,157 @@ export async function handleMeKeysRevoke(request, env) {
   )
     .bind(id, user.id)
     .run();
+  await recordSecurityEvent(
+    env,
+    {
+      kind: "key.revoke",
+      severity: "info",
+      user_id: user.id,
+      key_id: id,
+      reason: "dashboard_revoke",
+    },
+    request
+  );
   return json(request, { ok: true, id, revoked: true });
+}
+
+/**
+ * One-click rotate: revoke old key, create new with same scopes / bind / label / TTL.
+ * Returns new secret once.
+ */
+export async function handleMeKeysRotate(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return bad(request, "Sign in required", 401);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return bad(request, "Invalid JSON body");
+  }
+  const id = String(body.id || "").trim();
+  if (!id) return bad(request, "id required");
+
+  let old;
+  try {
+    old = await env.DB.prepare(
+      `SELECT * FROM api_keys WHERE id = ?1 AND user_id = ?2`
+    )
+      .bind(id, user.id)
+      .first();
+  } catch {
+    old = await env.DB.prepare(
+      `SELECT id, user_id, label, revoked_at, scopes_json, max_amount_usd,
+              bind_mode, bound_colo, bound_ip_hash, expires_at
+       FROM api_keys WHERE id = ?1 AND user_id = ?2`
+    )
+      .bind(id, user.id)
+      .first();
+  }
+  if (!old) return bad(request, "Key not found", 404);
+  if (old.revoked_at) return bad(request, "Key already revoked — create a new key", 400);
+
+  const limited = await checkRateLimit(
+    env,
+    "keycreate:" + user.id,
+    RL_KEY_CREATE_MAX,
+    RL_KEY_CREATE_WINDOW_SEC
+  );
+  if (limited) {
+    return bad(request, "Rate limit: max " + RL_KEY_CREATE_MAX + " keys per hour", 429, {
+      retry_after_sec: limited.retry_after_sec,
+    });
+  }
+
+  const newId = randomId(12);
+  const secret = "a2a_" + randomId(24);
+  const keyHash = await sha256Hex(secret);
+  const keyPrefix = secret.slice(0, 12);
+  const label = String(old.label || "agent").slice(0, 64);
+  const scopesJson = old.scopes_json != null ? old.scopes_json : null;
+  const maxAmountCol =
+    old.max_amount_usd != null ? Number(old.max_amount_usd) : null;
+  const bindMode = old.bind_mode || null;
+  // New key: clear learned bounds; keep mode if any
+  const expiresAt = old.expires_at || null;
+
+  await env.DB.prepare(
+    `UPDATE api_keys SET revoked_at = datetime('now') WHERE id = ?1 AND user_id = ?2`
+  )
+    .bind(id, user.id)
+    .run();
+
+  try {
+    await env.DB.prepare(
+      `INSERT INTO api_keys (
+         id, user_id, key_hash, key_prefix, label,
+         bind_mode, bound_colo, bound_ip_hash, bound_at,
+         scopes_json, max_amount_usd, scope_version, expires_at
+       ) VALUES (
+         ?1, ?2, ?3, ?4, ?5,
+         ?6, NULL, NULL, NULL,
+         ?7, ?8, 1, ?9
+       )`
+    )
+      .bind(
+        newId,
+        user.id,
+        keyHash,
+        keyPrefix,
+        label,
+        bindMode,
+        scopesJson,
+        maxAmountCol,
+        expiresAt
+      )
+      .run();
+  } catch (_) {
+    await env.DB.prepare(
+      `INSERT INTO api_keys (
+         id, user_id, key_hash, key_prefix, label,
+         scopes_json, max_amount_usd, scope_version
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)`
+    )
+      .bind(newId, user.id, keyHash, keyPrefix, label, scopesJson, maxAmountCol)
+      .run();
+  }
+
+  await recordSecurityEvent(
+    env,
+    {
+      kind: "key.rotate",
+      severity: "info",
+      user_id: user.id,
+      key_id: newId,
+      reason: "dashboard_rotate",
+      meta: { old_key_id: id },
+    },
+    request
+  );
+  await recordSecurityEvent(
+    env,
+    {
+      kind: "key.revoke",
+      severity: "info",
+      user_id: user.id,
+      key_id: id,
+      reason: "rotated",
+      meta: { new_key_id: newId },
+    },
+    request
+  );
+
+  const scopes = parseScopes(scopesJson);
+  return json(request, {
+    ok: true,
+    rotated_from: id,
+    id: newId,
+    label,
+    key_prefix: keyPrefix,
+    key: secret,
+    expires_at: expiresAt,
+    scopes: scopesPublicView(scopes),
+    hint: "Copy the new key now. Old key is revoked.",
+  });
 }
 
 export async function handleMeKeysUnsuspend(request, env) {
@@ -477,12 +715,29 @@ export async function handleMeKeysUnsuspend(request, env) {
   }
   const id = String(body.id || "").trim();
   if (!id) return bad(request, "id required");
-  const row = await env.DB.prepare(
-    `SELECT id, suspended_at FROM api_keys WHERE id = ?1 AND user_id = ?2`
-  )
-    .bind(id, user.id)
-    .first();
+  let row;
+  try {
+    row = await env.DB.prepare(
+      `SELECT id, suspended_at, disabled_at FROM api_keys WHERE id = ?1 AND user_id = ?2`
+    )
+      .bind(id, user.id)
+      .first();
+  } catch {
+    row = await env.DB.prepare(
+      `SELECT id, suspended_at FROM api_keys WHERE id = ?1 AND user_id = ?2`
+    )
+      .bind(id, user.id)
+      .first();
+  }
   if (!row) return bad(request, "Key not found", 404);
+  if (row.disabled_at) {
+    return bad(
+      request,
+      "Key permanently disabled (denial storm). Create or rotate a new key.",
+      400,
+      { code: "key_disabled" }
+    );
+  }
   if (!row.suspended_at) {
     return json(request, { ok: true, id, already_active: true });
   }
@@ -502,5 +757,16 @@ export async function handleMeKeysUnsuspend(request, env) {
     user_id: user.id,
     reason: "dashboard",
   });
+  await recordSecurityEvent(
+    env,
+    {
+      kind: "key.unsuspend",
+      severity: "info",
+      user_id: user.id,
+      key_id: id,
+      reason: "dashboard",
+    },
+    request
+  );
   return json(request, { ok: true, id, unsuspended: true });
 }
