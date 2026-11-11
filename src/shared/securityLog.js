@@ -1,4 +1,4 @@
-/** 
+/**
  * Immutable security event log + anomaly detection (burst / denial storm).
  *
  * Table: security_events (append-only from app code — INSERT only).
@@ -36,8 +36,51 @@ function safeMeta(meta) {
  * @param {object} row
  * @param {Request} [request] — optional, fills ip from CF-Connecting-IP
  */
+
+const CREATE_SECURITY_EVENTS = `
+CREATE TABLE IF NOT EXISTS security_events (
+  id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  kind TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info',
+  user_id TEXT,
+  key_id TEXT,
+  repo_id TEXT,
+  amount_usd REAL,
+  request_id TEXT,
+  ip TEXT,
+  verb TEXT,
+  reason TEXT,
+  meta_json TEXT
+);
+`;
+
+async function ensureSecurityEventsTable(env) {
+  if (!env || !env.DB) return false;
+  if (env.__securityEventsReady) return true;
+  try {
+    await env.DB.prepare(CREATE_SECURITY_EVENTS).run();
+    try {
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_sevt_user_created ON security_events(user_id, created_at DESC)`
+      ).run();
+    } catch (_) {}
+    try {
+      await env.DB.prepare(
+        `CREATE INDEX IF NOT EXISTS idx_sevt_kind_created ON security_events(kind, created_at DESC)`
+      ).run();
+    } catch (_) {}
+    env.__securityEventsReady = true;
+    return true;
+  } catch (e) {
+    console.log("security_events_ensure", e && e.message);
+    return false;
+  }
+}
+
 export async function recordSecurityEvent(env, row, request) {
   if (!env || !env.DB || !row || !row.kind) return null;
+  await ensureSecurityEventsTable(env);
   const id = row.id || "sevt_" + randomId(12);
   let ip = row.ip || null;
   if (!ip && request) {
@@ -76,9 +119,42 @@ export async function recordSecurityEvent(env, row, request) {
       .run();
     return id;
   } catch (e) {
-    // Table missing until migration — soft fail
     console.log("security_event_insert", e && e.message);
-    return null;
+    // retry once after force-create
+    try {
+      env.__securityEventsReady = false;
+      await ensureSecurityEventsTable(env);
+      await env.DB.prepare(
+        `INSERT INTO security_events (
+           id, created_at, kind, severity,
+           user_id, key_id, repo_id, amount_usd,
+           request_id, ip, verb, reason, meta_json
+         ) VALUES (
+           ?1, datetime('now'), ?2, ?3,
+           ?4, ?5, ?6, ?7,
+           ?8, ?9, ?10, ?11, ?12
+         )`
+      )
+        .bind(
+          id,
+          String(row.kind).slice(0, 64),
+          String(severity).slice(0, 16),
+          row.user_id || null,
+          row.key_id || null,
+          row.repo_id || null,
+          row.amount_usd != null ? Number(row.amount_usd) : null,
+          row.request_id ? String(row.request_id).slice(0, 128) : null,
+          ip,
+          row.verb ? String(row.verb).slice(0, 32) : null,
+          row.reason ? String(row.reason).slice(0, 256) : null,
+          safeMeta(row.meta)
+        )
+        .run();
+      return id;
+    } catch (e2) {
+      console.log("security_event_insert_retry", e2 && e2.message);
+      return null;
+    }
   }
 }
 
@@ -90,6 +166,7 @@ export async function listSecurityEventsForUser(env, userId, limit) {
     Math.max(Number(limit) || SECURITY_EVENTS_LIST_MAX, 1),
     100
   );
+  await ensureSecurityEventsTable(env);
   try {
     const { results } = await env.DB.prepare(
       `SELECT id, created_at, kind, severity, user_id, key_id, repo_id,
