@@ -19,5 +19,8 @@ export async function handleMeSecurityEvents(request, url, env) {
     ok: true,
     count: events.length,
     events,
+    hint: events.length === 0
+      ? "No events yet. Rotate a key or make a payment — events appear here. If still empty after that, redeploy worker with securityLog.js auto-create."
+      : null,
   });
 }
