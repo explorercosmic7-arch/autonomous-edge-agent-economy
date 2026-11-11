@@ -1,4 +1,4 @@
-/** 
+/**
  * API keys + edge binding — create/list/revoke/bind/unbind, me/key, edge info,
  * unsuspend, rotate, TTL (expires_at).
  * Scoped keys: verbs, max_amount_usd, to_repo_allow (see scopes.js)
@@ -190,7 +190,7 @@ export async function handleMeKeysCreate(request, env) {
     }
   }
 
-  await recordSecurityEvent(
+  const seId = await recordSecurityEvent(
     env,
     {
       kind: "key.create",
@@ -215,6 +215,7 @@ export async function handleMeKeysCreate(request, env) {
     label,
     key_prefix: keyPrefix,
     key: secret,
+    security_event_id: seId,
     bind_mode: bindMode || null,
     bound_colo: bindMode && bindMode !== "learn" ? boundColo : null,
     expires_at: insertedWithTtl ? expiresAt : null,
