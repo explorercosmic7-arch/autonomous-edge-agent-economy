@@ -38,30 +38,37 @@ function safeMeta(meta) {
  */
 
 let _securityEventsReady = false;
+let _lastSecurityError = null;
 
-const CREATE_SECURITY_EVENTS = `
-CREATE TABLE IF NOT EXISTS security_events (
-  id TEXT PRIMARY KEY,
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  kind TEXT NOT NULL,
-  severity TEXT NOT NULL DEFAULT 'info',
-  user_id TEXT,
-  key_id TEXT,
-  repo_id TEXT,
-  amount_usd REAL,
-  request_id TEXT,
-  ip TEXT,
-  verb TEXT,
-  reason TEXT,
-  meta_json TEXT
-);
-`;
+export function getLastSecurityError() {
+  return _lastSecurityError;
+}
+
+const CREATE_SQL =
+  "CREATE TABLE IF NOT EXISTS security_events (" +
+  "id TEXT PRIMARY KEY, " +
+  "created_at TEXT NOT NULL, " +
+  "kind TEXT NOT NULL, " +
+  "severity TEXT NOT NULL DEFAULT 'info', " +
+  "user_id TEXT, " +
+  "key_id TEXT, " +
+  "repo_id TEXT, " +
+  "amount_usd REAL, " +
+  "request_id TEXT, " +
+  "ip TEXT, " +
+  "verb TEXT, " +
+  "reason TEXT, " +
+  "meta_json TEXT" +
+  ")";
 
 export async function ensureSecurityEventsTable(env) {
-  if (!env || !env.DB) return false;
+  if (!env || !env.DB) {
+    _lastSecurityError = "no_db_binding";
+    return false;
+  }
   if (_securityEventsReady) return true;
   try {
-    await env.DB.prepare(CREATE_SECURITY_EVENTS).run();
+    await env.DB.prepare(CREATE_SQL).run();
     try {
       await env.DB.prepare(
         "CREATE INDEX IF NOT EXISTS idx_sevt_user_created ON security_events(user_id, created_at)"
@@ -72,16 +79,23 @@ export async function ensureSecurityEventsTable(env) {
         "CREATE INDEX IF NOT EXISTS idx_sevt_kind_created ON security_events(kind, created_at)"
       ).run();
     } catch (_) {}
+    // Prove table is readable
+    await env.DB.prepare("SELECT 1 AS ok FROM security_events LIMIT 1").all();
     _securityEventsReady = true;
+    _lastSecurityError = null;
     return true;
   } catch (e) {
-    console.log("security_events_ensure", e && e.message);
+    _lastSecurityError = "ensure: " + String(e && e.message ? e.message : e);
+    console.log("security_events_ensure", _lastSecurityError);
     return false;
   }
 }
 
 export async function recordSecurityEvent(env, row, request) {
-  if (!env || !env.DB || !row || !row.kind) return null;
+  if (!env || !env.DB || !row || !row.kind) {
+    _lastSecurityError = "record_skip_bad_args";
+    return null;
+  }
   await ensureSecurityEventsTable(env);
   const id = row.id || "sevt_" + randomId(12);
   let ip = row.ip || null;
@@ -92,69 +106,44 @@ export async function recordSecurityEvent(env, row, request) {
     } catch (_) {}
   }
   const severity = row.severity || "info";
+  const binds = [
+    id,
+    String(row.kind).slice(0, 64),
+    String(severity).slice(0, 16),
+    row.user_id || null,
+    row.key_id || null,
+    row.repo_id || null,
+    row.amount_usd != null ? Number(row.amount_usd) : null,
+    row.request_id ? String(row.request_id).slice(0, 128) : null,
+    ip,
+    row.verb ? String(row.verb).slice(0, 32) : null,
+    row.reason ? String(row.reason).slice(0, 256) : null,
+    safeMeta(row.meta),
+  ];
+  const INSERT_SQL =
+    "INSERT INTO security_events (" +
+    "id, created_at, kind, severity, " +
+    "user_id, key_id, repo_id, amount_usd, " +
+    "request_id, ip, verb, reason, meta_json" +
+    ") VALUES (?1, datetime('now'), ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+
   try {
-    await env.DB.prepare(
-      `INSERT INTO security_events (
-         id, created_at, kind, severity,
-         user_id, key_id, repo_id, amount_usd,
-         request_id, ip, verb, reason, meta_json
-       ) VALUES (
-         ?1, datetime('now'), ?2, ?3,
-         ?4, ?5, ?6, ?7,
-         ?8, ?9, ?10, ?11, ?12
-       )`
-    )
-      .bind(
-        id,
-        String(row.kind).slice(0, 64),
-        String(severity).slice(0, 16),
-        row.user_id || null,
-        row.key_id || null,
-        row.repo_id || null,
-        row.amount_usd != null ? Number(row.amount_usd) : null,
-        row.request_id ? String(row.request_id).slice(0, 128) : null,
-        ip,
-        row.verb ? String(row.verb).slice(0, 32) : null,
-        row.reason ? String(row.reason).slice(0, 256) : null,
-        safeMeta(row.meta)
-      )
-      .run();
+    await env.DB.prepare(INSERT_SQL).bind(...binds).run();
+    _lastSecurityError = null;
     return id;
   } catch (e) {
-    console.log("security_event_insert", e && e.message);
-    // retry once after force-create
+    _lastSecurityError = "insert: " + String(e && e.message ? e.message : e);
+    console.log("security_event_insert", _lastSecurityError);
+    // force re-ensure + one retry
     try {
       _securityEventsReady = false;
       await ensureSecurityEventsTable(env);
-      await env.DB.prepare(
-        `INSERT INTO security_events (
-           id, created_at, kind, severity,
-           user_id, key_id, repo_id, amount_usd,
-           request_id, ip, verb, reason, meta_json
-         ) VALUES (
-           ?1, datetime('now'), ?2, ?3,
-           ?4, ?5, ?6, ?7,
-           ?8, ?9, ?10, ?11, ?12
-         )`
-      )
-        .bind(
-          id,
-          String(row.kind).slice(0, 64),
-          String(severity).slice(0, 16),
-          row.user_id || null,
-          row.key_id || null,
-          row.repo_id || null,
-          row.amount_usd != null ? Number(row.amount_usd) : null,
-          row.request_id ? String(row.request_id).slice(0, 128) : null,
-          ip,
-          row.verb ? String(row.verb).slice(0, 32) : null,
-          row.reason ? String(row.reason).slice(0, 256) : null,
-          safeMeta(row.meta)
-        )
-        .run();
+      await env.DB.prepare(INSERT_SQL).bind(...binds).run();
+      _lastSecurityError = null;
       return id;
     } catch (e2) {
-      console.log("security_event_insert_retry", e2 && e2.message);
+      _lastSecurityError = "insert_retry: " + String(e2 && e2.message ? e2.message : e2);
+      console.log("security_event_insert_retry", _lastSecurityError);
       return null;
     }
   }
@@ -165,18 +154,16 @@ export async function recordSecurityEvent(env, row, request) {
  */
 export async function listSecurityEventsForUser(env, userId, limit) {
   const lim = Math.min(
-    Math.max(Number(limit) || SECURITY_EVENTS_LIST_MAX, 1),
+    Math.max(Number(limit) || SECURITY_EVENTS_LIST_MAX || 50, 1),
     100
   );
   await ensureSecurityEventsTable(env);
   try {
     const { results } = await env.DB.prepare(
-      `SELECT id, created_at, kind, severity, user_id, key_id, repo_id,
-              amount_usd, request_id, ip, verb, reason, meta_json
-       FROM security_events
-       WHERE user_id = ?1
-       ORDER BY created_at DESC
-       LIMIT ?2`
+      "SELECT id, created_at, kind, severity, user_id, key_id, repo_id, " +
+        "amount_usd, request_id, ip, verb, reason, meta_json " +
+        "FROM security_events WHERE user_id = ?1 " +
+        "ORDER BY created_at DESC LIMIT ?2"
     )
       .bind(userId, lim)
       .all();
@@ -202,41 +189,27 @@ export async function listSecurityEventsForUser(env, userId, limit) {
       })(),
     }));
   } catch (e) {
-    console.log("security_event_list", e && e.message);
+    _lastSecurityError = "list: " + String(e && e.message ? e.message : e);
+    console.log("security_event_list", _lastSecurityError);
     return [];
   }
 }
 
-async function countRecentByKinds(env, keyId, kinds, windowSec) {
-  if (!keyId || !kinds || !kinds.length) return 0;
-  const placeholders = kinds.map(() => "?").join(",");
-  // bind: keyId, ...kinds, windowSec — SQLite datetime('-N seconds')
-  const sql = `SELECT COUNT(*) AS c FROM security_events
-    WHERE key_id = ?1
-      AND kind IN (${placeholders})
-      AND created_at >= datetime('now', ?${kinds.length + 2})`;
-  const binds = [keyId, ...kinds, `-${Math.max(1, windowSec)} seconds`];
+/** Debug: total rows in table (any user). */
+export async function countSecurityEventsAll(env) {
   try {
-    // Rebuild with positional binds for D1
-    const q = await env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM security_events
-       WHERE key_id = ?
-         AND kind IN (${placeholders})
-         AND created_at >= datetime('now', ?)`
-    )
-      .bind(keyId, ...kinds, `-${Math.max(1, Number(windowSec) || 1)} seconds`)
-      .first();
-    return Number(q && q.c != null ? q.c : 0);
+    await ensureSecurityEventsTable(env);
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS c FROM security_events"
+    ).first();
+    return Number(row && row.c) || 0;
   } catch (e) {
-    console.log("security_count", e && e.message);
-    return 0;
+    _lastSecurityError = "count: " + String(e && e.message ? e.message : e);
+    console.log("security_event_count_all", _lastSecurityError);
+    return -1;
   }
 }
 
-/**
- * Burst: too many pay events in a short window → temporary suspend.
- * Returns { suspended: true, reason } if action taken.
- */
 export async function checkPaymentBurst(env, { keyId, userId, request }) {
   if (!keyId) return null;
   const n = await countRecentByKinds(
@@ -387,13 +360,3 @@ export async function afterScopeDeny(env, request, {
 
 
 /** Debug: total rows in table (any user). */
-export async function countSecurityEventsAll(env) {
-  try {
-    await ensureSecurityEventsTable(env);
-    const row = await env.DB.prepare(`SELECT COUNT(*) AS c FROM security_events`).first();
-    return Number(row && row.c) || 0;
-  } catch (e) {
-    console.log("security_event_count_all", e && e.message);
-    return -1;
-  }
-}
