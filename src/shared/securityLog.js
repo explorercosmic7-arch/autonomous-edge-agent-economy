@@ -37,6 +37,8 @@ function safeMeta(meta) {
  * @param {Request} [request] — optional, fills ip from CF-Connecting-IP
  */
 
+let _securityEventsReady = false;
+
 const CREATE_SECURITY_EVENTS = `
 CREATE TABLE IF NOT EXISTS security_events (
   id TEXT PRIMARY KEY,
@@ -55,22 +57,22 @@ CREATE TABLE IF NOT EXISTS security_events (
 );
 `;
 
-async function ensureSecurityEventsTable(env) {
+export export async function ensureSecurityEventsTable(env) {
   if (!env || !env.DB) return false;
-  if (env.__securityEventsReady) return true;
+  if (_securityEventsReady) return true;
   try {
     await env.DB.prepare(CREATE_SECURITY_EVENTS).run();
     try {
       await env.DB.prepare(
-        `CREATE INDEX IF NOT EXISTS idx_sevt_user_created ON security_events(user_id, created_at DESC)`
+        "CREATE INDEX IF NOT EXISTS idx_sevt_user_created ON security_events(user_id, created_at)"
       ).run();
     } catch (_) {}
     try {
       await env.DB.prepare(
-        `CREATE INDEX IF NOT EXISTS idx_sevt_kind_created ON security_events(kind, created_at DESC)`
+        "CREATE INDEX IF NOT EXISTS idx_sevt_kind_created ON security_events(kind, created_at)"
       ).run();
     } catch (_) {}
-    env.__securityEventsReady = true;
+    _securityEventsReady = true;
     return true;
   } catch (e) {
     console.log("security_events_ensure", e && e.message);
@@ -122,7 +124,7 @@ export async function recordSecurityEvent(env, row, request) {
     console.log("security_event_insert", e && e.message);
     // retry once after force-create
     try {
-      env.__securityEventsReady = false;
+      _securityEventsReady = false;
       await ensureSecurityEventsTable(env);
       await env.DB.prepare(
         `INSERT INTO security_events (
@@ -381,4 +383,17 @@ export async function afterScopeDeny(env, request, {
     return await checkDenialStorm(env, { keyId, userId, request });
   }
   return null;
+}
+
+
+/** Debug: total rows in table (any user). */
+export async function countSecurityEventsAll(env) {
+  try {
+    await ensureSecurityEventsTable(env);
+    const row = await env.DB.prepare(`SELECT COUNT(*) AS c FROM security_events`).first();
+    return Number(row && row.c) || 0;
+  } catch (e) {
+    console.log("security_event_count_all", e && e.message);
+    return -1;
+  }
 }
