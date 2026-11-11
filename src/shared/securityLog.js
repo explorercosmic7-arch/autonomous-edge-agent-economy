@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS security_events (
 );
 `;
 
-export export async function ensureSecurityEventsTable(env) {
+export async function ensureSecurityEventsTable(env) {
   if (!env || !env.DB) return false;
   if (_securityEventsReady) return true;
   try {
