@@ -2,7 +2,7 @@
  * Core ledger — pay, fund, balance, ledger + helpers
  * Path on GitHub: src/shared/ledger.js
  *
- * (receipt issue + trace helpers included for pay path)
+ * Day 03: optional instance_id on pay — paused/retired agents cannot spend
  *
  * REQUIRES: src/shared/credit.js exports debitWithCredit
  * Scoped API keys: applyScopeVerb(authUser, "pay", toRepo) before safetyGate
@@ -43,6 +43,7 @@ import {
 } from "./delegate.js";
 import { validateApprovedAllowance, markApprovalConsumed } from "./approval.js";
 import { applyScopeVerb } from "./scopes.js";
+import { maybeAssertInstanceFromBody } from "./agentInstance.js";
 import {
   RL_PAY_MAX,
   RL_PAY_WINDOW_SEC,
@@ -134,6 +135,22 @@ export async function handlePay(request, env, ctx) {
     body.trace_id || body.traceId || request.headers.get("X-Trace-Id")
   );
 
+  // Day 03 · Agent Lifecycle — optional instance_id blocks paused/retired spend
+  let activeInstance = null;
+  {
+    const instGate = await maybeAssertInstanceFromBody(env, body);
+    if (!instGate.ok) {
+      return bad(request, instGate.error, instGate.status || 403, {
+        code: instGate.code,
+        instance: instGate.instance || null,
+      });
+    }
+    activeInstance = instGate.instance || null;
+    if (activeInstance && !fromRepo) {
+      fromRepo = parseRepo(activeInstance.repo_id);
+    }
+  }
+
   // Delegation chain: child key + X-Delegate-Id spends parent-locked budget
   const delegateIdHdr = String(
     request.headers.get("X-Delegate-Id") || body.delegate_id || body.delegation_id || ""
@@ -152,7 +169,6 @@ export async function handlePay(request, env, ctx) {
     const taskEarly = String(body.task || "").slice(0, 500);
     if (!toRepoEarly) return bad(request, "to_repo must be owner/repo");
     if (amountEarly == null) return bad(request, "amount must be between 0.000001 and 1000000");
-    // Child key still needs pay scope for delegated spend
     applyScopeVerb(authUser, "pay", toRepoEarly);
     const claim = await claimDelegationSpend(env, {
       id: delegateIdHdr,
@@ -195,10 +211,8 @@ export async function handlePay(request, env, ctx) {
   if (amount == null) return bad(request, "amount must be between 0.000001 and 1000000");
 
   if (authUser) {
-    // Scoped API key — pay verb + max amount + to_repo allowlist
     applyScopeVerb(authUser, "pay", toRepo);
 
-    // One-shot allow after human approve (retry pay with X-Approval-Id)
     const approvalHdr = String(
       request.headers.get("X-Approval-Id") || body.approval_id || ""
     ).trim();
@@ -221,6 +235,7 @@ export async function handlePay(request, env, ctx) {
       to_repo: toRepo,
       task,
       idempotency_key: idem,
+      instance_id: activeInstance ? activeInstance.id : null,
     };
     const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
     if (blocked) return blocked;
@@ -491,6 +506,7 @@ export async function handlePay(request, env, ctx) {
     amount,
     task: payTaskLabel,
     trace_id: traceId || undefined,
+    instance_id: activeInstance ? activeInstance.id : undefined,
     credit_drawn: creditDrawn || undefined,
     latency_ms: Date.now() - t0,
     balances: {
@@ -568,7 +584,6 @@ export async function handleFund(request, env) {
   } catch {
     return bad(request, "Invalid JSON body");
   }
-  // Faucet is owner/session plane — API keys cannot fund (least privilege)
   const authUser = await getAuthUser(request, env);
   if (authUser && authUser.auth_via === "api_key") {
     return bad(request, "Faucet requires signed-in session (not API key)", 403, {
