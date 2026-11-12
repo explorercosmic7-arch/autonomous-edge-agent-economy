@@ -229,3 +229,16 @@ export const ANOMALY_DENY_WINDOW_SEC = 60;
 export const SECURITY_EVENTS_LIST_MAX = 50;
 export const KEY_TTL_MIN_HOURS = 1;
 export const KEY_TTL_MAX_HOURS = 24 * 90;
+
+/* ─── Day 03 · Agent instance lifecycle ─── */
+export const AGENT_INSTANCE_STATUSES = [
+  "created",
+  "funded",
+  "active",
+  "paused",
+  "retired",
+];
+export const AGENT_INSTANCE_OPERABLE = ["active"];
+export const MAX_AGENT_INSTANCES_PER_USER = 50;
+export const RL_INSTANCE_CREATE_MAX = 20;
+export const RL_INSTANCE_CREATE_WINDOW_SEC = 3600;
