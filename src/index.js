@@ -1,4 +1,4 @@
-import { 
+import {
   securityHeaders,
   corsHeaders,
   json,
@@ -239,6 +239,17 @@ import {
   handleWillExecute,
   handleWillExecutionsList,
 } from "./shared/will.js";
+import {
+  handleInstanceCreate,
+  handleInstanceList,
+  handleInstanceGet,
+  handleInstanceFund,
+  handleInstanceActivate,
+  handleInstancePause,
+  handleInstanceResume,
+  handleInstanceRetire,
+  handleInstanceFreeze,
+} from "./shared/agentInstance.js";
 
 import {
   handleEscrowHold,
@@ -1127,6 +1138,31 @@ export default {
         }
       }
       /* Agent Will — POST preferred (CORS allowlist is GET/POST only on some deploys) */
+      
+      // Day 03 · Agent instances
+      if (request.method === "POST" && url.pathname === "/api/instances") {
+        return await handleInstanceCreate(request, env);
+      }
+      if (request.method === "GET" && url.pathname === "/api/instances") {
+        return await handleInstanceList(request, url, env);
+      }
+      if (request.method === "POST" && url.pathname === "/api/instances/freeze") {
+        return await handleInstanceFreeze(request, env);
+      }
+      {
+        const __im = url.pathname.match(/^\/api\/instances\/([^/]+)(?:\/(fund|activate|pause|resume|retire))?$/);
+        if (__im) {
+          const iid = decodeURIComponent(__im[1]);
+          const action = __im[2] || null;
+          if (!action && request.method === "GET") return await handleInstanceGet(request, env, iid);
+          if (action === "fund" && request.method === "POST") return await handleInstanceFund(request, env, iid);
+          if (action === "activate" && request.method === "POST") return await handleInstanceActivate(request, env, iid);
+          if (action === "pause" && request.method === "POST") return await handleInstancePause(request, env, iid);
+          if (action === "resume" && request.method === "POST") return await handleInstanceResume(request, env, iid);
+          if (action === "retire" && request.method === "POST") return await handleInstanceRetire(request, env, iid);
+        }
+      }
+
       if ((request.method === "PUT" || request.method === "POST") && url.pathname === "/api/will") {
         return await handleWillUpsert(request, env, ctx);
       }
