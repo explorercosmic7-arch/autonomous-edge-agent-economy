@@ -40,7 +40,7 @@ export async function getSessionUser(request, env) {
     .first();
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
+    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?1`).bind(sid).run();
     return null;
   }
   return row;
@@ -252,7 +252,6 @@ export async function getApiKeyUser(request, env) {
   if (row.expires_at && isExpiredAt(row.expires_at)) {
     row._expired = true;
     row._expire_reason = "API key expired (TTL)";
-    // fire-and-forget audit (once per request is fine)
     try {
       await recordSecurityEvent(
         env,
@@ -287,7 +286,9 @@ export async function getApiKeyUser(request, env) {
   } catch (e) {
     console.log("enforce_key_binding", e && e.message);
   }
-  env.DB.prepare(`UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?`)
+  env.DB.prepare(
+    `UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?1`
+  )
     .bind(row.key_id)
     .run()
     .catch(() => {});
@@ -382,4 +383,4 @@ export function rejectIfSuspendedKey(request, authUser) {
   return null;
 }
 
-export { parseScopes }; 
+export { parseScopes };
