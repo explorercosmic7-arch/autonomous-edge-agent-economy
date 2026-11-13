@@ -1,6 +1,6 @@
 /**
  * Dashboard: GET /api/me/security-events
- * Optional: ?probe=1 inserts a system.probe event for this user (debug).
+ * Day 04: ?instance_id= filter, ?probe=1 debug insert
  */
 import { json, bad } from "./http.js";
 import { getSessionUser } from "./auth.js";
@@ -19,12 +19,12 @@ export async function handleMeSecurityEvents(request, url, env) {
 
   const limit = Math.min(
     Math.max(Number(url.searchParams.get("limit") || SECURITY_EVENTS_LIST_MAX || 50), 1),
-    100
+    200
   );
+  const instanceId = (url.searchParams.get("instance_id") || "").trim() || null;
 
   const tableOk = await ensureSecurityEventsTable(env);
 
-  // Optional probe so you can force one row without creating a key
   if (url.searchParams.get("probe") === "1") {
     await recordSecurityEvent(
       env,
@@ -33,13 +33,16 @@ export async function handleMeSecurityEvents(request, url, env) {
         severity: "info",
         user_id: user.id,
         reason: "dashboard_probe",
-        meta: { source: "security-events?probe=1" },
+        instance_id: instanceId || null,
+        meta: { source: "security-events?probe=1", instance_id: instanceId },
       },
       request
     );
   }
 
-  const events = await listSecurityEventsForUser(env, user.id, limit);
+  const events = await listSecurityEventsForUser(env, user.id, limit, {
+    instance_id: instanceId,
+  });
   let totalAll = -1;
   try {
     totalAll = await countSecurityEventsAll(env);
@@ -56,6 +59,7 @@ export async function handleMeSecurityEvents(request, url, env) {
       table_ok: tableOk,
       table_total: totalAll,
       limit,
+      instance_id: instanceId,
       last_error: lastErr,
     },
     hint:
@@ -63,8 +67,8 @@ export async function handleMeSecurityEvents(request, url, env) {
         ? lastErr
           ? "Security DB error: " + lastErr
           : totalAll > 0
-            ? "Events exist but none for this account. Sign out and sign in again."
-            : "Table empty. Open this URL with ?probe=1 once, or create/rotate a key, then Refresh."
+            ? "Events exist but none for this account (or instance filter). Try without instance_id."
+            : "Table empty. Open with ?probe=1 once, or create/rotate a key, then Refresh."
         : null,
   });
 }
