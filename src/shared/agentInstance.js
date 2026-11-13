@@ -1,13 +1,29 @@
 /**
- * Day 03/04 · Agent instances — lifecycle + hard spend gates.
- * Status: created → funded → active → paused → retired
- * Only "active" may spend (pay / hire accept / work lock).
+ * Day 03/04 · Agent Lifecycle
+ *
+ * Agents are first-class instances (not bare repo strings).
+ * State: created → funded → active → paused → retired
+ *
+ * Routes (wire in index.js):
+ *   POST /api/instances              create
+ *   GET  /api/instances              list mine
+ *   GET  /api/instances/:id          get one
+ *   POST /api/instances/:id/fund     created|funded → funded (optionally auto-active)
+ *   POST /api/instances/:id/activate funded → active
+ *   POST /api/instances/:id/pause    active → paused
+ *   POST /api/instances/:id/resume   paused → active
+ *   POST /api/instances/:id/retire   * → retired (terminal)
+ *   POST /api/instances/freeze       emergency: pause one or all under account
+ *
+ * Gate helpers (pay / hire / work):
+ *   assertInstanceOperable(env, instanceId)
+ *   maybeAssertInstanceFromBody(env, body, request?)
  */
 import { json, bad } from "./http.js";
 import { parseRepo, parseAmount, randomId } from "./utils.js";
-import { checkRateLimit } from "./rateLimit.js";
 import { getSessionUser, getAuthUser } from "./auth.js";
 import { ensureAccount } from "./accounts.js";
+import { checkRateLimit } from "./rateLimit.js";
 import { recordSecurityEvent } from "./securityLog.js";
 import {
   AGENT_INSTANCE_STATUSES,
@@ -15,93 +31,114 @@ import {
   MAX_AGENT_INSTANCES_PER_USER,
   RL_INSTANCE_CREATE_MAX,
   RL_INSTANCE_CREATE_WINDOW_SEC,
-  FAUCET_MAX_PER_CALL,
-  FAUCET_ACCOUNT_CAP,
-  SYSTEM_FAUCET,
 } from "./constants.js";
 
-const CREATE_TABLE = `
-CREATE TABLE IF NOT EXISTS agent_instances (
-  id TEXT PRIMARY KEY,
-  user_id TEXT NOT NULL,
-  repo_id TEXT NOT NULL,
-  label TEXT,
-  status TEXT NOT NULL DEFAULT 'created',
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-  funded_at TEXT,
-  activated_at TEXT,
-  paused_at TEXT,
-  retired_at TEXT,
-  pause_reason TEXT,
-  meta_json TEXT
-)`;
+const CREATE_SQL =
+  "CREATE TABLE IF NOT EXISTS agent_instances (" +
+  "id TEXT PRIMARY KEY, " +
+  "owner_user_id TEXT NOT NULL, " +
+  "repo_id TEXT NOT NULL, " +
+  "label TEXT, " +
+  "status TEXT NOT NULL DEFAULT 'created', " +
+  "funded_usd REAL NOT NULL DEFAULT 0, " +
+  "meta_json TEXT, " +
+  "created_at TEXT NOT NULL DEFAULT (datetime('now')), " +
+  "updated_at TEXT NOT NULL DEFAULT (datetime('now')), " +
+  "funded_at TEXT, " +
+  "activated_at TEXT, " +
+  "paused_at TEXT, " +
+  "retired_at TEXT" +
+  ")";
 
 let _tableReady = false;
 
-export async function ensureAgentInstanceTable(env) {
-  if (_tableReady) return true;
+export async function ensureAgentInstancesTable(env) {
   if (!env || !env.DB) return false;
+  if (_tableReady) return true;
   try {
-    await env.DB.prepare(CREATE_TABLE).run();
+    await env.DB.prepare(CREATE_SQL).run();
     try {
       await env.DB.prepare(
-        `CREATE INDEX IF NOT EXISTS idx_ainst_user ON agent_instances(user_id, created_at)`
+        "CREATE INDEX IF NOT EXISTS idx_agent_inst_owner ON agent_instances(owner_user_id, created_at)"
       ).run();
     } catch (_) {}
     try {
       await env.DB.prepare(
-        `CREATE INDEX IF NOT EXISTS idx_ainst_repo ON agent_instances(repo_id)`
+        "CREATE INDEX IF NOT EXISTS idx_agent_inst_owner_status ON agent_instances(owner_user_id, status)"
       ).run();
     } catch (_) {}
     _tableReady = true;
     return true;
   } catch (e) {
-    console.log("agent_instance_ensure", e && e.message);
+    console.log("agent_instances_ensure", e && e.message);
     return false;
   }
 }
 
-function operableStatuses() {
-  return AGENT_INSTANCE_OPERABLE && AGENT_INSTANCE_OPERABLE.length
-    ? AGENT_INSTANCE_OPERABLE
-    : ["active"];
+/** Alias used by some call sites */
+export async function ensureAgentInstanceTable(env) {
+  return ensureAgentInstancesTable(env);
 }
 
-export function isInstanceOperable(status) {
-  return operableStatuses().includes(String(status || "").toLowerCase());
-}
-
-export async function loadInstance(env, id) {
-  if (!id) return null;
-  await ensureAgentInstanceTable(env);
+function rowPublic(r) {
+  if (!r) return null;
+  let meta = null;
   try {
-    return await env.DB.prepare(`SELECT * FROM agent_instances WHERE id = ?1`)
-      .bind(id)
+    meta = r.meta_json ? JSON.parse(r.meta_json) : null;
+  } catch {
+    meta = null;
+  }
+  return {
+    id: r.id,
+    owner_user_id: r.owner_user_id,
+    repo_id: r.repo_id,
+    label: r.label || null,
+    status: r.status,
+    funded_usd: r.funded_usd != null ? Number(r.funded_usd) : 0,
+    meta,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+    funded_at: r.funded_at || null,
+    activated_at: r.activated_at || null,
+    paused_at: r.paused_at || null,
+    retired_at: r.retired_at || null,
+  };
+}
+
+export async function getInstanceById(env, id) {
+  await ensureAgentInstancesTable(env);
+  if (!id) return null;
+  try {
+    const row = await env.DB.prepare(
+      `SELECT * FROM agent_instances WHERE id = ?1`
+    )
+      .bind(String(id).slice(0, 64))
       .first();
+    return row || null;
   } catch {
     return null;
   }
 }
 
+export async function loadInstance(env, id) {
+  return getInstanceById(env, id);
+}
+
 /**
- * Hard gate: instance must exist and be active (or in OPERABLE list).
- * Returns { ok:true, instance } or { ok:false, error, code, status, instance? }
+ * Gate for pay / hire / work.
+ * @returns {{ ok: true, instance } | { ok: false, error, code, status, instance? }}
  */
-export async function assertInstanceActive(env, instanceId, { requireId } = {}) {
-  const id = String(instanceId || "").trim();
-  if (!id) {
-    if (requireId) {
-      return {
-        ok: false,
-        error: "instance_id required",
-        code: "instance_required",
-        status: 400,
-      };
-    }
-    return { ok: true, instance: null };
+export async function assertInstanceOperable(env, instanceId, opts = {}) {
+  const allow = opts.allowStatuses || AGENT_INSTANCE_OPERABLE || ["active"];
+  if (!instanceId) {
+    return {
+      ok: false,
+      error: "instance_id required",
+      code: "instance_required",
+      status: 400,
+    };
   }
-  const row = await loadInstance(env, id);
+  const row = await getInstanceById(env, String(instanceId).slice(0, 64));
   if (!row) {
     return {
       ok: false,
@@ -110,372 +147,488 @@ export async function assertInstanceActive(env, instanceId, { requireId } = {}) 
       status: 404,
     };
   }
-  const st = String(row.status || "").toLowerCase();
-  if (!isInstanceOperable(st)) {
+  if (!allow.includes(row.status)) {
     const code =
-      st === "paused"
+      row.status === "paused"
         ? "instance_paused"
-        : st === "retired"
+        : row.status === "retired"
           ? "instance_retired"
           : "instance_not_active";
     return {
       ok: false,
       error:
-        st === "paused"
-          ? "Agent instance is paused — resume before spending"
-          : st === "retired"
-            ? "Agent instance is retired — cannot spend"
-            : "Agent instance is not active (status=" + st + ")",
+        row.status === "paused"
+          ? "Agent instance is paused — cannot spend or take new work"
+          : row.status === "retired"
+            ? "Agent instance is retired — permanently blocked"
+            : `Agent instance status '${row.status}' cannot operate (need: ${allow.join("|")})`,
       code,
       status: 403,
-      instance: publicInstance(row),
+      instance: rowPublic(row),
     };
   }
-  return { ok: true, instance: row };
+  return { ok: true, instance: rowPublic(row) };
 }
 
-/** Read instance_id from body or header X-Instance-Id */
-export function readInstanceId(body, request) {
-  const fromBody =
-    body &&
-    (body.instance_id || body.instanceId || body.agent_instance_id);
-  if (fromBody) return String(fromBody).trim();
-  if (request) {
-    const h = request.headers.get("X-Instance-Id");
-    if (h) return String(h).trim();
+/** Optional gate: if body/header has instance_id, enforce; if missing, allow (legacy). */
+export async function maybeAssertInstanceFromBody(env, body, requestOrOpts) {
+  let request = null;
+  let opts = {};
+  if (requestOrOpts && typeof requestOrOpts.headers !== "undefined") {
+    request = requestOrOpts;
+  } else if (requestOrOpts && typeof requestOrOpts === "object") {
+    opts = requestOrOpts;
   }
-  return "";
+  let id =
+    body &&
+    (body.instance_id || body.instanceId || body.agent_instance_id || null);
+  if (!id && request) {
+    try {
+      id = request.headers.get("X-Instance-Id");
+    } catch (_) {}
+  }
+  if (!id) return { ok: true, instance: null, instance_id: null };
+  const r = await assertInstanceOperable(env, id, opts);
+  if (!r.ok) return r;
+  return { ok: true, instance: r.instance, instance_id: r.instance.id };
 }
 
-export async function maybeAssertInstanceFromBody(env, body, request) {
-  const id = readInstanceId(body, request);
-  return assertInstanceActive(env, id, { requireId: false });
+export async function assertInstanceActive(env, instanceId, opts = {}) {
+  if (!instanceId && !opts.requireId) {
+    return { ok: true, instance: null };
+  }
+  return assertInstanceOperable(env, instanceId, opts);
 }
 
-function publicInstance(row) {
-  if (!row) return null;
-  return {
-    id: row.id,
-    repo_id: row.repo_id,
-    label: row.label || null,
-    status: row.status,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    funded_at: row.funded_at || null,
-    activated_at: row.activated_at || null,
-    paused_at: row.paused_at || null,
-    retired_at: row.retired_at || null,
-    pause_reason: row.pause_reason || null,
-  };
+async function requireSession(request, env) {
+  const user = await getSessionUser(request, env);
+  if (!user) return { error: bad(request, "Sign in required", 401) };
+  return { user };
 }
 
-async function logInstanceEvent(env, request, kind, row, reason, meta) {
+async function requireOwnerInstance(request, env, id) {
+  const { user, error } = await requireSession(request, env);
+  if (error) return { error };
+  const row = await getInstanceById(env, id);
+  if (!row) return { error: bad(request, "Instance not found", 404) };
+  if (row.owner_user_id !== user.id) {
+    return { error: bad(request, "Not your instance", 403) };
+  }
+  return { user, row };
+}
+
+async function logLife(env, request, kind, severity, user, row, reason, extraMeta) {
   try {
     await recordSecurityEvent(
       env,
       {
         kind,
-        severity: kind.includes("freeze") || kind === "agent.retire" ? "warn" : "info",
-        user_id: row.user_id,
+        severity: severity || "info",
+        user_id: user.id,
         repo_id: row.repo_id,
-        reason: reason || null,
-        meta: Object.assign({ instance_id: row.id, status: row.status }, meta || {}),
-        // instance_id column (securityLog supports it)
         instance_id: row.id,
+        reason: reason || kind,
+        meta: Object.assign({ instance_id: row.id, status: row.status }, extraMeta || {}),
       },
       request
     );
   } catch (e) {
-    console.log("instance_sec_event", e && e.message);
+    console.log("agent_life_event", e && e.message);
   }
 }
 
+/* ─── Routes ─── */
+
+/** POST /api/instances  { repo, label?, meta? } */
 export async function handleInstanceCreate(request, env) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
+  const { user, error } = await requireSession(request, env);
+  if (error) return error;
+
   const limited = await checkRateLimit(
     env,
-    "inst:create:" + user.id,
+    "instcreate:" + user.id,
     RL_INSTANCE_CREATE_MAX || 20,
     RL_INSTANCE_CREATE_WINDOW_SEC || 3600
   );
   if (limited) {
-    return bad(request, "Rate limit: instance create", 429, {
+    return bad(request, "Rate limit: too many instance creates", 429, {
       retry_after_sec: limited.retry_after_sec,
     });
   }
-  let body = {};
+
+  let body;
   try {
     body = await request.json();
   } catch {
-    body = {};
+    return bad(request, "Invalid JSON body");
   }
+
   const repo = parseRepo(body.repo || body.repo_id || body.default_repo);
   if (!repo) return bad(request, "repo must be owner/repo");
-  const label = body.label ? String(body.label).slice(0, 64) : null;
-  await ensureAgentInstanceTable(env);
+
+  const label = body.label != null ? String(body.label).slice(0, 120) : null;
+  let metaJson = null;
+  if (body.meta != null) {
+    try {
+      metaJson = JSON.stringify(body.meta).slice(0, 4000);
+    } catch {
+      metaJson = null;
+    }
+  }
+
+  await ensureAgentInstancesTable(env);
+
+  const max = MAX_AGENT_INSTANCES_PER_USER || 50;
   try {
-    const c = await env.DB.prepare(
-      `SELECT COUNT(*) AS c FROM agent_instances WHERE user_id = ?1 AND status != 'retired'`
+    const cnt = await env.DB.prepare(
+      `SELECT COUNT(*) AS c FROM agent_instances WHERE owner_user_id = ?1 AND status != 'retired'`
     )
       .bind(user.id)
       .first();
-    if ((c && Number(c.c)) >= (MAX_AGENT_INSTANCES_PER_USER || 50)) {
-      return bad(request, "Max agent instances reached", 429, { code: "instance_cap" });
+    if (Number(cnt && cnt.c) >= max) {
+      return bad(request, "Max agent instances reached (" + max + ")", 400, {
+        code: "instance_limit",
+      });
     }
   } catch (_) {}
-  const id = "ainst_" + randomId(16);
-  try {
-    await env.DB.prepare(
-      `INSERT INTO agent_instances (id, user_id, repo_id, label, status, created_at, updated_at)
-       VALUES (?1, ?2, ?3, ?4, 'created', datetime('now'), datetime('now'))`
-    )
-      .bind(id, user.id, repo, label)
-      .run();
-  } catch (e) {
-    return bad(request, "Create failed: " + (e.message || e), 500);
-  }
-  const row = await loadInstance(env, id);
-  await logInstanceEvent(env, request, "agent.create", row || { id, user_id: user.id, repo_id: repo, status: "created" }, "dashboard_create");
-  return json(request, { ok: true, instance: publicInstance(row) });
+
+  const id = "ainst_" + randomId(12);
+  await ensureAccount(env, repo);
+
+  await env.DB.prepare(
+    `INSERT INTO agent_instances (
+       id, owner_user_id, repo_id, label, status, funded_usd, meta_json,
+       created_at, updated_at
+     ) VALUES (?1, ?2, ?3, ?4, 'created', 0, ?5, datetime('now'), datetime('now'))`
+  )
+    .bind(id, user.id, repo, label, metaJson)
+    .run();
+
+  const row = await getInstanceById(env, id);
+  await logLife(env, request, "agent.create", "info", user, row || { id, repo_id: repo, status: "created" }, "instance_create", { label });
+
+  return json(request, { ok: true, instance: rowPublic(row) });
 }
 
+/** GET /api/instances?status=&limit= */
 export async function handleInstanceList(request, url, env) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  await ensureAgentInstanceTable(env);
-  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 50), 1), 100);
+  const { user, error } = await requireSession(request, env);
+  if (error) return error;
+  await ensureAgentInstancesTable(env);
+
   const status = (url.searchParams.get("status") || "").trim().toLowerCase();
-  let sql = `SELECT * FROM agent_instances WHERE user_id = ?1`;
-  const binds = [user.id];
+  const limit = Math.min(
+    Math.max(Number(url.searchParams.get("limit") || 50), 1),
+    100
+  );
+
+  let rows;
   if (status && (AGENT_INSTANCE_STATUSES || []).includes(status)) {
-    sql += ` AND status = ?2`;
-    binds.push(status);
-    sql += ` ORDER BY created_at DESC LIMIT ?3`;
-    binds.push(limit);
+    const { results } = await env.DB.prepare(
+      `SELECT * FROM agent_instances
+       WHERE owner_user_id = ?1 AND status = ?2
+       ORDER BY created_at DESC LIMIT ?3`
+    )
+      .bind(user.id, status, limit)
+      .all();
+    rows = results || [];
   } else {
-    sql += ` ORDER BY created_at DESC LIMIT ?2`;
-    binds.push(limit);
+    const { results } = await env.DB.prepare(
+      `SELECT * FROM agent_instances
+       WHERE owner_user_id = ?1
+       ORDER BY created_at DESC LIMIT ?2`
+    )
+      .bind(user.id, limit)
+      .all();
+    rows = results || [];
   }
-  try {
-    const { results } = await env.DB.prepare(sql).bind(...binds).all();
-    return json(request, {
-      ok: true,
-      count: (results || []).length,
-      instances: (results || []).map(publicInstance),
-    });
-  } catch (e) {
-    return bad(request, "List failed: " + (e.message || e), 500);
-  }
+
+  return json(request, {
+    ok: true,
+    count: rows.length,
+    instances: rows.map(rowPublic),
+  });
 }
 
+/** GET /api/instances/:id */
 export async function handleInstanceGet(request, env, id) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  const row = await loadInstance(env, id);
-  if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
-  return json(request, { ok: true, instance: publicInstance(row) });
+  const { row, error } = await requireOwnerInstance(request, env, id);
+  if (error) return error;
+  return json(request, { ok: true, instance: rowPublic(row) });
 }
 
+/**
+ * POST /api/instances/:id/fund
+ * Body: { amount?, activate?: true }
+ */
 export async function handleInstanceFund(request, env, id) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  const row = await loadInstance(env, id);
-  if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
-  if (row.status === "retired") return bad(request, "Retired instance", 400, { code: "instance_retired" });
+  const { user, row, error } = await requireOwnerInstance(request, env, id);
+  if (error) return error;
+
+  if (row.status === "retired") {
+    return bad(request, "Retired instance cannot be funded", 403, {
+      code: "instance_retired",
+    });
+  }
+  if (row.status === "paused") {
+    return bad(request, "Paused instance — resume before funding", 403, {
+      code: "instance_paused",
+    });
+  }
+
   let body = {};
   try {
     body = await request.json();
   } catch {
     body = {};
   }
-  const amount = parseAmount(body.amount != null ? body.amount : 1);
-  const activate = body.activate === true || body.activate === "true";
-  if (amount == null || amount <= 0) return bad(request, "amount invalid");
-  if (amount > FAUCET_MAX_PER_CALL) {
-    return bad(request, "Max faucet per call is $" + FAUCET_MAX_PER_CALL);
-  }
-  await ensureAccount(env, row.repo_id);
-  const updated = await env.DB.prepare(
-    `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now')
-     WHERE repo_id = ?2 AND (balance + ?1) <= ?3 RETURNING balance`
-  )
-    .bind(amount, row.repo_id, FAUCET_ACCOUNT_CAP)
-    .first();
-  if (!updated) {
-    return bad(request, "Faucet cap reached", 429);
-  }
-  await env.DB.prepare(
-    `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
-     VALUES (?1, ?2, ?3, ?4, 'success', 0)`
-  )
-    .bind(SYSTEM_FAUCET, row.repo_id, amount, "instance-fund:" + id)
-    .run()
-    .catch(() => {});
 
-  let newStatus = row.status === "created" ? "funded" : row.status;
-  if (activate || body.activate !== false) {
-    if (newStatus === "funded" || newStatus === "created") newStatus = "active";
-  }
+  const amount = parseAmount(body.amount);
+  const activate = !!(body.activate || body.auto_activate);
+
+  await ensureAccount(env, row.repo_id);
+
+  const add = amount != null ? amount : 0;
+  const newFunded = Number(row.funded_usd || 0) + add;
+  let nextStatus = "funded";
+  if (activate) nextStatus = "active";
+  if (row.status === "active") nextStatus = "active";
+
   await env.DB.prepare(
     `UPDATE agent_instances SET
        status = ?2,
+       funded_usd = ?3,
        funded_at = COALESCE(funded_at, datetime('now')),
        activated_at = CASE WHEN ?2 = 'active' THEN COALESCE(activated_at, datetime('now')) ELSE activated_at END,
        updated_at = datetime('now')
      WHERE id = ?1`
   )
-    .bind(id, newStatus)
+    .bind(id, nextStatus, newFunded)
     .run();
 
-  const next = await loadInstance(env, id);
-  await logInstanceEvent(env, request, "agent.fund", next, "fund", { amount });
-  if (newStatus === "active") {
-    await logInstanceEvent(env, request, "agent.activate", next, "fund_activate");
-  }
-  return json(request, {
-    ok: true,
-    instance: publicInstance(next),
-    balance: Number(updated.balance),
-    amount,
+  const updated = await getInstanceById(env, id);
+  await logLife(env, request, "agent.fund", "info", user, updated, "instance_fund", {
+    amount: add,
+    status: nextStatus,
   });
+  if (nextStatus === "active" && row.status !== "active") {
+    await logLife(env, request, "agent.activate", "info", user, updated, "fund_activate");
+  }
+
+  return json(request, { ok: true, instance: rowPublic(updated) });
 }
 
+/** POST /api/instances/:id/activate */
 export async function handleInstanceActivate(request, env, id) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  const row = await loadInstance(env, id);
-  if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
-  if (row.status === "retired") return bad(request, "Cannot activate retired", 400);
-  if (row.status === "paused") {
-    return bad(request, "Use resume for paused instances", 400, { code: "use_resume" });
-  }
-  await env.DB.prepare(
-    `UPDATE agent_instances SET status = 'active', activated_at = COALESCE(activated_at, datetime('now')), updated_at = datetime('now')
-     WHERE id = ?1`
-  )
-    .bind(id)
-    .run();
-  const next = await loadInstance(env, id);
-  await logInstanceEvent(env, request, "agent.activate", next, "activate");
-  return json(request, { ok: true, instance: publicInstance(next) });
-}
+  const { user, row, error } = await requireOwnerInstance(request, env, id);
+  if (error) return error;
 
-export async function handleInstancePause(request, env, id) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  const row = await loadInstance(env, id);
-  if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
-  if (row.status === "retired") return bad(request, "Already retired", 400);
-  if (row.status === "paused") {
-    return json(request, { ok: true, instance: publicInstance(row), already: true });
+  if (row.status === "active") {
+    return json(request, { ok: true, instance: rowPublic(row), already: true });
   }
-  let body = {};
-  try {
-    body = await request.json();
-  } catch {
-    body = {};
-  }
-  const reason = body.reason ? String(body.reason).slice(0, 200) : "operator_pause";
-  await env.DB.prepare(
-    `UPDATE agent_instances SET status = 'paused', paused_at = datetime('now'), pause_reason = ?2, updated_at = datetime('now')
-     WHERE id = ?1`
-  )
-    .bind(id, reason)
-    .run();
-  const next = await loadInstance(env, id);
-  await logInstanceEvent(env, request, "agent.pause", next, reason);
-  return json(request, { ok: true, instance: publicInstance(next) });
-}
-
-export async function handleInstanceResume(request, env, id) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  const row = await loadInstance(env, id);
-  if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
-  if (row.status === "retired") return bad(request, "Cannot resume retired", 400);
-  if (row.status !== "paused") {
-    return json(request, { ok: true, instance: publicInstance(row), already: true });
-  }
-  await env.DB.prepare(
-    `UPDATE agent_instances SET status = 'active', pause_reason = NULL, updated_at = datetime('now')
-     WHERE id = ?1`
-  )
-    .bind(id)
-    .run();
-  const next = await loadInstance(env, id);
-  await logInstanceEvent(env, request, "agent.resume", next, "operator_resume");
-  return json(request, { ok: true, instance: publicInstance(next) });
-}
-
-export async function handleInstanceRetire(request, env, id) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
-  const row = await loadInstance(env, id);
-  if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
   if (row.status === "retired") {
-    return json(request, { ok: true, instance: publicInstance(row), already: true });
+    return bad(request, "Cannot activate retired instance", 403);
   }
-  await env.DB.prepare(
-    `UPDATE agent_instances SET status = 'retired', retired_at = datetime('now'), updated_at = datetime('now')
-     WHERE id = ?1`
-  )
-    .bind(id)
-    .run();
-  const next = await loadInstance(env, id);
-  await logInstanceEvent(env, request, "agent.retire", next, "operator_retire");
-  return json(request, { ok: true, instance: publicInstance(next) });
-}
-
-/** Emergency freeze: one instance or all under account */
-export async function handleInstanceFreeze(request, env) {
-  const user = await getSessionUser(request, env);
-  if (!user) return bad(request, "Sign in required", 401);
+  if (row.status === "paused") {
+    return bad(request, "Use resume for paused instances", 400, {
+      code: "use_resume",
+    });
+  }
+  if (row.status !== "funded" && row.status !== "created") {
+    return bad(request, "Can only activate from created/funded", 400);
+  }
   let body = {};
   try {
     body = await request.json();
   } catch {
     body = {};
   }
-  const one = String(body.instance_id || body.id || "").trim();
-  await ensureAgentInstanceTable(env);
-  const reason = body.reason ? String(body.reason).slice(0, 200) : "emergency_freeze";
-  let paused = 0;
+  if (row.status === "created" && !body.force) {
+    return bad(
+      request,
+      "Fund the instance first (or pass force:true for lab)",
+      400,
+      { code: "need_fund" }
+    );
+  }
+
+  await env.DB.prepare(
+    `UPDATE agent_instances SET
+       status = 'active',
+       activated_at = COALESCE(activated_at, datetime('now')),
+       updated_at = datetime('now')
+     WHERE id = ?1`
+  )
+    .bind(id)
+    .run();
+
+  const updated = await getInstanceById(env, id);
+  await logLife(env, request, "agent.activate", "info", user, updated, "instance_activate");
+  return json(request, { ok: true, instance: rowPublic(updated) });
+}
+
+/** POST /api/instances/:id/pause */
+export async function handleInstancePause(request, env, id) {
+  const { user, row, error } = await requireOwnerInstance(request, env, id);
+  if (error) return error;
+
+  if (row.status === "retired") {
+    return bad(request, "Retired instance cannot be paused", 403);
+  }
+  if (row.status === "paused") {
+    return json(request, { ok: true, instance: rowPublic(row), already: true });
+  }
+
+  await env.DB.prepare(
+    `UPDATE agent_instances SET
+       status = 'paused',
+       paused_at = datetime('now'),
+       updated_at = datetime('now')
+     WHERE id = ?1`
+  )
+    .bind(id)
+    .run();
+
+  const updated = await getInstanceById(env, id);
+  await logLife(env, request, "agent.pause", "warn", user, updated, "instance_pause", {
+    from: row.status,
+  });
+  return json(request, { ok: true, instance: rowPublic(updated) });
+}
+
+/** POST /api/instances/:id/resume */
+export async function handleInstanceResume(request, env, id) {
+  const { user, row, error } = await requireOwnerInstance(request, env, id);
+  if (error) return error;
+
+  if (row.status !== "paused") {
+    return bad(request, "Only paused instances can be resumed", 400, {
+      code: "not_paused",
+      status: row.status,
+    });
+  }
+
+  await env.DB.prepare(
+    `UPDATE agent_instances SET
+       status = 'active',
+       paused_at = NULL,
+       updated_at = datetime('now')
+     WHERE id = ?1`
+  )
+    .bind(id)
+    .run();
+
+  const updated = await getInstanceById(env, id);
+  await logLife(env, request, "agent.resume", "info", user, updated, "instance_resume");
+  return json(request, { ok: true, instance: rowPublic(updated) });
+}
+
+/** POST /api/instances/:id/retire */
+export async function handleInstanceRetire(request, env, id) {
+  const { user, row, error } = await requireOwnerInstance(request, env, id);
+  if (error) return error;
+
+  if (row.status === "retired") {
+    return json(request, { ok: true, instance: rowPublic(row), already: true });
+  }
+
+  await env.DB.prepare(
+    `UPDATE agent_instances SET
+       status = 'retired',
+       retired_at = datetime('now'),
+       updated_at = datetime('now')
+     WHERE id = ?1`
+  )
+    .bind(id)
+    .run();
+
+  const updated = await getInstanceById(env, id);
+  await logLife(env, request, "agent.retire", "warn", user, updated, "instance_retire", {
+    from: row.status,
+  });
+  return json(request, { ok: true, instance: rowPublic(updated) });
+}
+
+/**
+ * POST /api/instances/freeze
+ * Body: { instance_id? } — one id, or omit to pause ALL non-retired under account
+ */
+export async function handleInstanceFreeze(request, env) {
+  const { user, error } = await requireSession(request, env);
+  if (error) return error;
+  await ensureAgentInstancesTable(env);
+
+  let body = {};
+  try {
+    body = await request.json();
+  } catch {
+    body = {};
+  }
+
+  const one = body.instance_id || body.instanceId || null;
+
   if (one) {
-    const row = await loadInstance(env, one);
-    if (!row || row.user_id !== user.id) return bad(request, "Not found", 404);
-    if (row.status !== "retired" && row.status !== "paused") {
-      await env.DB.prepare(
-        `UPDATE agent_instances SET status = 'paused', paused_at = datetime('now'), pause_reason = ?2, updated_at = datetime('now')
-         WHERE id = ?1`
-      )
-        .bind(one, reason)
-        .run();
-      paused = 1;
-      const next = await loadInstance(env, one);
-      await logInstanceEvent(env, request, "agent.freeze", next, reason);
+    const row = await getInstanceById(env, String(one));
+    if (!row || row.owner_user_id !== user.id) {
+      return bad(request, "Instance not found", 404);
     }
-  } else {
-    const r = await env.DB.prepare(
-      `UPDATE agent_instances SET status = 'paused', paused_at = datetime('now'), pause_reason = ?2, updated_at = datetime('now')
-       WHERE user_id = ?1 AND status IN ('created','funded','active')`
+    if (row.status === "retired") {
+      return bad(request, "Already retired", 400);
+    }
+    if (row.status !== "paused") {
+      await env.DB.prepare(
+        `UPDATE agent_instances SET status = 'paused', paused_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1`
+      )
+        .bind(row.id)
+        .run();
+    }
+    const updated = await getInstanceById(env, row.id);
+    await logLife(env, request, "agent.freeze", "critical", user, updated, "emergency_freeze_one");
+    return json(request, {
+      ok: true,
+      frozen: 1,
+      instances: [rowPublic(updated)],
+    });
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT id FROM agent_instances
+     WHERE owner_user_id = ?1 AND status NOT IN ('paused', 'retired')`
+  )
+    .bind(user.id)
+    .all();
+  const ids = (results || []).map((r) => r.id);
+  for (const iid of ids) {
+    await env.DB.prepare(
+      `UPDATE agent_instances SET status = 'paused', paused_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1`
     )
-      .bind(user.id, reason)
+      .bind(iid)
       .run();
-    paused = (r && r.meta && r.meta.changes) || 0;
+  }
+
+  try {
     await recordSecurityEvent(
       env,
       {
         kind: "agent.freeze_all",
         severity: "critical",
         user_id: user.id,
-        reason,
-        meta: { paused },
+        reason: "emergency_freeze_all",
+        meta: { count: ids.length, ids },
       },
       request
     );
-  }
-  return json(request, { ok: true, paused, reason });
-}
+  } catch (_) {}
 
-export { publicInstance };
+  const { results: after } = await env.DB.prepare(
+    `SELECT * FROM agent_instances WHERE owner_user_id = ?1 ORDER BY created_at DESC LIMIT 50`
+  )
+    .bind(user.id)
+    .all();
+
+  return json(request, {
+    ok: true,
+    frozen: ids.length,
+    instances: (after || []).map(rowPublic),
+  });
+}
