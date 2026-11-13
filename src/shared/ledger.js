@@ -1,11 +1,7 @@
 /**
  * Core ledger — pay, fund, balance, ledger + helpers
- * Path on GitHub: src/shared/ledger.js
- *
- * Day 03: optional instance_id on pay — paused/retired agents cannot spend
- *
- * REQUIRES: src/shared/credit.js exports debitWithCredit
- * Scoped API keys: applyScopeVerb(authUser, "pay", toRepo) before safetyGate
+ * Day 03/04: optional instance_id on pay — paused/retired blocked
+ * Day 04: afterPaySecurity + afterInstanceBlock with instance_id
  */
 import { json, bad } from "./http.js";
 import {
@@ -44,6 +40,7 @@ import {
 import { validateApprovedAllowance, markApprovalConsumed } from "./approval.js";
 import { applyScopeVerb } from "./scopes.js";
 import { maybeAssertInstanceFromBody } from "./agentInstance.js";
+import { afterPaySecurity, afterInstanceBlock } from "./securityLog.js";
 import {
   RL_PAY_MAX,
   RL_PAY_WINDOW_SEC,
@@ -54,8 +51,6 @@ import {
   CREDIT_REP_SUCCESS_BONUS,
   CREDIT_REP_PER_USD,
 } from "./constants.js";
-
-/* ─── Ledger helpers ─── */
 
 export async function readBalances(env, fromRepo, toRepo) {
   const [fromAcc, toAcc] = await env.DB.batch([
@@ -88,8 +83,6 @@ export async function waitForIdem(env, key) {
   }
   return { ok: false, error: "Payment still in flight", pending: true };
 }
-
-/* ─── Pay ─── */
 
 export async function handlePay(request, env, ctx) {
   const t0 = Date.now();
@@ -135,11 +128,20 @@ export async function handlePay(request, env, ctx) {
     body.trace_id || body.traceId || request.headers.get("X-Trace-Id")
   );
 
-  // Day 03 · Agent Lifecycle — optional instance_id blocks paused/retired spend
+  // Day 03/04 · Agent Lifecycle gate
   let activeInstance = null;
   {
-    const instGate = await maybeAssertInstanceFromBody(env, body);
+    const instGate = await maybeAssertInstanceFromBody(env, body, request);
     if (!instGate.ok) {
+      waitUntil(
+        afterInstanceBlock(env, request, {
+          authUser,
+          instanceId: body.instance_id || body.instanceId || null,
+          code: instGate.code,
+          verb: "pay",
+          repoId: fromRepo,
+        })
+      );
       return bad(request, instGate.error, instGate.status || 403, {
         code: instGate.code,
         instance: instGate.instance || null,
@@ -151,7 +153,6 @@ export async function handlePay(request, env, ctx) {
     }
   }
 
-  // Delegation chain: child key + X-Delegate-Id spends parent-locked budget
   const delegateIdHdr = String(
     request.headers.get("X-Delegate-Id") || body.delegate_id || body.delegation_id || ""
   ).trim();
@@ -311,6 +312,16 @@ export async function handlePay(request, env, ctx) {
             .run()
             .catch(() => {});
         }
+        waitUntil(
+          afterPaySecurity(env, request, {
+            ok: false,
+            authUser,
+            repoId: fromRepo,
+            amountUsd: amount,
+            reason: debitRes.code || "insufficient",
+            instanceId: activeInstance ? activeInstance.id : null,
+          })
+        );
         waitUntil(
           env.DB.prepare(
             `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
@@ -526,6 +537,16 @@ export async function handlePay(request, env, ctx) {
   waitUntil(
     (async () => {
       try {
+        await afterPaySecurity(env, request, {
+          ok: true,
+          authUser,
+          repoId: fromRepo,
+          amountUsd: amount,
+          requestId: idem || (txId != null ? String(txId) : null),
+          instanceId: activeInstance ? activeInstance.id : null,
+        });
+      } catch (_) {}
+      try {
         await env.DB.batch([
           env.DB.prepare(
             `INSERT INTO velocity_events (id, repo_id, api_key_id, amount, created_at)
@@ -661,8 +682,6 @@ export async function handleLedger(request, url, env) {
   const { results } = await stmt.all();
   return json(request, { ok: true, count: results.length, transactions: results });
 }
-
-/* ─── Signed payment receipts ─── */
 
 export function receiptSecret(env) {
   return (
