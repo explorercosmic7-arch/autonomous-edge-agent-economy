@@ -1,7 +1,8 @@
-/** 
+/**
  * API keys + edge binding — create/list/revoke/bind/unbind, me/key, edge info,
  * unsuspend, rotate, TTL (expires_at).
  * Scoped keys: verbs, max_amount_usd, to_repo_allow (see scopes.js)
+ * Normal create (no verbs in body) → full legacy access — NOT read-only.
  * Security events: key.create | key.revoke | key.rotate | key.unsuspend
  */
 import { json, bad } from "./http.js";
@@ -42,7 +43,6 @@ function parseTtlHours(body) {
   return n;
 }
 
-/* ─── API keys ─── */
 export async function handleMeKeysCreate(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
@@ -72,6 +72,7 @@ export async function handleMeKeysCreate(request, env) {
   if ((countRow?.c || 0) >= MAX_KEYS_PER_USER) {
     return bad(request, "Max " + MAX_KEYS_PER_USER + " active keys per user", 429);
   }
+  // Normal key (no verbs in body) → full legacy — see scopesFromCreateBody
   const scopes = scopesFromCreateBody(body);
   const scopesJson = scopesToJson(scopes);
   const maxAmountCol =
@@ -202,7 +203,7 @@ export async function handleMeKeysCreate(request, env) {
         label,
         ttl_hours: ttlHours,
         legacy: !!scopes.legacy,
-        verbs: scopes.verbs,
+        verbs: scopes.legacy ? ["*"] : scopes.verbs,
       },
     },
     request
@@ -229,7 +230,7 @@ export async function handleMeKeysCreate(request, env) {
       (bindMode ? " Edge binding: " + bindMode + "." : "") +
       (expiresAt ? " Expires: " + expiresAt + "." : "") +
       (view.legacy
-        ? " Scope: full (legacy)."
+        ? " Scope: full (all verbs)."
         : " Scope: " + view.label + ".") +
       (insertedWithScopes
         ? ""
@@ -453,7 +454,6 @@ export async function handleMeKeysUnbind(request, env) {
   return json(request, { ok: true, id, bind_mode: null, unbound: true });
 }
 
-/** Current API key metadata + binding + scopes (API key auth). */
 export async function handleMeKeySelf(request, env) {
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
@@ -566,10 +566,6 @@ export async function handleMeKeysRevoke(request, env) {
   return json(request, { ok: true, id, revoked: true });
 }
 
-/**
- * One-click rotate: revoke old key, create new with same scopes / bind / label / TTL.
- * Returns new secret once.
- */
 export async function handleMeKeysRotate(request, env) {
   const user = await getSessionUser(request, env);
   if (!user) return bad(request, "Sign in required", 401);
@@ -618,11 +614,11 @@ export async function handleMeKeysRotate(request, env) {
   const keyHash = await sha256Hex(secret);
   const keyPrefix = secret.slice(0, 12);
   const label = String(old.label || "agent").slice(0, 64);
-  const scopesJson = old.scopes_json != null ? old.scopes_json : null;
+  // Preserve scopes; if old had null scopes_json → full legacy on new key
+  let scopesJson = old.scopes_json != null ? old.scopes_json : scopesToJson({ legacy: true, verbs: ["*"] });
   const maxAmountCol =
     old.max_amount_usd != null ? Number(old.max_amount_usd) : null;
   const bindMode = old.bind_mode || null;
-  // New key: clear learned bounds; keep mode if any
   const expiresAt = old.expires_at || null;
 
   await env.DB.prepare(
