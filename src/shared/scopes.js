@@ -4,6 +4,12 @@
  *
  * CRITICAL: empty create body (normal dashboard key) → legacy full access.
  * Never default to ["read"] only.
+ *
+ * Create body shapes accepted:
+ *   { verbs: ["read","pay"] }
+ *   { scopes: ["read","pay"] }
+ *   { scopes: { verbs: ["read","pay"], max_amount_usd?, to_repo_allow? } }  // unwrap
+ *   { preset: "read"|"pay"|"agent"|"hire"|"money"|"full" }
  */
 import { afterScopeDeny } from "./securityLog.js";
 
@@ -51,7 +57,6 @@ export function parseScopes(raw) {
       legacy: true,
     };
   }
-  // Explicit full / legacy markers
   if (obj.legacy === true || obj.full === true || obj.verbs === "*" || obj.verbs === "all") {
     return {
       v: 1,
@@ -70,7 +75,6 @@ export function parseScopes(raw) {
         .trim();
       if (SCOPE_VERBS.includes(s)) set.add(s);
     }
-    // Empty array after filter → treat as legacy full (never silent read-only)
     verbs = set.size ? Array.from(set) : null;
   }
   let maxAmt = null;
@@ -121,7 +125,31 @@ function normalizeRepoAllowList(list) {
  * Only explicit preset or verbs list creates a restricted key.
  */
 export function scopesFromCreateBody(body) {
-  body = body || {};
+  body = body && typeof body === "object" ? { ...body } : {};
+
+  // Unwrap nested { scopes: { verbs: [...] } } from older dashboard clients
+  if (
+    body.scopes &&
+    typeof body.scopes === "object" &&
+    !Array.isArray(body.scopes)
+  ) {
+    const nested = body.scopes;
+    if (Array.isArray(nested.verbs) && !Array.isArray(body.verbs)) {
+      body.verbs = nested.verbs;
+    }
+    if (body.max_amount_usd == null && nested.max_amount_usd != null) {
+      body.max_amount_usd = nested.max_amount_usd;
+    }
+    if (
+      body.to_repo_allow == null &&
+      (nested.to_repo_allow != null || nested.allow_to != null)
+    ) {
+      body.to_repo_allow = nested.to_repo_allow ?? nested.allow_to;
+    }
+    // scopes field consumed as object — clear so Array.isArray(body.scopes) is false
+    delete body.scopes;
+  }
+
   if (body.full === true || body.legacy === true || body.unscoped === true) {
     return {
       v: 1,
@@ -138,7 +166,6 @@ export function scopesFromCreateBody(body) {
     (typeof body.scope === "string" && body.scope.trim()) ||
     (body.preset != null && String(body.preset).trim() !== "");
 
-  // Normal dashboard create: empty body → FULL ACCESS
   if (!hasExplicit) {
     return {
       v: 1,
@@ -162,11 +189,15 @@ export function scopesFromCreateBody(body) {
       return parseScopes({ full: true });
     }
     if (p === "read" || p === "readonly") verbs = ["read"];
-    else if (p === "pay" || p === "agent") verbs = ["read", "pay"];
+    else if (p === "pay") verbs = ["read", "pay"];
+    else if (p === "agent") verbs = ["read", "pay", "hire", "escrow", "stream"];
     else if (p === "hire") verbs = ["read", "hire"];
     else if (p === "money") verbs = ["read", "pay", "escrow", "stream"];
-    else {
-      // Unknown preset → full, not silent read-only
+    else if (p === "custom") {
+      // custom without verbs array → read only (safe), not full
+      verbs = ["read"];
+    } else {
+      // Unknown preset with no verbs → full (do not invent silent read-only)
       return parseScopes({ full: true });
     }
   }
@@ -177,7 +208,6 @@ export function scopesFromCreateBody(body) {
     to_repo_allow: body.to_repo_allow ?? body.allow_to ?? body.to_allow,
   });
 
-  // Explicit restricted list that filtered to empty → still full, not ["read"]
   if (!parsed.legacy && (!parsed.verbs || parsed.verbs.length === 0)) {
     return {
       v: 1,
@@ -190,10 +220,6 @@ export function scopesFromCreateBody(body) {
   return parsed;
 }
 
-/**
- * Persist scopes. legacy → null in DB (parseScopes treats null as full).
- * Restricted → JSON with verbs array.
- */
 export function scopesToJson(scopes) {
   if (!scopes || scopes.legacy || scopes.verbs === null) {
     return null;
@@ -308,14 +334,7 @@ export function checkKeyScope(
   return null;
 }
 
-/**
- * Prefer this helper from money handlers so denials hit the audit log.
- * rejectKeyScope(request, env, authUser, "pay", { amount, toRepo }, bad)
- * env is optional for backward compat: rejectKeyScope(request, authUser, verb, opts, badFn)
- */
 export function rejectKeyScope(request, envOrAuth, authOrVerb, verbOrOpts, optsOrBad, badFnMaybe) {
-  // Overload: (request, authUser, verb, opts, badFn)  — legacy
-  //           (request, env, authUser, verb, opts, badFn) — preferred
   let env = null;
   let authUser;
   let verb;
@@ -365,7 +384,6 @@ export function rejectKeyScope(request, envOrAuth, authOrVerb, verbOrOpts, optsO
   return hit;
 }
 
-/** Async variant — await in handlers so denial-storm can disable before response. */
 export async function rejectKeyScopeAsync(request, env, authUser, verb, opts, badFn) {
   const hit = checkKeyScope(authUser, verb, opts || {});
   if (!hit) return null;
