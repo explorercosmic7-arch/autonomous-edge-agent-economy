@@ -1,6 +1,6 @@
 /**
  * Shared Hire Protocol — RFQ → Quote → Accept → Complete / Cancel + expire.
- * Scoped API keys: applyScopeVerb(authUser, "hire", ...)
+ * Day 04: handleHireAccept hard-gates paused/retired agent instances.
  */
 import { json, bad } from "./http.js";
 import {
@@ -16,6 +16,12 @@ import { scheduleWebhook } from "./webhooks.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
 import { getPassportClaims } from "./passport.js";
 import { applyScopeVerb } from "./scopes.js";
+import {
+  maybeAssertInstanceFromBody,
+} from "./agentInstance.js";
+import {
+  afterInstanceBlock,
+} from "./securityLog.js";
 import {
   SYSTEM_HIRE,
   HIRE_MIN,
@@ -150,7 +156,10 @@ export async function handleHireRfq(request, env, ctx) {
   const id = "hr_" + randomId(12);
   const modifier = "+" + ttlSec + " seconds";
   try {
-    await env.DB.prepare(`INSERT INTO hire_rfqs (id, buyer_repo, capability, task, budget_usd, min_quotes, status, ttl_seconds, expires_at, label, created_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, datetime('now', ?8), ?9, ?10, datetime('now'), datetime('now'))`)
+    await env.DB.prepare(
+      `INSERT INTO hire_rfqs (id, buyer_repo, capability, task, budget_usd, min_quotes, status, ttl_seconds, expires_at, label, created_by, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, datetime('now', ?8), ?9, ?10, datetime('now'), datetime('now'))`
+    )
       .bind(id, buyer, capability, task, budget, minQuotes, ttlSec, modifier, label, authUser.id).run();
   } catch (e) {
     return bad(request, "hire_rfqs table missing — run d1-hire-migration.sql: " + (e.message || e), 500);
@@ -191,15 +200,19 @@ export async function handleHireQuote(request, env, ctx) {
   if (provider === rfq.buyer_repo) return bad(request, "Buyer cannot quote their own RFQ", 400, { code: "self_quote" });
   if (amount > Number(rfq.budget_usd)) return bad(request, "Quote exceeds RFQ budget ($" + rfq.budget_usd + ")", 400, { code: "over_budget" });
   try {
-    const existing = await env.DB.prepare(`SELECT id FROM hire_quotes WHERE rfq_id = ?1 AND provider_repo = ?2 AND status = 'open' LIMIT 1`).bind(rfqId, provider).first();
+    const existing = await env.DB.prepare(
+      `SELECT id FROM hire_quotes WHERE rfq_id = ?1 AND provider_repo = ?2 AND status = 'open' LIMIT 1`
+    ).bind(rfqId, provider).first();
     if (existing) return bad(request, "Provider already has an open quote on this RFQ", 409, { code: "duplicate_quote", quote_id: existing.id });
   } catch (_) {}
   let provider_passport = null;
   try { provider_passport = await getPassportClaims(env, provider); } catch (_) {}
   const qid = "hq_" + randomId(12);
   try {
-    await env.DB.prepare(`INSERT INTO hire_quotes (id, rfq_id, provider_repo, amount_usd, eta_seconds, note, status, created_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, datetime('now'), datetime('now'))`)
-      .bind(qid, rfqId, provider, amount, eta, note, authUser.id).run();
+    await env.DB.prepare(
+      `INSERT INTO hire_quotes (id, rfq_id, provider_repo, amount_usd, eta_seconds, note, status, created_by, created_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, datetime('now'), datetime('now'))`
+    ).bind(qid, rfqId, provider, amount, eta, note, authUser.id).run();
   } catch (e) { return bad(request, "Quote insert failed: " + (e.message || e), 500); }
   await logHireEvent(env, { rfq_id: rfqId, quote_id: qid, event: "quote_posted", actor_repo: provider, amount, note });
   if (rfq.created_by) scheduleWebhook(ctx, env, rfq.created_by, "hire.quote_posted", { rfq_id: rfqId, quote_id: qid, provider_repo: provider, amount_usd: amount, eta_seconds: eta });
@@ -211,6 +224,24 @@ export async function handleHireAccept(request, env, ctx) {
   const authUser = await getAuthUser(request, env);
   if (!authUser) return bad(request, "Sign in or API key required", 401);
   let body; try { body = await request.json(); } catch { return bad(request, "Invalid JSON body"); }
+
+  // Day 04 · Hard gate — paused/retired buyer instance cannot accept (spend)
+  const instGate = await maybeAssertInstanceFromBody(env, body, request);
+  if (!instGate.ok) {
+    await afterInstanceBlock(env, request, {
+      authUser,
+      instanceId: body.instance_id || body.instanceId || null,
+      code: instGate.code,
+      verb: "hire",
+      repoId: null,
+    });
+    return bad(request, instGate.error, instGate.status || 403, {
+      code: instGate.code,
+      instance: instGate.instance || null,
+    });
+  }
+  const activeInstance = instGate.instance || null;
+
   const quoteId = String(body.quote_id || body.id || "").trim();
   if (!quoteId) return bad(request, "quote_id required");
   const quote = await loadHireQuote(env, quoteId);
@@ -236,7 +267,7 @@ export async function handleHireAccept(request, env, ctx) {
       hint: "Omit require_passport / passport_strict for soft mode (accept + warnings only)",
     });
   }
-  authUser._policyCtx = { to_repo: provider, task: "hire:" + (rfq.task || "").slice(0, 80) };
+  authUser._policyCtx = { to_repo: provider, task: "hire:" + (rfq.task || "").slice(0, 80), instance_id: activeInstance ? activeInstance.id : null };
   const blocked = await safetyGate(request, env, authUser, buyer, amount);
   if (blocked) return blocked;
   const debitRes = await debitWithCredit(env, buyer, amount);
@@ -249,23 +280,51 @@ export async function handleHireAccept(request, env, ctx) {
   try {
     await ensureAccount(env, SYSTEM_HIRE);
     await env.DB.batch([
-      env.DB.prepare(`UPDATE hire_rfqs SET status = 'matched', accepted_quote_id = ?2, job_id = ?3, updated_at = datetime('now'), closed_at = datetime('now') WHERE id = ?1 AND status = 'open'`).bind(rfq.id, quoteId, jobId),
-      env.DB.prepare(`UPDATE hire_quotes SET status = 'accepted', updated_at = datetime('now') WHERE id = ?1`).bind(quoteId),
-      env.DB.prepare(`UPDATE hire_quotes SET status = 'rejected', updated_at = datetime('now') WHERE rfq_id = ?1 AND id != ?2 AND status = 'open'`).bind(rfq.id, quoteId),
-      env.DB.prepare(`INSERT INTO hire_jobs (id, rfq_id, quote_id, buyer_repo, provider_repo, amount_usd, task, status, created_by, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'held', ?8, datetime('now'), datetime('now'))`).bind(jobId, rfq.id, quoteId, buyer, provider, amount, rfq.task, authUser.id),
-      env.DB.prepare(`INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms) VALUES (?1, ?2, ?3, ?4, 'success', ?5)`).bind(buyer, SYSTEM_HIRE, amount, "hire-hold:" + jobId, Date.now() - t0),
+      env.DB.prepare(
+        `UPDATE hire_rfqs SET status = 'matched', accepted_quote_id = ?2, job_id = ?3, updated_at = datetime('now'), closed_at = datetime('now') WHERE id = ?1 AND status = 'open'`
+      ).bind(rfq.id, quoteId, jobId),
+      env.DB.prepare(
+        `UPDATE hire_quotes SET status = 'accepted', updated_at = datetime('now') WHERE id = ?1`
+      ).bind(quoteId),
+      env.DB.prepare(
+        `UPDATE hire_quotes SET status = 'rejected', updated_at = datetime('now') WHERE rfq_id = ?1 AND id != ?2 AND status = 'open'`
+      ).bind(rfq.id, quoteId),
+      env.DB.prepare(
+        `INSERT INTO hire_jobs (id, rfq_id, quote_id, buyer_repo, provider_repo, amount_usd, task, status, created_by, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'held', ?8, datetime('now'), datetime('now'))`
+      ).bind(jobId, rfq.id, quoteId, buyer, provider, amount, rfq.task, authUser.id),
+      env.DB.prepare(
+        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms) VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+      ).bind(buyer, SYSTEM_HIRE, amount, "hire-hold:" + jobId, Date.now() - t0),
     ]);
   } catch (e) {
-    await env.DB.prepare(`UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`).bind(amount, buyer).run().catch(() => {});
+    await env.DB.prepare(
+      `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
+    ).bind(amount, buyer).run().catch(() => {});
     if (debitRes.credit_drawn > 0) {
-      await env.DB.prepare(`UPDATE agent_limits SET outstanding_credit = MAX(0, COALESCE(outstanding_credit, 0) - ?2), updated_at = datetime('now') WHERE repo_id = ?1`).bind(buyer, debitRes.credit_drawn).run().catch(() => {});
+      await env.DB.prepare(
+        `UPDATE agent_limits SET outstanding_credit = MAX(0, COALESCE(outstanding_credit, 0) - ?2), updated_at = datetime('now') WHERE repo_id = ?1`
+      ).bind(buyer, debitRes.credit_drawn).run().catch(() => {});
     }
     return bad(request, "Accept failed: " + (e.message || e), 500);
   }
   await safetyRecordSpend(env, authUser, buyer, amount);
   await logHireEvent(env, { rfq_id: rfq.id, quote_id: quoteId, job_id: jobId, event: "accepted", actor_repo: buyer, amount });
-  if (rfq.created_by) scheduleWebhook(ctx, env, rfq.created_by, "hire.accepted", { rfq_id: rfq.id, quote_id: quoteId, job_id: jobId, buyer_repo: buyer, provider_repo: provider, amount_usd: amount, status: "held", passport_warnings: passportEval.warnings });
-  return json(request, { ok: true, job: { id: jobId, rfq_id: rfq.id, quote_id: quoteId, buyer_repo: buyer, provider_repo: provider, amount_usd: amount, task: rfq.task, status: "held" }, provider_passport: passportEval.claims, passport_warnings: passportEval.warnings, passport_gate: passportEval.warnings.length ? "soft_warn" : "clear", latency_ms: Date.now() - t0, hint: "Provider delivers work. Buyer POST /api/hire/complete { job_id } to pay out." });
+  if (rfq.created_by) scheduleWebhook(ctx, env, rfq.created_by, "hire.accepted", {
+    rfq_id: rfq.id, quote_id: quoteId, job_id: jobId, buyer_repo: buyer, provider_repo: provider, amount_usd: amount, status: "held",
+    passport_warnings: passportEval.warnings,
+    instance_id: activeInstance ? activeInstance.id : null,
+  });
+  return json(request, {
+    ok: true,
+    job: { id: jobId, rfq_id: rfq.id, quote_id: quoteId, buyer_repo: buyer, provider_repo: provider, amount_usd: amount, task: rfq.task, status: "held" },
+    instance_id: activeInstance ? activeInstance.id : undefined,
+    provider_passport: passportEval.claims,
+    passport_warnings: passportEval.warnings,
+    passport_gate: passportEval.warnings.length ? "soft_warn" : "clear",
+    latency_ms: Date.now() - t0,
+    hint: "Provider delivers work. Buyer POST /api/hire/complete { job_id } to pay out.",
+  });
 }
 
 export async function handleHireComplete(request, env, ctx) {
@@ -282,13 +341,17 @@ export async function handleHireComplete(request, env, ctx) {
   if (!isBuyer) return bad(request, "Only the buyer can complete / release this job", 403);
   applyScopeVerb(authUser, "hire", job.provider_repo);
   const amount = Number(job.amount_usd);
-  const claim = await env.DB.prepare(`UPDATE hire_jobs SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'held' RETURNING *`).bind(jobId).first();
+  const claim = await env.DB.prepare(
+    `UPDATE hire_jobs SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'held' RETURNING *`
+  ).bind(jobId).first();
   if (!claim) return bad(request, "Complete race", 409);
   await ensureAccount(env, job.provider_repo);
   await ensureAccount(env, SYSTEM_HIRE);
   await env.DB.batch([
     env.DB.prepare(`UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`).bind(amount, job.provider_repo),
-    env.DB.prepare(`INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms) VALUES (?1, ?2, ?3, ?4, 'success', ?5)`).bind(SYSTEM_HIRE, job.provider_repo, amount, "hire-complete:" + jobId + ":" + (job.task || "").slice(0, 40), Date.now() - t0),
+    env.DB.prepare(
+      `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms) VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+    ).bind(SYSTEM_HIRE, job.provider_repo, amount, "hire-complete:" + jobId + ":" + (job.task || "").slice(0, 40), Date.now() - t0),
   ]);
   await logHireEvent(env, { rfq_id: job.rfq_id, quote_id: job.quote_id, job_id: jobId, event: "completed", actor_repo: job.buyer_repo, amount });
   await adjustRep(env, job.provider_repo, CREDIT_REP_SUCCESS_BONUS, "hire_complete", jobId);
@@ -311,13 +374,17 @@ export async function handleHireCancel(request, env, ctx) {
     if (job.status !== "held") return bad(request, "Job not cancellable (status=" + job.status + ")", 400);
     const allowed = authUser.id === job.created_by || (authUser.default_repo && authUser.default_repo === job.buyer_repo);
     if (!allowed) return bad(request, "Not authorized", 403);
-    const claim = await env.DB.prepare(`UPDATE hire_jobs SET status = 'cancelled', cancelled_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'held' RETURNING *`).bind(jobId).first();
+    const claim = await env.DB.prepare(
+      `UPDATE hire_jobs SET status = 'cancelled', cancelled_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'held' RETURNING *`
+    ).bind(jobId).first();
     if (!claim) return bad(request, "Cancel race", 409);
     const amount = Number(job.amount_usd);
     await ensureAccount(env, job.buyer_repo);
     await env.DB.batch([
       env.DB.prepare(`UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`).bind(amount, job.buyer_repo),
-      env.DB.prepare(`INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms) VALUES (?1, ?2, ?3, ?4, 'success', ?5)`).bind(SYSTEM_HIRE, job.buyer_repo, amount, "hire-cancel-refund:" + jobId, Date.now() - t0),
+      env.DB.prepare(
+        `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms) VALUES (?1, ?2, ?3, ?4, 'success', ?5)`
+      ).bind(SYSTEM_HIRE, job.buyer_repo, amount, "hire-cancel-refund:" + jobId, Date.now() - t0),
     ]);
     await logHireEvent(env, { rfq_id: job.rfq_id, job_id: jobId, event: "job_cancelled", actor_repo: job.buyer_repo, amount });
     return json(request, { ok: true, job_id: jobId, status: "cancelled", refunded: amount, latency_ms: Date.now() - t0 });
@@ -328,8 +395,12 @@ export async function handleHireCancel(request, env, ctx) {
   if (rfq.status !== "open") return bad(request, "RFQ not open (status=" + rfq.status + ")", 400);
   const allowed = authUser.id === rfq.created_by || (authUser.default_repo && authUser.default_repo === rfq.buyer_repo);
   if (!allowed) return bad(request, "Not authorized", 403);
-  await env.DB.prepare(`UPDATE hire_rfqs SET status = 'cancelled', closed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'open'`).bind(rfqId).run();
-  await env.DB.prepare(`UPDATE hire_quotes SET status = 'rejected', updated_at = datetime('now') WHERE rfq_id = ?1 AND status = 'open'`).bind(rfqId).run();
+  await env.DB.prepare(
+    `UPDATE hire_rfqs SET status = 'cancelled', closed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'open'`
+  ).bind(rfqId).run();
+  await env.DB.prepare(
+    `UPDATE hire_quotes SET status = 'rejected', updated_at = datetime('now') WHERE rfq_id = ?1 AND status = 'open'`
+  ).bind(rfqId).run();
   await logHireEvent(env, { rfq_id: rfqId, event: "rfq_cancelled", actor_repo: rfq.buyer_repo });
   return json(request, { ok: true, rfq_id: rfqId, status: "cancelled", latency_ms: Date.now() - t0 });
 }
@@ -340,8 +411,18 @@ export async function handleHireGet(request, env, id) {
   const rfq = await loadHireRfq(env, id);
   if (rfq) {
     let quotes = [], events = [];
-    try { const q = await env.DB.prepare(`SELECT id, provider_repo, amount_usd, eta_seconds, note, status, created_at FROM hire_quotes WHERE rfq_id = ?1 ORDER BY created_at ASC`).bind(id).all(); quotes = q.results || []; } catch (_) {}
-    try { const q = await env.DB.prepare(`SELECT event, actor_repo, amount, note, created_at FROM hire_events WHERE rfq_id = ?1 ORDER BY created_at DESC LIMIT 40`).bind(id).all(); events = q.results || []; } catch (_) {}
+    try {
+      const q = await env.DB.prepare(
+        `SELECT id, provider_repo, amount_usd, eta_seconds, note, status, created_at FROM hire_quotes WHERE rfq_id = ?1 ORDER BY created_at ASC`
+      ).bind(id).all();
+      quotes = q.results || [];
+    } catch (_) {}
+    try {
+      const q = await env.DB.prepare(
+        `SELECT event, actor_repo, amount, note, created_at FROM hire_events WHERE rfq_id = ?1 ORDER BY created_at DESC LIMIT 40`
+      ).bind(id).all();
+      events = q.results || [];
+    } catch (_) {}
     let job = null;
     if (rfq.job_id) job = await loadHireJob(env, rfq.job_id);
     return json(request, { ok: true, type: "rfq", rfq, quotes, job, events });
@@ -379,11 +460,17 @@ export async function expireHireRfqs(env, ctx) {
   const t0 = Date.now();
   let expired = 0, refundedJobs = 0;
   try {
-    const q = await env.DB.prepare(`SELECT id, created_by FROM hire_rfqs WHERE status = 'open' AND expires_at IS NOT NULL AND expires_at < datetime('now') ORDER BY expires_at ASC LIMIT ?1`).bind(EXPIRE_HIRE_BATCH).all();
+    const q = await env.DB.prepare(
+      `SELECT id, created_by FROM hire_rfqs WHERE status = 'open' AND expires_at IS NOT NULL AND expires_at < datetime('now') ORDER BY expires_at ASC LIMIT ?1`
+    ).bind(EXPIRE_HIRE_BATCH).all();
     for (const row of q.results || []) {
       try {
-        await env.DB.prepare(`UPDATE hire_rfqs SET status = 'expired', closed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'open'`).bind(row.id).run();
-        await env.DB.prepare(`UPDATE hire_quotes SET status = 'expired', updated_at = datetime('now') WHERE rfq_id = ?1 AND status = 'open'`).bind(row.id).run();
+        await env.DB.prepare(
+          `UPDATE hire_rfqs SET status = 'expired', closed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND status = 'open'`
+        ).bind(row.id).run();
+        await env.DB.prepare(
+          `UPDATE hire_quotes SET status = 'expired', updated_at = datetime('now') WHERE rfq_id = ?1 AND status = 'open'`
+        ).bind(row.id).run();
         await logHireEvent(env, { rfq_id: row.id, event: "rfq_expired" });
         expired += 1;
         if (row.created_by) scheduleWebhook(ctx, env, row.created_by, "hire.rfq_expired", { id: row.id, status: "expired" });
