@@ -1,6 +1,9 @@
-/** 
+/**
  * Scoped API keys — least-privilege verbs, amount ceilings, to_repo allowlists.
  * Scope denials are recorded to security_events (immutable audit) + denial-storm check.
+ *
+ * CRITICAL: empty create body (normal dashboard key) → legacy full access.
+ * Never default to ["read"] only.
  */
 import { afterScopeDeny } from "./securityLog.js";
 
@@ -48,6 +51,16 @@ export function parseScopes(raw) {
       legacy: true,
     };
   }
+  // Explicit full / legacy markers
+  if (obj.legacy === true || obj.full === true || obj.verbs === "*" || obj.verbs === "all") {
+    return {
+      v: 1,
+      verbs: null,
+      max_amount_usd: null,
+      to_repo_allow: null,
+      legacy: true,
+    };
+  }
   let verbs = null;
   if (Array.isArray(obj.verbs)) {
     const set = new Set();
@@ -57,9 +70,8 @@ export function parseScopes(raw) {
         .trim();
       if (SCOPE_VERBS.includes(s)) set.add(s);
     }
-    verbs = Array.from(set);
-  } else if (obj.legacy === true || obj.full === true) {
-    verbs = null;
+    // Empty array after filter → treat as legacy full (never silent read-only)
+    verbs = set.size ? Array.from(set) : null;
   }
   let maxAmt = null;
   if (obj.max_amount_usd != null && obj.max_amount_usd !== "") {
@@ -103,6 +115,11 @@ function normalizeRepoAllowList(list) {
   return out.length ? out : null;
 }
 
+/**
+ * Build scopes from key create / rotate body.
+ * No verbs / no preset / no scopes field → full legacy (normal key).
+ * Only explicit preset or verbs list creates a restricted key.
+ */
 export function scopesFromCreateBody(body) {
   body = body || {};
   if (body.full === true || body.legacy === true || body.unscoped === true) {
@@ -114,6 +131,24 @@ export function scopesFromCreateBody(body) {
       legacy: true,
     };
   }
+
+  const hasExplicit =
+    Array.isArray(body.scopes) ||
+    Array.isArray(body.verbs) ||
+    (typeof body.scope === "string" && body.scope.trim()) ||
+    (body.preset != null && String(body.preset).trim() !== "");
+
+  // Normal dashboard create: empty body → FULL ACCESS
+  if (!hasExplicit) {
+    return {
+      v: 1,
+      verbs: null,
+      max_amount_usd: null,
+      to_repo_allow: null,
+      legacy: true,
+    };
+  }
+
   let verbs = null;
   if (Array.isArray(body.scopes)) {
     verbs = body.scopes;
@@ -122,28 +157,43 @@ export function scopesFromCreateBody(body) {
   } else if (typeof body.scope === "string") {
     verbs = body.scope.split(/[,\s]+/);
   } else if (body.preset) {
-    const p = String(body.preset).toLowerCase();
+    const p = String(body.preset).toLowerCase().trim();
+    if (p === "full" || p === "legacy" || p === "all" || p === "unscoped") {
+      return parseScopes({ full: true });
+    }
     if (p === "read" || p === "readonly") verbs = ["read"];
     else if (p === "pay" || p === "agent") verbs = ["read", "pay"];
     else if (p === "hire") verbs = ["read", "hire"];
     else if (p === "money") verbs = ["read", "pay", "escrow", "stream"];
-    else if (p === "full") {
+    else {
+      // Unknown preset → full, not silent read-only
       return parseScopes({ full: true });
-    } else verbs = ["read"];
-  } else {
-    verbs = ["read"];
+    }
   }
+
   const parsed = parseScopes({
     verbs,
     max_amount_usd: body.max_amount_usd ?? body.max_amount ?? body.maxAmount,
     to_repo_allow: body.to_repo_allow ?? body.allow_to ?? body.to_allow,
   });
+
+  // Explicit restricted list that filtered to empty → still full, not ["read"]
   if (!parsed.legacy && (!parsed.verbs || parsed.verbs.length === 0)) {
-    parsed.verbs = ["read"];
+    return {
+      v: 1,
+      verbs: null,
+      max_amount_usd: null,
+      to_repo_allow: null,
+      legacy: true,
+    };
   }
   return parsed;
 }
 
+/**
+ * Persist scopes. legacy → null in DB (parseScopes treats null as full).
+ * Restricted → JSON with verbs array.
+ */
 export function scopesToJson(scopes) {
   if (!scopes || scopes.legacy || scopes.verbs === null) {
     return null;
@@ -286,12 +336,8 @@ export function rejectKeyScope(request, envOrAuth, authOrVerb, verbOrOpts, optsO
   const hit = checkKeyScope(authUser, verb, opts || {});
   if (!hit) return null;
 
-  // Audit + anomaly (async fire — caller should await this function)
-  // Note: callers using non-async path still get the Response; event is best-effort
   if (env && authUser && authUser.auth_via === "api_key") {
     try {
-      // schedule without blocking if no await — but we return sync Response below
-      // Callers that await rejectKeyScopeAsync should use the async variant.
       const p = afterScopeDeny(env, request, {
         authUser,
         verb,
