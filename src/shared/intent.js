@@ -27,10 +27,6 @@ import {
 } from "./constants.js";
 
 /* ─── Spend Intent Capsules ───
- * Pre-authorize a time-boxed, amount-capped spend envelope.
- * Create locks budget into system/intent; spend draws remaining under allowlist;
- * cancel/expire refunds remainder to from_repo.
- *
  * POST /api/intent/create  { from_repo?, budget, allow_to?, task_prefix?, max_per_spend?, ttl_seconds?, label? }
  * POST /api/intent/spend   { id, to_repo, amount, task? }
  * POST /api/intent/cancel  { id }
@@ -64,7 +60,6 @@ export function parseAllowTo(v) {
       }
     } catch (_) {}
   }
-  // comma-separated
   const list = s.split(",").map((x) => parseRepo(x.trim())).filter(Boolean);
   return list.length ? JSON.stringify(list) : null;
 }
@@ -303,7 +298,6 @@ export async function handleIntentSpend(request, env, ctx) {
     }
   }
 
-  // Authz: creator session or matching default_repo / from_repo
   const allowed =
     authUser.id === row.created_by ||
     (authUser.default_repo && authUser.default_repo === row.from_repo);
@@ -333,7 +327,6 @@ export async function handleIntentSpend(request, env, ctx) {
     });
   }
 
-  // Claim remaining atomically
   const claim = await env.DB.prepare(
     `UPDATE intent_capsules
      SET remaining_usd = remaining_usd - ?2,
@@ -368,7 +361,6 @@ export async function handleIntentSpend(request, env, ctx) {
       ),
     ]);
   } catch (e) {
-    // rollback remaining
     await env.DB.prepare(
       `UPDATE intent_capsules
        SET remaining_usd = remaining_usd + ?2, status = 'open', closed_at = NULL, updated_at = datetime('now')
@@ -621,5 +613,3 @@ export async function expireIntentCapsules(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
-
-
