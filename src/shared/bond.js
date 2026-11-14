@@ -29,14 +29,6 @@ import {
   CREDIT_REP_FAIL_PENALTY,
 } from "./constants.js";
 
-/* ─── Intent bonds (graded commitment) ───
- * Lifecycle: open → matched → fulfilled | slashed | expired | cancelled
- * Poster locks bond_amount into system/bond.
- * Match: counterparty attests intent is accepted.
- * Fulfill: full refund of bond to poster.
- * Slash: fraction (slash_bps or body.slash_bps) → system/slash-pool; rest → poster.
- * Expire open: full refund. Expire matched past match_expires: auto-slash default bps.
- */
 export function parseBondTtl(body, field, def) {
   const sec = Number(body[field] ?? body.ttl);
   if (Number.isFinite(sec)) {
@@ -389,7 +381,6 @@ export async function handleBondSlash(request, env, ctx) {
     return bad(request, "Bond not slashable (status=" + row.status + ")");
   }
 
-  // Matcher or poster (or reserved counterparty) may slash
   const allowed =
     authUser.id === row.matched_by ||
     authUser.id === row.created_by ||
@@ -613,7 +604,6 @@ export async function expireBonds(env, ctx) {
   let refundedTotal = 0;
   let slashedTotal = 0;
 
-  // 1) Open past expires_at → full refund + expired
   try {
     const q = await env.DB.prepare(
       `SELECT * FROM intent_bonds
@@ -665,7 +655,6 @@ export async function expireBonds(env, ctx) {
     return { expired_open: 0, expired_match: 0, error: e.message, latency_ms: Date.now() - t0 };
   }
 
-  // 2) Matched past match_expires_at → default slash
   try {
     const q = await env.DB.prepare(
       `SELECT * FROM intent_bonds
@@ -754,5 +743,3 @@ export async function expireBonds(env, ctx) {
     latency_ms: Date.now() - t0,
   };
 }
-
-
