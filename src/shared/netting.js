@@ -1,5 +1,5 @@
 /**
- * Shared Netting — bilateral obligation netting (soft/hard settle).
+ * Shared Netting — bilateral obligation netting (soft/hard settle). 
  */
 import { json, bad } from "./http.js";
 import {
