@@ -1,5 +1,5 @@
 /**
- * Shared Bond — intent bonds (post/match/fulfill/slash/cancel) + expireBonds cron.
+ * Shared Bond — intent bonds (post/match/fulfill/slash/cancel) + expireBonds cron. 
  */
 import { json, bad } from "./http.js";
 import {
