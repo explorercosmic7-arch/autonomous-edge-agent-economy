@@ -373,7 +373,6 @@ export async function handlePoolRelease(request, env, ctx) {
   const funded = Number(pool.funded_amount || 0);
   if (funded <= 0) return bad(request, "Nothing funded to release", 400);
 
-  // Default: require fully funded unless force=true (creator only)
   const force = body.force === true;
   if (pool.status !== "funded" && funded < Number(pool.target_amount)) {
     if (!force || authUser.id !== pool.created_by) {
@@ -685,5 +684,3 @@ export async function expireCollaborativePools(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
-
-
