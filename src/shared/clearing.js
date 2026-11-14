@@ -22,16 +22,6 @@ import {
   RL_CLEARING_WINDOW_SEC,
 } from "./constants.js";
 
-/* ─── Cross-deployment clearing netting ───
- * Multilateral net positions over bilateral micro-pays in a time window.
- * Produces HMAC-SHA256 settlement manifest (RECEIPT_SECRET) for external rails.
- * Optional apply_balances: move net amounts via system/clearing.
- *
- * POST /api/clearing/run { window_hours?, apply_balances?, deployment_id? }
- * GET  /api/clearing?limit=
- * GET  /api/clearing/:id  → batch + positions + settlement + hmac
- */
-
 export function clearingSecret(env) {
   return env.RECEIPT_SECRET || env.SESSION_SECRET || env.GOOGLE_CLIENT_SECRET || "a2a-dev-receipt-secret";
 }
@@ -39,7 +29,6 @@ export function clearingSecret(env) {
 export async function hmacSettlement(env, canonicalJson) {
   return hmacSha256Hex(clearingSecret(env), canonicalJson);
 }
-
 
 export async function handleClearingRun(request, env, ctx) {
   const t0 = Date.now();
@@ -70,7 +59,6 @@ export async function handleClearingRun(request, env, ctx) {
   const applyBalances = !!body.apply_balances;
   const deploymentId = String(body.deployment_id || body.deployment || "default").slice(0, 120);
 
-  // Aggregate bilateral pays in window (exclude system/* counterparties)
   let txs = [];
   try {
     const q = await env.DB.prepare(
@@ -88,8 +76,7 @@ export async function handleClearingRun(request, env, ctx) {
     return bad(request, "transactions query failed: " + (e.message || e), 500);
   }
 
-  // Net position per repo: +in -out
-  const pos = new Map(); // repo -> { out, in }
+  const pos = new Map();
   let gross = 0;
   for (const t of txs) {
     const a = Number(t.amount) || 0;
@@ -117,7 +104,7 @@ export async function handleClearingRun(request, env, ctx) {
     });
     volumeNet += Math.abs(net);
   }
-  volumeNet = Math.round((volumeNet / 2) * 1e6) / 1e6; // each $ counted twice in abs sum
+  volumeNet = Math.round((volumeNet / 2) * 1e6) / 1e6;
   const volumeSaved = Math.max(0, Math.round((gross - volumeNet) * 1e6) / 1e6);
 
   if (positions.length > CLEARING_MAX_REPOS) {
@@ -148,7 +135,6 @@ export async function handleClearingRun(request, env, ctx) {
   const settlementJson = JSON.stringify(settlement);
   const settlementHmac = await hmacSettlement(env, settlementJson);
 
-  // Optional hard settle: payers (net < 0) → system/clearing → receivers (net > 0)
   let applied = 0;
   if (applyBalances && positions.length) {
     await ensureAccount(env, SYSTEM_CLEARING);
@@ -162,10 +148,7 @@ export async function handleClearingRun(request, env, ctx) {
       )
         .bind(need, p.repo_id)
         .first();
-      if (!deb) {
-        // skip underfunded; leave net unsettled for this repo
-        continue;
-      }
+      if (!deb) continue;
       await env.DB.prepare(
         `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
       )
@@ -256,7 +239,6 @@ export async function handleClearingRun(request, env, ctx) {
     );
   }
 
-  // Also mint an HMAC receipt record for the settlement (cross-deployment verify)
   try {
     const rid = "rcpt_clr_" + randomId(10);
     const rPayload = {
@@ -345,7 +327,6 @@ export async function handleClearingGet(request, env, id) {
     settlement = batch.settlement_json;
   }
 
-  // Recompute HMAC for verification convenience
   let hmac_ok = null;
   if (batch.settlement_json && batch.settlement_hmac) {
     const expect = await hmacSettlement(env, batch.settlement_json);
@@ -393,5 +374,3 @@ export async function handleClearingList(request, url, env) {
     );
   }
 }
-
-
