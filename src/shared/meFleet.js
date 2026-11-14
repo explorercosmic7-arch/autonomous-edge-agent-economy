@@ -1,7 +1,6 @@
 /**
  * Me fleet — GET|POST /api/me/fleet
  * Account-wide daily/monthly spend caps (fleet_limits).
- * Auth: session cookie OR API key (same user_id as key owner).
  */
 import { json, bad } from "./http.js";
 import { getAuthUser, rejectIfSuspendedKey } from "./auth.js";
@@ -55,7 +54,6 @@ export async function handleMeFleetSet(request, env) {
   if (auth.error) return auth.error;
   const user = auth.user;
 
-  // Optional: only session can *change* caps (keep agents from self-raising limits)
   if (user.auth_via === "api_key") {
     return bad(request, "Fleet limits can only be changed from the signed-in dashboard", 403, {
       code: "fleet_session_only",
