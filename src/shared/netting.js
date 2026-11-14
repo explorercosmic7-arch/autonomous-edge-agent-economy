@@ -275,5 +275,3 @@ export async function handleNettingList(request, url, env) {
     );
   }
 }
-
-
