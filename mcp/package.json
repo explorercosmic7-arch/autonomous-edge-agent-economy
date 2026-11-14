@@ -1,7 +1,7 @@
 {
   "name": "agentpay-mcp",
-  "version": "0.2.0",
-  "description": "MCP server for AgentPay — Stage 1 tools over the live edge Worker (health, balance, ledger, passport, agents search/list/rank, pay+instance, hire full path, standing orders)",
+  "version": "0.3.0",
+  "description": "MCP server for AgentPay — Stage 1+2 tools (pay, hire, standing, agents, escrow, stream, intent, work, split, ledger, passport)",
   "type": "module",
   "bin": {
     "agentpay-mcp": "./src/server.js"
@@ -22,9 +22,11 @@
     "agentpay",
     "agents",
     "payments",
-    "standing-orders",
-    "hire",
-    "passport"
+    "escrow",
+    "stream",
+    "intent",
+    "work",
+    "split"
   ],
   "license": "MIT"
 }
