@@ -1,5 +1,5 @@
 /**
- * Shared Saga — multi-step payment graphs + compensate/cancel + expireSagas cron.
+ * Shared Saga — multi-step payment graphs + compensate/cancel + expireSagas cron. 
  */
 import { json, bad } from "./http.js";
 import {
