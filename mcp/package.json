@@ -1,7 +1,7 @@
 {
   "name": "agentpay-mcp",
-  "version": "0.4.0",
-  "description": "MCP server for AgentPay — Stages 1–3 (pay, hire, standing, agents, escrow, stream, intent, work, split, pool, bond, commit, ticket, saga, netting, clearing, ledger, passport)",
+  "version": "0.5.0",
+  "description": "MCP server for AgentPay — Stages 1–4 (pay, hire, standing, agents, escrow, stream, intent, work, split, pool, bond, commit, ticket, saga, netting, clearing, instances, will, delegate, subwallet, dispute, ledger, passport)",
   "type": "module",
   "bin": { "agentpay-mcp": "./src/server.js" },
   "main": "./src/server.js",
@@ -11,4 +11,3 @@
   "keywords": ["mcp", "agentpay", "agents", "payments"],
   "license": "MIT"
 }
- 
