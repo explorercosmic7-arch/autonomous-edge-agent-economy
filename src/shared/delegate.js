@@ -1,6 +1,5 @@
 /**
  * Shared Delegation — parent authority / child pocket money + expireDelegations cron.
- * Scoped API keys: applyScopeVerb(authUser, "pay", ...) on open (locks parent funds).
  */
 import { json, bad } from "./http.js";
 import {
@@ -231,7 +230,6 @@ export async function handleDelegateOpen(request, env, ctx) {
       code: "child_key_not_yours",
     });
   }
-  // Opening a delegation spends parent funds — requires pay scope
   applyScopeVerb(authUser, "pay", SYSTEM_DELEGATE);
   authUser._policyCtx = { to_repo: SYSTEM_DELEGATE, task: "delegate:open" };
   const blocked = await safetyGate(request, env, authUser, parentRepo, budget);
@@ -259,18 +257,8 @@ export async function handleDelegateOpen(request, env, ctx) {
            ?11, ?12, datetime('now'), datetime('now')
          )`
       ).bind(
-        id,
-        parentRepo,
-        childKeyId,
-        childRepo,
-        budget,
-        allowTo,
-        taskPrefix,
-        maxPer,
-        ttlSec,
-        modifier,
-        label,
-        authUser.id
+        id, parentRepo, childKeyId, childRepo, budget,
+        allowTo, taskPrefix, maxPer, ttlSec, modifier, label, authUser.id
       ),
       env.DB.prepare(
         `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms)
