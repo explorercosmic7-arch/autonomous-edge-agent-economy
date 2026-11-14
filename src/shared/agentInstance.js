@@ -3,21 +3,6 @@
  *
  * Agents are first-class instances (not bare repo strings).
  * State: created → funded → active → paused → retired
- *
- * Routes (wire in index.js):
- *   POST /api/instances              create
- *   GET  /api/instances              list mine
- *   GET  /api/instances/:id          get one
- *   POST /api/instances/:id/fund     created|funded → funded (optionally auto-active)
- *   POST /api/instances/:id/activate funded → active
- *   POST /api/instances/:id/pause    active → paused
- *   POST /api/instances/:id/resume   paused → active
- *   POST /api/instances/:id/retire   * → retired (terminal)
- *   POST /api/instances/freeze       emergency: pause one or all under account
- *
- * Gate helpers (pay / hire / work):
- *   assertInstanceOperable(env, instanceId)
- *   maybeAssertInstanceFromBody(env, body, request?)
  */
 import { json, bad } from "./http.js";
 import { parseRepo, parseAmount, randomId } from "./utils.js";
@@ -75,7 +60,6 @@ export async function ensureAgentInstancesTable(env) {
   }
 }
 
-/** Alias used by some call sites */
 export async function ensureAgentInstanceTable(env) {
   return ensureAgentInstancesTable(env);
 }
@@ -124,10 +108,6 @@ export async function loadInstance(env, id) {
   return getInstanceById(env, id);
 }
 
-/**
- * Gate for pay / hire / work.
- * @returns {{ ok: true, instance } | { ok: false, error, code, status, instance? }}
- */
 export async function assertInstanceOperable(env, instanceId, opts = {}) {
   const allow = opts.allowStatuses || AGENT_INSTANCE_OPERABLE || ["active"];
   if (!instanceId) {
@@ -170,7 +150,6 @@ export async function assertInstanceOperable(env, instanceId, opts = {}) {
   return { ok: true, instance: rowPublic(row) };
 }
 
-/** Optional gate: if body/header has instance_id, enforce; if missing, allow (legacy). */
 export async function maybeAssertInstanceFromBody(env, body, requestOrOpts) {
   let request = null;
   let opts = {};
@@ -237,9 +216,6 @@ async function logLife(env, request, kind, severity, user, row, reason, extraMet
   }
 }
 
-/* ─── Routes ─── */
-
-/** POST /api/instances  { repo, label?, meta? } */
 export async function handleInstanceCreate(request, env) {
   const { user, error } = await requireSession(request, env);
   if (error) return error;
@@ -310,7 +286,6 @@ export async function handleInstanceCreate(request, env) {
   return json(request, { ok: true, instance: rowPublic(row) });
 }
 
-/** GET /api/instances?status=&limit= */
 export async function handleInstanceList(request, url, env) {
   const { user, error } = await requireSession(request, env);
   if (error) return error;
@@ -350,17 +325,12 @@ export async function handleInstanceList(request, url, env) {
   });
 }
 
-/** GET /api/instances/:id */
 export async function handleInstanceGet(request, env, id) {
   const { row, error } = await requireOwnerInstance(request, env, id);
   if (error) return error;
   return json(request, { ok: true, instance: rowPublic(row) });
 }
 
-/**
- * POST /api/instances/:id/fund
- * Body: { amount?, activate?: true }
- */
 export async function handleInstanceFund(request, env, id) {
   const { user, row, error } = await requireOwnerInstance(request, env, id);
   if (error) return error;
@@ -418,7 +388,6 @@ export async function handleInstanceFund(request, env, id) {
   return json(request, { ok: true, instance: rowPublic(updated) });
 }
 
-/** POST /api/instances/:id/activate */
 export async function handleInstanceActivate(request, env, id) {
   const { user, row, error } = await requireOwnerInstance(request, env, id);
   if (error) return error;
@@ -467,7 +436,6 @@ export async function handleInstanceActivate(request, env, id) {
   return json(request, { ok: true, instance: rowPublic(updated) });
 }
 
-/** POST /api/instances/:id/pause */
 export async function handleInstancePause(request, env, id) {
   const { user, row, error } = await requireOwnerInstance(request, env, id);
   if (error) return error;
@@ -496,7 +464,6 @@ export async function handleInstancePause(request, env, id) {
   return json(request, { ok: true, instance: rowPublic(updated) });
 }
 
-/** POST /api/instances/:id/resume */
 export async function handleInstanceResume(request, env, id) {
   const { user, row, error } = await requireOwnerInstance(request, env, id);
   if (error) return error;
@@ -523,7 +490,6 @@ export async function handleInstanceResume(request, env, id) {
   return json(request, { ok: true, instance: rowPublic(updated) });
 }
 
-/** POST /api/instances/:id/retire */
 export async function handleInstanceRetire(request, env, id) {
   const { user, row, error } = await requireOwnerInstance(request, env, id);
   if (error) return error;
@@ -549,10 +515,6 @@ export async function handleInstanceRetire(request, env, id) {
   return json(request, { ok: true, instance: rowPublic(updated) });
 }
 
-/**
- * POST /api/instances/freeze
- * Body: { instance_id? } — one id, or omit to pause ALL non-retired under account
- */
 export async function handleInstanceFreeze(request, env) {
   const { user, error } = await requireSession(request, env);
   if (error) return error;
