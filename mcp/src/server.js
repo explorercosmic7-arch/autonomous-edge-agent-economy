@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentPay MCP Server v0.5.0 — Stage 1–4
+ * AgentPay MCP Server v0.6.0 — Stage 1–5
  *
  * Thin adapter: MCP tools → live Cloudflare Worker APIs.
  * No new ledger. No second database.
@@ -20,6 +20,12 @@
  *   delegate (open/revoke/get/list)
  *   subwallet (open/spend/close/list)
  *   dispute (open/accept/vote/execute/cancel/get/list)
+ * Stage 5:
+ *   continuity (open/beat/close/recover/get/list)
+ *   shield (get/set helpers via API if exposed)
+ *   approvals (settings/list/decide)
+ *   fleet (get/set)
+ *   receipts (get/verify) + traces (get)
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -1696,6 +1702,203 @@ const TOOLS = [
     },
   },
 
+,
+
+  /* ─── Stage 5: Continuity ─── */
+  {
+    name: "agentpay_continuity_open",
+    description: "Open heartbeat continuity session. Optional bond + recovery_action refund|successor|slash_refund.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner_repo: { type: "string" },
+        successor_repo: { type: "string" },
+        interval_sec: { type: "number" },
+        grace_sec: { type: "number" },
+        miss_limit: { type: "number" },
+        bond_usd: { type: "number" },
+        recovery_action: { type: "string", enum: ["refund", "successor", "slash_refund"] },
+        slash_bps: { type: "number" },
+        ref_type: { type: "string" },
+        ref_id: { type: "string" },
+        label: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_continuity_beat",
+    description: "Heartbeat before next_deadline_at.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        note: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_continuity_close",
+    description: "Owner closes session; refunds bond.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_continuity_recover",
+    description: "Manual recover after deadline passed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_continuity_get",
+    description: "Get continuity session + events.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_continuity_list",
+    description: "List continuity sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string", enum: ["active", "recovered", "closed", "expired"] },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 5: Approvals ─── */
+  {
+    name: "agentpay_approvals_list",
+    description: "List approval requests for the signed-in account.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_approvals_decide",
+    description: "Approve or reject a pending approval. Then retry pay with X-Approval-Id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        decision: { type: "string", enum: ["approve", "reject"] },
+        note: { type: "string" },
+      },
+      required: ["id", "decision"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_approval_settings_get",
+    description: "Get approval settings (thresholds, prefixes, new counterparty).",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_approval_settings_set",
+    description: "Update approval settings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        enabled: { type: "boolean" },
+        approve_over_usd: { type: "number" },
+        alert_over_usd: { type: "number" },
+        approve_new_counterparty: { type: "boolean" },
+        approve_task_prefixes: { type: "string", description: "comma-separated" },
+        ttl_seconds: { type: "number" },
+        warn_bps: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 5: Fleet ─── */
+  {
+    name: "agentpay_fleet_get",
+    description: "Get account fleet spend caps and remaining.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_fleet_set",
+    description: "Set fleet daily/monthly budgets (session only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        daily_budget: { type: "number" },
+        monthly_budget: { type: "number" },
+        warn_bps: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 5: Receipts + Traces ─── */
+  {
+    name: "agentpay_receipt_get",
+    description: "Get payment receipt by id.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_receipt_verify",
+    description: "Verify receipt HMAC. Pass id or payload+signature.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        payload: { type: "string" },
+        signature: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_trace_get",
+    description: "Get payment trace and related transactions.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+
 
 ];
 
@@ -2819,6 +3022,150 @@ async function callTool(name, args) {
     }
 
 
+
+    /* ─── Stage 5: Continuity ─── */
+    case "agentpay_continuity_open": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.owner_repo) body.owner_repo = String(args.owner_repo).trim();
+      if (args.successor_repo) body.successor_repo = String(args.successor_repo).trim();
+      if (args.interval_sec != null) body.interval_sec = Number(args.interval_sec);
+      if (args.grace_sec != null) body.grace_sec = Number(args.grace_sec);
+      if (args.miss_limit != null) body.miss_limit = Number(args.miss_limit);
+      if (args.bond_usd != null) body.bond_usd = Number(args.bond_usd);
+      if (args.recovery_action) body.recovery_action = String(args.recovery_action);
+      if (args.slash_bps != null) body.slash_bps = Number(args.slash_bps);
+      if (args.ref_type) body.ref_type = String(args.ref_type);
+      if (args.ref_id) body.ref_id = String(args.ref_id);
+      if (args.label) body.label = String(args.label);
+      const r = await api("/api/continuity/open", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_continuity_beat": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.note) body.note = String(args.note);
+      const r = await api("/api/continuity/beat", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_continuity_close": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/continuity/close", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_continuity_recover": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.reason) body.reason = String(args.reason);
+      const r = await api("/api/continuity/recover", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_continuity_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/continuity/" + encodeURIComponent(id));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_continuity_list": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status);
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/continuity" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 5: Approvals ─── */
+    case "agentpay_approvals_list": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.status) params.status = String(args.status);
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/me/approvals" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_approvals_decide": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        decision: String(args.decision || "").toLowerCase(),
+      };
+      if (args.note) body.note = String(args.note);
+      const r = await api("/api/me/approvals/decide", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_approval_settings_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/me/approval-settings");
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_approval_settings_set": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.enabled != null) body.enabled = !!args.enabled;
+      if (args.approve_over_usd != null) body.approve_over_usd = Number(args.approve_over_usd);
+      if (args.alert_over_usd != null) body.alert_over_usd = Number(args.alert_over_usd);
+      if (args.approve_new_counterparty != null) body.approve_new_counterparty = !!args.approve_new_counterparty;
+      if (args.approve_task_prefixes != null) body.approve_task_prefixes = String(args.approve_task_prefixes);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.warn_bps != null) body.warn_bps = Number(args.warn_bps);
+      const r = await api("/api/me/approval-settings", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 5: Fleet ─── */
+    case "agentpay_fleet_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/me/fleet");
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_fleet_set": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.daily_budget != null) body.daily_budget = Number(args.daily_budget);
+      if (args.monthly_budget != null) body.monthly_budget = Number(args.monthly_budget);
+      if (args.warn_bps != null) body.warn_bps = Number(args.warn_bps);
+      const r = await api("/api/me/fleet", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 5: Receipts + Traces ─── */
+    case "agentpay_receipt_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/receipt/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_receipt_verify": {
+      const body = {};
+      if (args.id) body.id = String(args.id).trim();
+      if (args.payload) body.payload = String(args.payload);
+      if (args.signature) body.signature = String(args.signature);
+      const r = await api("/api/receipt/verify", { method: "POST", body, auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_trace_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/trace/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+
+
     default:
       return textResult({ ok: false, error: "Unknown tool: " + name }, true);
   }
@@ -2828,7 +3175,7 @@ async function main() {
   const server = new Server(
     {
       name: "agentpay",
-      version: "0.5.0",
+      version: "0.6.0",
     },
     {
       capabilities: {
