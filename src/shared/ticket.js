@@ -23,12 +23,6 @@ import {
   EXPIRE_TICKET_BATCH,
 } from "./constants.js";
 
-/* ─── Capability tickets (spendable rights) ───
- * Mint: issuer debits optional USD bond + grants units of a capability string.
- * Transfer: holder → new holder (no unit change).
- * Redeem: burn units (and optional USD to service repo).
- * Capability is free-form: "model/gpt-tool", "api:vision", "can_call:foo".
- */
 export function parseTicketTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
   if (Number.isFinite(sec)) {
@@ -125,7 +119,6 @@ export async function handleTicketMint(request, env) {
     );
   }
 
-  // Optional USD bond locked from issuer (skin in the game)
   if (bond != null && bond > 0) {
     authUser._policyCtx = { to_repo: SYSTEM_TICKET, task };
     const blocked = await safetyGate(request, env, authUser, issuer, bond);
@@ -351,11 +344,9 @@ export async function handleTicketRedeem(request, env) {
 
   if (!claim) return bad(request, "Redeem failed (race or insufficient)", 409);
 
-  // Optional USD settlement to service provider
   if (amountUsd != null && amountUsd > 0 && payTo) {
     await ensureAccount(env, SYSTEM_TICKET);
     await ensureAccount(env, payTo);
-    // Pay from system/ticket bond pool if funded; else from holder (soft fail)
     const fromBond = await env.DB.prepare(
       `UPDATE accounts SET balance = balance - ?1, updated_at = datetime('now')
        WHERE repo_id = ?2 AND balance >= ?1 RETURNING balance`
@@ -417,7 +408,6 @@ export async function handleTicketGet(request, env, id) {
   if (!id) return bad(request, "id required");
   const row = await loadTicket(env, id);
   if (!row) {
-    // distinguish missing table
     try {
       await env.DB.prepare(`SELECT 1 FROM capability_tickets LIMIT 1`).first();
     } catch (e) {
@@ -516,5 +506,3 @@ export async function expireTickets(env) {
   }
   return { expired, scanned: results.length, latency_ms: Date.now() - t0 };
 }
-
-
