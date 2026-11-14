@@ -119,7 +119,6 @@ export async function handleStandingOpen(request, env, ctx) {
   if (intervalSec == null) return bad(request, "interval_sec out of range (30s–30d)");
   if (ttlSec == null) return bad(request, "ttl_seconds out of range");
 
-  // Soft pre-check: safety gate for first potential debit (does not debit yet)
   authUser._policyCtx = { to_repo: toRepo, task: "standing:" + task };
   const blocked = await safetyGate(request, env, authUser, fromRepo, amount);
   if (blocked) return blocked;
@@ -152,7 +151,7 @@ export async function handleStandingOpen(request, env, ctx) {
         label,
         maxRuns,
         budget,
-        modInterval, // first run after one interval (or use 'now' for immediate — use interval)
+        modInterval,
         ttlSec,
         modTtl,
         authUser.id
@@ -397,7 +396,6 @@ export async function runStandingOnce(env, row, ctx) {
   const toRepo = row.to_repo;
   const task = "standing:" + (row.task || row.id);
 
-  // Synthetic auth for safety gate
   const authUser = {
     id: row.created_by,
     default_repo: fromRepo,
@@ -439,7 +437,6 @@ export async function runStandingOnce(env, row, ctx) {
       ).bind(fromRepo, toRepo, amount, task.slice(0, 200), Date.now() - t0),
     ]);
   } catch (e) {
-    // refund debit
     await env.DB.prepare(
       `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
     )
@@ -465,7 +462,6 @@ export async function processStandingOrders(env, ctx) {
   let completed = 0;
   let expired = 0;
   try {
-    // Expire by TTL first
     const expQ = await env.DB.prepare(
       `SELECT id FROM standing_orders
        WHERE status = 'active'
@@ -500,7 +496,6 @@ export async function processStandingOrders(env, ctx) {
 
     for (const row of q.results || []) {
       try {
-        // Budget / max_runs pre-check
         const spent = Number(row.spent_usd || 0);
         const runs = Number(row.runs_done || 0);
         const amount = Number(row.amount);
@@ -544,7 +539,6 @@ export async function processStandingOrders(env, ctx) {
             close = true;
           }
           if (row.budget_usd != null && newSpent + amount > Number(row.budget_usd) + 1e-9) {
-            // next would exceed — mark complete after this run
             status = "completed";
             close = true;
           }
@@ -580,7 +574,6 @@ export async function processStandingOrders(env, ctx) {
             });
           }
         } else {
-          // On insufficient / lock — stop order so it doesn't spin
           const stop =
             result.code === "insufficient" ||
             result.code === "insufficient_credit" ||
@@ -614,5 +607,3 @@ export async function processStandingOrders(env, ctx) {
   }
   return { ran, failed, completed, expired, latency_ms: Date.now() - t0 };
 }
-
-
