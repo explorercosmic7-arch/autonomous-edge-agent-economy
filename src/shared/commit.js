@@ -27,17 +27,6 @@ import {
   CREDIT_REP_SUCCESS_BONUS,
 } from "./constants.js";
 
-/* ─── Commit–reveal counterfactual pay ───
- * 1) POST /api/commit  { to_repo, amount, task?, commit_hash, ttl_seconds? }
- *    Locks amount from from_repo → system/commit. commit_hash = sha256(preimage).
- * 2) POST /api/commit/reveal { id, preimage }
- *    If sha256(preimage) === commit_hash → pay system/commit → to_repo.
- * 3) POST /api/commit/cancel { id }  (before reveal) → full refund to from_repo.
- * 4) Cron / expire → refund (counterfactual: never paid).
- *
- * Preimage is opaque UTF-8 string (or hex). Client should use high entropy.
- */
-
 export function parseCommitTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
   if (Number.isFinite(sec)) {
@@ -107,7 +96,6 @@ export async function handleCommitCreate(request, env, ctx) {
   const ttlSec = parseCommitTtl(body);
   let commitHash = String(body.commit_hash || body.hash || "").trim().toLowerCase();
 
-  // Optional: server hashes preimage if client sends preimage at commit (less private)
   if (!isHex64(commitHash) && body.preimage != null) {
     commitHash = await sha256Hex(String(body.preimage));
   }
@@ -154,7 +142,6 @@ export async function handleCommitCreate(request, env, ctx) {
       ).bind(fromRepo, SYSTEM_COMMIT, amount, "commit-lock:" + id, Date.now() - t0),
     ]);
   } catch (e) {
-    // refund cash/credit best-effort
     await env.DB.prepare(
       `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
     )
@@ -259,7 +246,6 @@ export async function handleCommitReveal(request, env, ctx) {
     return bad(request, "Preimage does not match commit_hash", 403, { code: "bad_preimage" });
   }
 
-  // Anyone with preimage can reveal (classic HTLC). Optional: restrict to to_repo / creator.
   const claim = await env.DB.prepare(
     `UPDATE payment_commits
      SET status = 'revealed',
@@ -418,7 +404,6 @@ export async function handleCommitGet(request, env, id) {
       .all();
     events = q.results || [];
   } catch (_) {}
-  // Never return preimage; hash is public
   return json(request, { ok: true, commit: row, events });
 }
 
@@ -511,5 +496,3 @@ export async function expireCommits(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
-
-
