@@ -1,11 +1,13 @@
 /**
  * Shared Work — verifiable work claims, lock/attest/settle/refund + expireWorkClaims cron.
+ * Day 04: handleWorkLock hard-gates paused/retired agent instances.
  */
 import { json, bad } from "./http.js";
 import {
   parseRepo,
   parseAmount,
   randomId,
+  hmacSha256Hex,
 } from "./utils.js";
 import { checkRateLimit } from "./rateLimit.js";
 import { getAuthUser } from "./auth.js";
@@ -13,6 +15,8 @@ import { ensureAccount } from "./accounts.js";
 import { adjustRep, debitWithCredit } from "./credit.js";
 import { scheduleWebhook } from "./webhooks.js";
 import { safetyGate, safetyRecordSpend } from "./gate.js";
+import { maybeAssertInstanceFromBody } from "./agentInstance.js";
+import { afterInstanceBlock } from "./securityLog.js";
 import {
   SYSTEM_WORK,
   WORK_MIN,
@@ -28,15 +32,6 @@ import {
   CREDIT_REP_SUCCESS_BONUS,
   CREDIT_REP_FAIL_PENALTY,
 } from "./constants.js";
-
-/* ─── Verifiable Work Settlement (VWS) ───
- * 1) Provider POST /api/work/claim  { task, amount, expected_hash?, output_hash?, min_attestations? }
- * 2) Buyer     POST /api/work/lock   { id }  — locks amount from buyer → system/work
- * 3) Anyone    POST /api/work/attest { id, output_hash, note? }
- * 4) Settle    POST /api/work/settle { id }  — when attestations >= min and hash matches → pay provider
- * 5) Refund    POST /api/work/refund { id }  — buyer or timeout path
- * Receipt includes work proof + payment (HMAC).
- */
 
 export function parseWorkTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
@@ -165,6 +160,13 @@ export async function handleWorkClaim(request, env, ctx) {
   });
 }
 
+ handleWorkLock in work.js with this function.
+// Also add imports:
+//   import { maybeAssertInstanceFromBody } from "./agentInstance.js";
+//   import { afterInstanceBlock } from "./securityLog.js";
+
+
+
 export async function handleWorkLock(request, env, ctx) {
   const t0 = Date.now();
   const authUser = await getAuthUser(request, env);
@@ -176,6 +178,23 @@ export async function handleWorkLock(request, env, ctx) {
   } catch {
     return bad(request, "Invalid JSON body");
   }
+
+  const instGate = await maybeAssertInstanceFromBody(env, body, request);
+  if (!instGate.ok) {
+    await afterInstanceBlock(env, request, {
+      authUser,
+      instanceId: body.instance_id || body.instanceId || null,
+      code: instGate.code,
+      verb: "work",
+      repoId: null,
+    });
+    return bad(request, instGate.error, instGate.status || 403, {
+      code: instGate.code,
+      instance: instGate.instance || null,
+    });
+  }
+  const activeInstance = instGate.instance || null;
+
   const id = String(body.id || "").trim();
   if (!id) return bad(request, "id required");
 
@@ -200,7 +219,11 @@ export async function handleWorkLock(request, env, ctx) {
   }
 
   const amount = Number(row.amount);
-  authUser._policyCtx = { to_repo: row.provider_repo, task: "work:" + (row.task || "") };
+  authUser._policyCtx = {
+    to_repo: row.provider_repo,
+    task: "work:" + (row.task || ""),
+    instance_id: activeInstance ? activeInstance.id : null,
+  };
   const blocked = await safetyGate(request, env, authUser, buyerRepo, amount);
   if (blocked) return blocked;
 
@@ -225,7 +248,6 @@ export async function handleWorkLock(request, env, ctx) {
     .first();
 
   if (!claim) {
-    // refund
     await env.DB.prepare(
       `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
     )
@@ -248,6 +270,7 @@ export async function handleWorkLock(request, env, ctx) {
   if (authUser.id) {
     scheduleWebhook(ctx, env, authUser.id, "work.locked", {
       id, buyer_repo: buyerRepo, provider_repo: row.provider_repo, amount, status: "locked",
+      instance_id: activeInstance ? activeInstance.id : null,
     });
   }
 
@@ -262,6 +285,7 @@ export async function handleWorkLock(request, env, ctx) {
       locked_amount: amount,
       credit_drawn: debitRes.credit_drawn || 0,
     },
+    instance_id: activeInstance ? activeInstance.id : undefined,
     balance_buyer: debitRes.balance,
     latency_ms: Date.now() - t0,
   });
@@ -294,55 +318,35 @@ export async function handleWorkAttest(request, env, ctx) {
     return bad(request, "Claim not attestable (status=" + row.status + ")", 400);
   }
 
-  // ── Attestation diversity: no self-attest (provider / buyer) ──
   if (WORK_BLOCK_SELF_ATTEST) {
     if (row.provider_repo && attestor === row.provider_repo) {
-      await logWorkEvent(env, id, "attest_rejected", {
-        actor_repo: attestor,
-        note: "self_attest_provider",
-      });
-      return bad(request, "Provider cannot attest their own claim", 403, {
-        code: "self_attest_forbidden",
-      });
+      await logWorkEvent(env, id, "attest_rejected", { actor_repo: attestor, note: "self_attest_provider" });
+      return bad(request, "Provider cannot attest their own claim", 403, { code: "self_attest_forbidden" });
     }
     if (row.buyer_repo && attestor === row.buyer_repo) {
-      await logWorkEvent(env, id, "attest_rejected", {
-        actor_repo: attestor,
-        note: "self_attest_buyer",
-      });
-      return bad(request, "Buyer cannot attest a claim they funded", 403, {
-        code: "self_attest_forbidden",
-      });
+      await logWorkEvent(env, id, "attest_rejected", { actor_repo: attestor, note: "self_attest_buyer" });
+      return bad(request, "Buyer cannot attest a claim they funded", 403, { code: "self_attest_forbidden" });
     }
   }
 
-  // ── Distinct attestors only (one vote per repo) ──
   if (WORK_REQUIRE_DISTINCT_ATTESTORS) {
     try {
       const prior = await env.DB.prepare(
-        `SELECT id FROM work_attestations
-         WHERE claim_id = ?1 AND attestor_repo = ?2 LIMIT 1`
-      )
-        .bind(id, attestor)
-        .first();
+        `SELECT id FROM work_attestations WHERE claim_id = ?1 AND attestor_repo = ?2 LIMIT 1`
+      ).bind(id, attestor).first();
       if (prior) {
         return bad(request, "This attestor already attested this claim", 409, {
           code: "duplicate_attestor",
           attestor_repo: attestor,
         });
       }
-    } catch (e) {
-      // table missing handled on insert
-    }
+    } catch (e) {}
   }
 
-  // If expected_hash set, attestation must match
   if (row.expected_hash && row.expected_hash.toLowerCase() !== outputHash) {
     await logWorkEvent(env, id, "attest_mismatch", { actor_repo: attestor, note: outputHash.slice(0, 16) });
     return bad(request, "output_hash does not match expected_hash", 403, { code: "hash_mismatch" });
   }
-
-  // If claim already has output_hash from provider, require match
   if (row.output_hash && row.output_hash.toLowerCase() !== outputHash) {
     return bad(request, "output_hash conflicts with existing claim hash", 409, { code: "hash_conflict" });
   }
@@ -352,9 +356,7 @@ export async function handleWorkAttest(request, env, ctx) {
     await env.DB.prepare(
       `INSERT INTO work_attestations (id, claim_id, attestor_repo, output_hash, note, created_at)
        VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))`
-    )
-      .bind(attId, id, attestor, outputHash, note)
-      .run();
+    ).bind(attId, id, attestor, outputHash, note).run();
   } catch (e) {
     const msg = (e && e.message) || String(e);
     if (/UNIQUE|unique|constraint/i.test(msg)) {
@@ -366,14 +368,11 @@ export async function handleWorkAttest(request, env, ctx) {
     return bad(request, "work_attestations missing — run d1-work-migration.sql: " + msg, 500);
   }
 
-  // Recount distinct attestors (source of truth for diversity)
   let distinctCount = 1;
   try {
     const dist = await env.DB.prepare(
       `SELECT COUNT(DISTINCT attestor_repo) AS c FROM work_attestations WHERE claim_id = ?1`
-    )
-      .bind(id)
-      .first();
+    ).bind(id).first();
     distinctCount = Number(dist?.c || 1);
   } catch (_) {
     distinctCount = Number(row.attestation_count || 0) + 1;
@@ -393,9 +392,7 @@ export async function handleWorkAttest(request, env, ctx) {
          status = CASE WHEN status IN ('locked', 'attested') THEN 'attested' ELSE status END,
          updated_at = datetime('now')
      WHERE id = ?1`
-  )
-    .bind(id, outputHash, distinctCount)
-    .run();
+  ).bind(id, outputHash, distinctCount).run();
 
   await logWorkEvent(env, id, "attested", {
     actor_repo: attestor,
@@ -404,11 +401,8 @@ export async function handleWorkAttest(request, env, ctx) {
 
   if (row.created_by) {
     scheduleWebhook(ctx, env, row.created_by, "work.attested", {
-      id,
-      attestor_repo: attestor,
-      output_hash: outputHash,
-      attestation_count: distinctCount,
-      distinct_attestors: distinctCount,
+      id, attestor_repo: attestor, output_hash: outputHash,
+      attestation_count: distinctCount, distinct_attestors: distinctCount,
       min_attestations: Number(row.min_attestations || 1),
     });
   }
@@ -456,28 +450,20 @@ export async function handleWorkSettle(request, env, ctx) {
   if (Number(row.locked_amount || 0) <= 0) {
     return bad(request, "No funds locked on claim", 400);
   }
-  // Diversity: require distinct attestors (re-count; ignore inflated row counters)
   let distinctAtt = Number(row.attestation_count || 0);
   try {
     const dist = await env.DB.prepare(
       `SELECT COUNT(DISTINCT attestor_repo) AS c FROM work_attestations WHERE claim_id = ?1`
-    )
-      .bind(id)
-      .first();
+    ).bind(id).first();
     if (dist && dist.c != null) distinctAtt = Number(dist.c);
   } catch (_) {}
   const minAtt = Number(row.min_attestations || 1);
   if (distinctAtt < minAtt) {
-    return bad(
-      request,
-      "Need " + minAtt + " distinct attestation(s), have " + distinctAtt,
-      400,
-      {
-        code: "insufficient_attestations",
-        distinct_attestors: distinctAtt,
-        min_attestations: minAtt,
-      }
-    );
+    return bad(request, "Need " + minAtt + " distinct attestation(s), have " + distinctAtt, 400, {
+      code: "insufficient_attestations",
+      distinct_attestors: distinctAtt,
+      min_attestations: minAtt,
+    });
   }
   if (!row.output_hash) return bad(request, "No output_hash on claim — attest first", 400);
 
@@ -486,9 +472,7 @@ export async function handleWorkSettle(request, env, ctx) {
      SET status = 'settled', settled_at = datetime('now'), updated_at = datetime('now')
      WHERE id = ?1 AND status IN ('locked', 'attested')
      RETURNING *`
-  )
-    .bind(id)
-    .first();
+  ).bind(id).first();
   if (!claim) return bad(request, "Settle race", 409);
 
   const amount = Number(row.locked_amount || row.amount);
@@ -516,7 +500,6 @@ export async function handleWorkSettle(request, env, ctx) {
     await adjustRep(env, row.buyer_repo, CREDIT_REP_SUCCESS_BONUS, "work_settle_buyer", id);
   }
 
-  // HMAC receipt with work proof
   let receiptId = null;
   let receiptSig = null;
   try {
@@ -596,14 +579,11 @@ export async function handleWorkRefund(request, env, ctx) {
       (authUser.default_repo === row.buyer_repo || authUser.default_repo === row.provider_repo));
   if (!allowed) return bad(request, "Not authorized to refund", 403);
 
-  // open with no lock — just cancel
   if (row.status === "open" || Number(row.locked_amount || 0) <= 0) {
     await env.DB.prepare(
       `UPDATE work_claims SET status = 'refunded', refunded_at = datetime('now'), updated_at = datetime('now')
        WHERE id = ?1 AND status = 'open'`
-    )
-      .bind(id)
-      .run();
+    ).bind(id).run();
     await logWorkEvent(env, id, "cancelled", { actor_repo: authUser.default_repo });
     return json(request, { ok: true, id, status: "refunded", refunded: 0, latency_ms: Date.now() - t0 });
   }
@@ -613,9 +593,7 @@ export async function handleWorkRefund(request, env, ctx) {
      SET status = 'refunded', refunded_at = datetime('now'), updated_at = datetime('now')
      WHERE id = ?1 AND status IN ('locked', 'attested')
      RETURNING *`
-  )
-    .bind(id)
-    .first();
+  ).bind(id).first();
   if (!claim) return bad(request, "Refund race", 409);
 
   const refund = Number(row.locked_amount);
@@ -664,18 +642,14 @@ export async function handleWorkGet(request, env, id) {
     const a = await env.DB.prepare(
       `SELECT id, attestor_repo, output_hash, note, created_at
        FROM work_attestations WHERE claim_id = ?1 ORDER BY created_at ASC`
-    )
-      .bind(id)
-      .all();
+    ).bind(id).all();
     attestations = a.results || [];
   } catch (_) {}
   try {
     const e = await env.DB.prepare(
       `SELECT event, actor_repo, note, created_at
        FROM work_events WHERE claim_id = ?1 ORDER BY created_at DESC LIMIT 40`
-    )
-      .bind(id)
-      .all();
+    ).bind(id).all();
     events = e.results || [];
   } catch (_) {}
   return json(request, { ok: true, claim: row, attestations, events });
@@ -780,5 +754,3 @@ export async function expireWorkClaims(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
-
-
