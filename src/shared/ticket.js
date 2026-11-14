@@ -1,5 +1,5 @@
 /**
- * Shared Ticket — capability tickets (mint/transfer/redeem) + expireTickets cron. 
+ * Shared Ticket — capability tickets (mint/transfer/redeem) + expireTickets cron.  
  */
 import { json, bad } from "./http.js";
 import {
