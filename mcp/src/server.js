@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentPay MCP Server v0.2.0 — Stage 1
+ * AgentPay MCP Server v0.3.0 — Stage 1+2
  *
  * Thin adapter: MCP tools → live Cloudflare Worker APIs.
  * No new ledger. No second database.
@@ -531,7 +531,345 @@ const TOOLS = [
       required: ["id"],
       additionalProperties: false,
     },
+  },,
+
+  {
+    name: "agentpay_escrow_hold",
+    description:
+      "Hold funds in escrow (from_repo → system) until release or refund. Requires escrow scope. ttl_seconds or ttl_hours required.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_repo: { type: "string", description: "Payer owner/name" },
+        to_repo: { type: "string", description: "Intended payee owner/name" },
+        amount: { type: "number", description: "USD amount" },
+        task: { type: "string", description: "Optional task label" },
+        ttl_seconds: { type: "number", description: "Hold TTL in seconds" },
+        ttl_hours: { type: "number", description: "Hold TTL in hours (alt)" },
+        idempotency_key: { type: "string", description: "Optional idempotency key" },
+      },
+      required: ["to_repo", "amount"],
+      additionalProperties: false,
+    },
   },
+  {
+    name: "agentpay_escrow_release",
+    description: "Release held escrow to to_repo (payee).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Escrow id (esc_…)" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_escrow_refund",
+    description: "Refund held escrow back to from_repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Escrow id" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_escrow_list",
+    description: "List escrows. Optional repo and status filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "owner/name filter" },
+        status: { type: "string", description: "held | released | refunded | expired" },
+        limit: { type: "number", description: "Max rows" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_stream_start",
+    description:
+      "Start a streaming micro-pay: lock budget, then meter units. Requires stream scope.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_repo: { type: "string" },
+        to_repo: { type: "string" },
+        budget: { type: "number", description: "Total USD budget locked" },
+        rate_per_unit: { type: "number", description: "USD per unit" },
+        unit_label: { type: "string", description: "e.g. token" },
+        task: { type: "string" },
+        idempotency_key: { type: "string" },
+      },
+      required: ["to_repo", "budget", "rate_per_unit"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_stream_meter",
+    description: "Meter units against an open stream (pays provider from locked budget).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Stream id (str_…)" },
+        units: { type: "number", description: "Units to meter (>0)" },
+      },
+      required: ["id", "units"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_stream_stop",
+    description: "Stop stream and refund remaining budget to from_repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Stream id" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_stream_list",
+    description: "List streams. Optional repo and status filters.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string", description: "open | stopped | exhausted" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_intent_create",
+    description:
+      "Create a spend intent capsule: time-boxed amount-capped pre-auth. Funds locked until spend/cancel/expire.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_repo: { type: "string" },
+        budget: { type: "number", description: "Total USD budget" },
+        allow_to: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional allowlist of to_repo values",
+        },
+        task_prefix: { type: "string", description: "Optional required task prefix" },
+        max_per_spend: { type: "number" },
+        ttl_seconds: { type: "number" },
+        label: { type: "string" },
+      },
+      required: ["budget"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_intent_spend",
+    description: "Spend from an open intent capsule to a to_repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Intent id (ic_…)" },
+        to_repo: { type: "string" },
+        amount: { type: "number" },
+        task: { type: "string" },
+      },
+      required: ["id", "to_repo", "amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_intent_cancel",
+    description: "Cancel open intent and refund remaining to from_repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_intent_list",
+    description: "List intent capsules.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string", description: "open | depleted | cancelled | expired" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_intent_get",
+    description: "Get one intent capsule by id (includes events).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_claim",
+    description: "Provider opens a verifiable work claim.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        provider_repo: { type: "string" },
+        buyer_repo: { type: "string" },
+        task: { type: "string" },
+        amount: { type: "number" },
+        expected_hash: { type: "string" },
+        output_hash: { type: "string" },
+        output_uri: { type: "string" },
+        min_attestations: { type: "number" },
+        ttl_seconds: { type: "number" },
+      },
+      required: ["task", "amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_lock",
+    description: "Buyer locks funds on a work claim.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Claim id (wk_…)" },
+        buyer_repo: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_attest",
+    description: "Attest a work claim with output_hash (no self-attest).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        output_hash: { type: "string" },
+        attestor_repo: { type: "string" },
+        note: { type: "string" },
+      },
+      required: ["id", "output_hash"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_settle",
+    description: "Settle locked work claim when attestations meet minimum.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_refund",
+    description: "Refund locked work claim to buyer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_list",
+    description: "List work claims.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_work_get",
+    description: "Get one work claim with attestations and events.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_split_create",
+    description:
+      "Revenue split: one debit → N recipients by bps (must sum to 10000). Scope: pay.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_repo: { type: "string" },
+        amount: { type: "number" },
+        recipients: {
+          type: "array",
+          description: "[{ repo, bps }, ...] bps sum 10000",
+          items: {
+            type: "object",
+            properties: {
+              repo: { type: "string" },
+              bps: { type: "number" },
+            },
+          },
+        },
+        task: { type: "string" },
+        idempotency_key: { type: "string" },
+      },
+      required: ["amount", "recipients"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_split_list",
+    description: "List revenue splits.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_split_get",
+    description: "Get one split by id with legs.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+
 ];
 
 async function callTool(name, args) {
@@ -803,6 +1141,260 @@ async function callTool(name, args) {
       return textResult(r.data, isFail(r));
     }
 
+
+    case "agentpay_escrow_hold": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        to_repo: String(args.to_repo || "").trim(),
+        amount: Number(args.amount),
+      };
+      if (args.from_repo) body.from_repo = String(args.from_repo).trim();
+      if (args.task != null) body.task = String(args.task);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.ttl_hours != null) body.ttl_hours = Number(args.ttl_hours);
+      if (args.idempotency_key) body.idempotency_key = String(args.idempotency_key).trim();
+      const r = await api("/api/escrow/hold", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_escrow_release": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      const r = await api("/api/escrow/release", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_escrow_refund": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      const r = await api("/api/escrow/refund", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_escrow_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/escrow" + qstr(params), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_stream_start": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        to_repo: String(args.to_repo || "").trim(),
+        budget: Number(args.budget),
+        rate_per_unit: Number(args.rate_per_unit),
+      };
+      if (args.from_repo) body.from_repo = String(args.from_repo).trim();
+      if (args.unit_label) body.unit_label = String(args.unit_label);
+      if (args.task != null) body.task = String(args.task);
+      if (args.idempotency_key) body.idempotency_key = String(args.idempotency_key).trim();
+      const r = await api("/api/stream/start", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_stream_meter": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        units: Number(args.units),
+      };
+      const r = await api("/api/stream/meter", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_stream_stop": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      const r = await api("/api/stream/stop", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_stream_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/stream" + qstr(params), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_intent_create": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { budget: Number(args.budget) };
+      if (args.from_repo) body.from_repo = String(args.from_repo).trim();
+      if (args.allow_to != null) body.allow_to = args.allow_to;
+      if (args.task_prefix != null) body.task_prefix = String(args.task_prefix);
+      if (args.max_per_spend != null) body.max_per_spend = Number(args.max_per_spend);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.label != null) body.label = String(args.label);
+      const r = await api("/api/intent/create", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_intent_spend": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        to_repo: String(args.to_repo || "").trim(),
+        amount: Number(args.amount),
+      };
+      if (args.task != null) body.task = String(args.task);
+      const r = await api("/api/intent/spend", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_intent_cancel": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      const r = await api("/api/intent/cancel", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_intent_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/intent" + qstr(params), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_intent_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/intent/" + encodeURIComponent(id), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_claim": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        task: String(args.task || "").trim(),
+        amount: Number(args.amount),
+      };
+      if (args.provider_repo) body.provider_repo = String(args.provider_repo).trim();
+      if (args.buyer_repo) body.buyer_repo = String(args.buyer_repo).trim();
+      if (args.expected_hash) body.expected_hash = String(args.expected_hash).trim();
+      if (args.output_hash) body.output_hash = String(args.output_hash).trim();
+      if (args.output_uri) body.output_uri = String(args.output_uri);
+      if (args.min_attestations != null) body.min_attestations = Number(args.min_attestations);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      const r = await api("/api/work/claim", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_lock": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.buyer_repo) body.buyer_repo = String(args.buyer_repo).trim();
+      const r = await api("/api/work/lock", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_attest": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        output_hash: String(args.output_hash || "").trim(),
+      };
+      if (args.attestor_repo) body.attestor_repo = String(args.attestor_repo).trim();
+      if (args.note) body.note = String(args.note);
+      const r = await api("/api/work/attest", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_settle": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      const r = await api("/api/work/settle", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_refund": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      const r = await api("/api/work/refund", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/work" + qstr(params), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_work_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/work/" + encodeURIComponent(id), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_split_create": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        amount: Number(args.amount),
+        recipients: args.recipients,
+      };
+      if (args.from_repo) body.from_repo = String(args.from_repo).trim();
+      if (args.task != null) body.task = String(args.task);
+      if (args.idempotency_key) body.idempotency_key = String(args.idempotency_key).trim();
+      const r = await api("/api/split", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_split_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/split" + qstr(params), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
+    case "agentpay_split_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/split/" + encodeURIComponent(id), {
+        auth: API_KEY ? undefined : false,
+      });
+      return textResult(r.data, isFail(r));
+    }
+
     default:
       return textResult({ ok: false, error: "Unknown tool: " + name }, true);
   }
@@ -812,7 +1404,7 @@ async function main() {
   const server = new Server(
     {
       name: "agentpay",
-      version: "0.2.0",
+      version: "0.3.0",
     },
     {
       capabilities: {
