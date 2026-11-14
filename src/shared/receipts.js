@@ -1,6 +1,5 @@
 /**
  * Payment receipts + payment traces (GET)
- * Issue helpers live in shared/ledger.js (issuePayReceipt, receiptSecret, parseTraceId)
  */
 import { json, bad } from "./http.js";
 import { hmacSha256Hex } from "./utils.js";
@@ -8,8 +7,6 @@ import {
   receiptSecret,
   parseTraceId,
 } from "./ledger.js";
-
-/* receipts issue helpers moved to shared/ledger.js */
 
 export async function handleReceiptGet(request, env, id) {
   id = String(id || "").trim();
@@ -84,7 +81,6 @@ export async function handleReceiptVerify(request, env) {
     id: id || null,
   });
 }
-
 
 export async function handleTraceGet(request, env, id) {
   id = parseTraceId(id);
