@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentPay MCP Server v0.3.0 — Stage 1+2
+ * AgentPay MCP Server v0.4.0 — Stage 1–3
  *
  * Thin adapter: MCP tools → live Cloudflare Worker APIs.
  * No new ledger. No second database.
@@ -869,6 +869,442 @@ const TOOLS = [
       additionalProperties: false,
     },
   },
+,
+
+  {
+    name: "agentpay_pool_open",
+    description: "Open a collaborative funding pool toward a beneficiary and target amount.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beneficiary_repo: { type: "string" },
+        target_amount: { type: "number" },
+        creator_repo: { type: "string" },
+        task: { type: "string" },
+        title: { type: "string" },
+        ttl_seconds: { type: "number" },
+        min_contribution: { type: "number" },
+      },
+      required: ["beneficiary_repo", "target_amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_pool_contribute",
+    description: "Contribute funds to an open collaborative pool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        amount: { type: "number" },
+        from_repo: { type: "string" },
+      },
+      required: ["id", "amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_pool_release",
+    description: "Release funded pool to beneficiary (force:true for early release by creator).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        force: { type: "boolean" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_pool_refund",
+    description: "Cancel pool and refund all held contributions.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_pool_list",
+    description: "List collaborative pools.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_pool_get",
+    description: "Get one pool with contributions and events.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_post",
+    description: "Post an intent bond (locks bond_amount).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        poster_repo: { type: "string" },
+        intent: { type: "string" },
+        bond_amount: { type: "number" },
+        counterparty_repo: { type: "string" },
+        task: { type: "string" },
+        ttl_seconds: { type: "number" },
+        match_ttl_seconds: { type: "number" },
+        slash_bps: { type: "number" },
+      },
+      required: ["intent", "bond_amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_match",
+    description: "Match (accept) an open intent bond as counterparty.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        counterparty_repo: { type: "string" },
+        match_ttl_seconds: { type: "number" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_fulfill",
+    description: "Fulfill bond — full refund to poster.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_slash",
+    description: "Slash bond (portion to slash pool, rest to poster).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        slash_bps: { type: "number" },
+        reason: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_cancel",
+    description: "Cancel unmatched open bond (full refund).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_list",
+    description: "List intent bonds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_bond_get",
+    description: "Get one bond with events.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_commit_create",
+    description: "Commit–reveal lock: lock amount with sha256 commit_hash (or pass preimage to hash server-side).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        from_repo: { type: "string" },
+        to_repo: { type: "string" },
+        amount: { type: "number" },
+        commit_hash: { type: "string" },
+        preimage: { type: "string" },
+        task: { type: "string" },
+        ttl_seconds: { type: "number" },
+      },
+      required: ["to_repo", "amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_commit_reveal",
+    description: "Reveal preimage; if hash matches, pay to_repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        preimage: { type: "string" },
+        note: { type: "string" },
+      },
+      required: ["id", "preimage"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_commit_cancel",
+    description: "Cancel unrevealed commit (counterfactual full refund).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_commit_list",
+    description: "List payment commits.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_commit_get",
+    description: "Get one commit (never returns preimage).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_ticket_mint",
+    description: "Mint a capability ticket (units of a capability string, optional USD bond).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issuer_repo: { type: "string" },
+        holder_repo: { type: "string" },
+        capability: { type: "string" },
+        units: { type: "number" },
+        bond_usd: { type: "number" },
+        max_amount_usd: { type: "number" },
+        ttl_seconds: { type: "number" },
+        task: { type: "string" },
+      },
+      required: ["capability", "units"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_ticket_transfer",
+    description: "Transfer ticket to a new holder.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        to_repo: { type: "string" },
+      },
+      required: ["id", "to_repo"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_ticket_redeem",
+    description: "Redeem (burn) ticket units; optional USD pay to service repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        units: { type: "number" },
+        to_repo: { type: "string" },
+        amount: { type: "number" },
+        task: { type: "string" },
+      },
+      required: ["id", "units"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_ticket_list",
+    description: "List capability tickets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string" },
+        capability: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_ticket_get",
+    description: "Get one ticket with events.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_saga_start",
+    description: "Start multi-step payment saga (locks total budget, ordered steps).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        owner_repo: { type: "string" },
+        label: { type: "string" },
+        steps: {
+          type: "array",
+          description: "[{ to_repo, amount, task?, from_repo? }, ...]",
+        },
+        total_budget: { type: "number" },
+        ttl_seconds: { type: "number" },
+      },
+      required: ["steps"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_saga_advance",
+    description: "Execute next saga step (pay step.to_repo from reserved budget).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_saga_compensate",
+    description: "Compensate saga: reverse completed steps and refund owner.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        reason: { type: "string" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_saga_cancel",
+    description: "Cancel saga before any step runs (full refund).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_saga_list",
+    description: "List payment sagas.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_saga_get",
+    description: "Get one saga with steps and events.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_netting_run",
+    description: "Run bilateral obligation netting over a time window. Soft by default; apply_balances:true moves funds.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        window_hours: { type: "number" },
+        apply_balances: { type: "boolean" },
+        repo: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_netting_list",
+    description: "List recent netting runs and settlements.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_clearing_run",
+    description: "Multilateral clearing batch with HMAC settlement manifest. Optional apply_balances.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        window_hours: { type: "number" },
+        apply_balances: { type: "boolean" },
+        deployment_id: { type: "string" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_clearing_list",
+    description: "List clearing batches.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_clearing_get",
+    description: "Get clearing batch with positions, settlement, and HMAC verify.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
 
 ];
 
@@ -1395,6 +1831,302 @@ async function callTool(name, args) {
       return textResult(r.data, isFail(r));
     }
 
+
+    case "agentpay_pool_open": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        beneficiary_repo: String(args.beneficiary_repo || "").trim(),
+        target_amount: Number(args.target_amount),
+      };
+      if (args.creator_repo) body.creator_repo = String(args.creator_repo).trim();
+      if (args.task != null) body.task = String(args.task);
+      if (args.title != null) body.title = String(args.title);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.min_contribution != null) body.min_contribution = Number(args.min_contribution);
+      const r = await api("/api/pool/open", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_pool_contribute": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim(), amount: Number(args.amount) };
+      if (args.from_repo) body.from_repo = String(args.from_repo).trim();
+      const r = await api("/api/pool/contribute", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_pool_release": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.force === true) body.force = true;
+      const r = await api("/api/pool/release", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_pool_refund": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/pool/refund", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_pool_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/pool" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_pool_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/pool/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_post": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        intent: String(args.intent || "").trim(),
+        bond_amount: Number(args.bond_amount),
+      };
+      if (args.poster_repo) body.poster_repo = String(args.poster_repo).trim();
+      if (args.counterparty_repo) body.counterparty_repo = String(args.counterparty_repo).trim();
+      if (args.task != null) body.task = String(args.task);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.match_ttl_seconds != null) body.match_ttl_seconds = Number(args.match_ttl_seconds);
+      if (args.slash_bps != null) body.slash_bps = Number(args.slash_bps);
+      const r = await api("/api/bond/post", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_match": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.counterparty_repo) body.counterparty_repo = String(args.counterparty_repo).trim();
+      if (args.match_ttl_seconds != null) body.match_ttl_seconds = Number(args.match_ttl_seconds);
+      const r = await api("/api/bond/match", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_fulfill": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/bond/fulfill", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_slash": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.slash_bps != null) body.slash_bps = Number(args.slash_bps);
+      if (args.reason != null) body.reason = String(args.reason);
+      const r = await api("/api/bond/slash", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_cancel": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/bond/cancel", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/bond" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_bond_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/bond/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_commit_create": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        to_repo: String(args.to_repo || "").trim(),
+        amount: Number(args.amount),
+      };
+      if (args.from_repo) body.from_repo = String(args.from_repo).trim();
+      if (args.commit_hash) body.commit_hash = String(args.commit_hash).trim();
+      if (args.preimage != null) body.preimage = String(args.preimage);
+      if (args.task != null) body.task = String(args.task);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      const r = await api("/api/commit", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_commit_reveal": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        preimage: String(args.preimage ?? ""),
+      };
+      if (args.note != null) body.note = String(args.note);
+      const r = await api("/api/commit/reveal", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_commit_cancel": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/commit/cancel", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_commit_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/commit" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_commit_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/commit/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_ticket_mint": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        capability: String(args.capability || "").trim(),
+        units: Number(args.units),
+      };
+      if (args.issuer_repo) body.issuer_repo = String(args.issuer_repo).trim();
+      if (args.holder_repo) body.holder_repo = String(args.holder_repo).trim();
+      if (args.bond_usd != null) body.bond_usd = Number(args.bond_usd);
+      if (args.max_amount_usd != null) body.max_amount_usd = Number(args.max_amount_usd);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.task != null) body.task = String(args.task);
+      const r = await api("/api/ticket/mint", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_ticket_transfer": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        to_repo: String(args.to_repo || "").trim(),
+      };
+      const r = await api("/api/ticket/transfer", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_ticket_redeem": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        units: Number(args.units),
+      };
+      if (args.to_repo) body.to_repo = String(args.to_repo).trim();
+      if (args.amount != null) body.amount = Number(args.amount);
+      if (args.task != null) body.task = String(args.task);
+      const r = await api("/api/ticket/redeem", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_ticket_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.capability) params.capability = String(args.capability).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/ticket" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_ticket_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/ticket/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_saga_start": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { steps: args.steps };
+      if (args.owner_repo) body.owner_repo = String(args.owner_repo).trim();
+      if (args.label != null) body.label = String(args.label);
+      if (args.total_budget != null) body.total_budget = Number(args.total_budget);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      const r = await api("/api/saga/start", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_saga_advance": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/saga/advance", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_saga_compensate": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.reason != null) body.reason = String(args.reason);
+      const r = await api("/api/saga/compensate", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_saga_cancel": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const r = await api("/api/saga/cancel", { method: "POST", body: { id: String(args.id || "").trim() } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_saga_list": {
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/saga" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_saga_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/saga/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_netting_run": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.window_hours != null) body.window_hours = Number(args.window_hours);
+      if (args.apply_balances === true) body.apply_balances = true;
+      if (args.repo) body.repo = String(args.repo).trim();
+      const r = await api("/api/netting/run", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_netting_list": {
+      const params = {};
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/netting" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_clearing_run": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.window_hours != null) body.window_hours = Number(args.window_hours);
+      if (args.apply_balances === true) body.apply_balances = true;
+      if (args.deployment_id) body.deployment_id = String(args.deployment_id);
+      const r = await api("/api/clearing/run", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_clearing_list": {
+      const params = {};
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/clearing" + qstr(params), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_clearing_get": {
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/clearing/" + encodeURIComponent(id), { auth: API_KEY ? undefined : false });
+      return textResult(r.data, isFail(r));
+    }
+
     default:
       return textResult({ ok: false, error: "Unknown tool: " + name }, true);
   }
@@ -1404,7 +2136,7 @@ async function main() {
   const server = new Server(
     {
       name: "agentpay",
-      version: "0.3.0",
+      version: "0.4.0",
     },
     {
       capabilities: {
