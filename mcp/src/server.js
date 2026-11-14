@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-/** 
- * AgentPay MCP Server v0.4.0 — Stage 1–3
+/**
+ * AgentPay MCP Server v0.5.0 — Stage 1–4
  *
  * Thin adapter: MCP tools → live Cloudflare Worker APIs.
  * No new ledger. No second database.
@@ -12,11 +12,14 @@
  * Run (stdio — Cursor / Claude Desktop):
  *   AGENTPAY_API_KEY=a2a_… node src/server.js
  *
- * Stage 1 tools:
- *   health, balance, passport_get, pay (+ instance_id), ledger_list
- *   agents_search, agents_list, agents_rank
- *   hire_rfq, hire_quote, hire_accept, hire_complete, hire_cancel, hire_list, hire_get
- *   standing_open, standing_cancel, standing_pause, standing_resume, standing_list, standing_get
+ * Stages 1–3: pay, hire, standing, agents, escrow, stream, intent, work, split,
+ *   pool, bond, commit, ticket, saga, netting, clearing, ledger, passport
+ * Stage 4:
+ *   instances (create/list/get/fund/activate/pause/resume/retire/freeze)
+ *   will (upsert/get/revoke/execute/executions)
+ *   delegate (open/revoke/get/list)
+ *   subwallet (open/spend/close/list)
+ *   dispute (open/accept/vote/execute/cancel/get/list)
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -1306,6 +1309,394 @@ const TOOLS = [
     },
   },
 
+  /* ─── Stage 4: Instances ─── */
+  {
+    name: "agentpay_instance_create",
+    description: "Create agent instance (status=created). repo=owner/repo. Session preferred.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        label: { type: "string" },
+        meta: { type: "object" },
+      },
+      required: ["repo"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_list",
+    description: "List my agent instances.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["created", "funded", "active", "paused", "retired"] },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_get",
+    description: "Get one instance by id (ainst_...).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_fund",
+    description: "Fund instance. Pass activate:true to auto-activate.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        amount: { type: "number" },
+        activate: { type: "boolean" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_activate",
+    description: "Activate instance (funded→active). force:true for lab from created.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        force: { type: "boolean" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_pause",
+    description: "Pause instance — blocks spend/work.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_resume",
+    description: "Resume paused instance → active.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_retire",
+    description: "Retire instance (terminal).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_instance_freeze",
+    description: "Emergency freeze: one instance_id, or omit to pause ALL under account.",
+    inputSchema: {
+      type: "object",
+      properties: { instance_id: { type: "string" } },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 4: Will ─── */
+  {
+    name: "agentpay_will_upsert",
+    description: "Create/update will. heirs:[{repo,bps}] must sum bps to 10000.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        heirs: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              repo: { type: "string" },
+              bps: { type: "number" },
+            },
+            required: ["repo", "bps"],
+          },
+        },
+        reserve_usd: { type: "number" },
+        auto_on_continuity_fail: { type: "boolean" },
+        min_missed_beats: { type: "number" },
+        note: { type: "string" },
+      },
+      required: ["heirs"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_will_get",
+    description: "Get will + heirs for a repo.",
+    inputSchema: {
+      type: "object",
+      properties: { repo: { type: "string" } },
+      required: ["repo"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_will_revoke",
+    description: "Revoke active will (not if executed).",
+    inputSchema: {
+      type: "object",
+      properties: { repo: { type: "string" } },
+      required: ["repo"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_will_execute",
+    description: "Execute will: pay heirs from balance minus reserve. One-shot.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        trigger: { type: "string" },
+        idempotency_key: { type: "string" },
+      },
+      required: ["repo"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_will_executions",
+    description: "List will executions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 4: Delegate ─── */
+  {
+    name: "agentpay_delegate_open",
+    description: "Open delegation: lock parent budget for child API key. Child spends with X-Delegate-Id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent_repo: { type: "string" },
+        child_key_id: { type: "string" },
+        budget: { type: "number" },
+        child_repo: { type: "string" },
+        allow_to: {},
+        task_prefix: { type: "string" },
+        max_per_spend: { type: "number" },
+        ttl_seconds: { type: "number" },
+        label: { type: "string" },
+      },
+      required: ["child_key_id", "budget"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_delegate_revoke",
+    description: "Revoke open delegation; refund remaining to parent.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_delegate_get",
+    description: "Get delegation by id (dg_...).",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_delegate_list",
+    description: "List delegations.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        child_key_id: { type: "string" },
+        status: { type: "string", enum: ["open", "depleted", "revoked", "expired"] },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 4: Sub-wallet ─── */
+  {
+    name: "agentpay_subwallet_open",
+    description: "Open ephemeral sub-wallet: parent debits budget. Child spends via spend.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        parent_repo: { type: "string" },
+        budget: { type: "number" },
+        label: { type: "string" },
+        task: { type: "string" },
+        ttl_seconds: { type: "number" },
+        idempotency_key: { type: "string" },
+      },
+      required: ["budget"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_subwallet_spend",
+    description: "Spend from open sub-wallet to to_repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        to_repo: { type: "string" },
+        amount: { type: "number" },
+        task: { type: "string" },
+      },
+      required: ["id", "to_repo", "amount"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_subwallet_close",
+    description: "Close sub-wallet; refund remaining to parent.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_subwallet_list",
+    description: "List sub-wallets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string", enum: ["open", "closed", "expired", "exhausted"] },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+  /* ─── Stage 4: Dispute ─── */
+  {
+    name: "agentpay_dispute_open",
+    description: "Buyer opens dispute on locked/attested work claim.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        claim_id: { type: "string" },
+        reason: { type: "string" },
+        evidence_uri: { type: "string" },
+        evidence_hash: { type: "string" },
+        complainant_bond: { type: "number" },
+        arbiter_bond_required: { type: "number" },
+        min_arbiters: { type: "number" },
+        ttl_seconds: { type: "number" },
+      },
+      required: ["claim_id", "reason"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_dispute_accept",
+    description: "Bonded arbiter joins panel (not buyer/provider).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        arbiter_repo: { type: "string" },
+        bond_usd: { type: "number" },
+      },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_dispute_vote",
+    description: "Arbiter votes release|slash|split. Quorum auto-executes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        decision: { type: "string", enum: ["release", "slash", "split"] },
+        split_bps: { type: "number" },
+        note: { type: "string" },
+        arbiter_repo: { type: "string" },
+      },
+      required: ["id", "decision"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_dispute_execute",
+    description: "Force execute if ruled or quorum reached.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_dispute_cancel",
+    description: "Complainant cancels before votes; bonds returned.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_dispute_get",
+    description: "Get dispute + arbiters + events.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "agentpay_dispute_list",
+    description: "List disputes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string" },
+        status: { type: "string", enum: ["open", "accepted", "ruled", "executed", "cancelled", "expired"] },
+        claim_id: { type: "string" },
+        limit: { type: "number" },
+      },
+      additionalProperties: false,
+    },
+  },
+
+
 ];
 
 async function callTool(name, args) {
@@ -2127,6 +2518,307 @@ async function callTool(name, args) {
       return textResult(r.data, isFail(r));
     }
 
+
+    /* ─── Stage 4: Instances ─── */
+    case "agentpay_instance_create": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { repo: String(args.repo || "").trim() };
+      if (args.label) body.label = String(args.label);
+      if (args.meta && typeof args.meta === "object") body.meta = args.meta;
+      const r = await api("/api/instances", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_list": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.status) params.status = String(args.status);
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/instances" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/instances/" + encodeURIComponent(id));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_fund": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const body = {};
+      if (args.amount != null) body.amount = Number(args.amount);
+      if (args.activate === true) body.activate = true;
+      const r = await api("/api/instances/" + encodeURIComponent(id) + "/fund", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_activate": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const body = {};
+      if (args.force === true) body.force = true;
+      const r = await api("/api/instances/" + encodeURIComponent(id) + "/activate", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_pause": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/instances/" + encodeURIComponent(id) + "/pause", { method: "POST", body: {} });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_resume": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/instances/" + encodeURIComponent(id) + "/resume", { method: "POST", body: {} });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_retire": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/instances/" + encodeURIComponent(id) + "/retire", { method: "POST", body: {} });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_instance_freeze": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.instance_id) body.instance_id = String(args.instance_id);
+      const r = await api("/api/instances/freeze", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 4: Will ─── */
+    case "agentpay_will_upsert": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { heirs: args.heirs };
+      if (args.repo) body.repo = String(args.repo).trim();
+      if (args.reserve_usd != null) body.reserve_usd = Number(args.reserve_usd);
+      if (args.auto_on_continuity_fail != null) body.auto_on_continuity_fail = !!args.auto_on_continuity_fail;
+      if (args.min_missed_beats != null) body.min_missed_beats = Number(args.min_missed_beats);
+      if (args.note) body.note = String(args.note);
+      const r = await api("/api/will", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_will_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      const r = await api("/api/will" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_will_revoke": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.repo) body.repo = String(args.repo).trim();
+      const r = await api("/api/will/revoke", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_will_execute": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {};
+      if (args.repo) body.repo = String(args.repo).trim();
+      if (args.trigger) body.trigger = String(args.trigger);
+      if (args.idempotency_key) body.idempotency_key = String(args.idempotency_key);
+      const headers = {};
+      if (args.idempotency_key) headers["Idempotency-Key"] = String(args.idempotency_key);
+      const r = await api("/api/will/execute", { method: "POST", body, headers });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_will_executions": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/will/executions" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 4: Delegate ─── */
+    case "agentpay_delegate_open": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        child_key_id: String(args.child_key_id || "").trim(),
+        budget: Number(args.budget),
+      };
+      if (args.parent_repo) body.parent_repo = String(args.parent_repo).trim();
+      if (args.child_repo) body.child_repo = String(args.child_repo).trim();
+      if (args.allow_to != null) body.allow_to = args.allow_to;
+      if (args.task_prefix) body.task_prefix = String(args.task_prefix);
+      if (args.max_per_spend != null) body.max_per_spend = Number(args.max_per_spend);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.label) body.label = String(args.label);
+      const r = await api("/api/delegate/open", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_delegate_revoke": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/delegate/revoke", { method: "POST", body: { id } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_delegate_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/delegate/" + encodeURIComponent(id));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_delegate_list": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.child_key_id) params.child_key_id = String(args.child_key_id);
+      if (args.status) params.status = String(args.status);
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/delegate" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 4: Sub-wallet ─── */
+    case "agentpay_subwallet_open": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { budget: Number(args.budget) };
+      if (args.parent_repo) body.parent_repo = String(args.parent_repo).trim();
+      if (args.label) body.label = String(args.label);
+      if (args.task) body.task = String(args.task);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      if (args.idempotency_key) body.idempotency_key = String(args.idempotency_key);
+      const headers = {};
+      if (args.idempotency_key) headers["Idempotency-Key"] = String(args.idempotency_key);
+      const r = await api("/api/subwallet/open", { method: "POST", body, headers });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_subwallet_spend": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        to_repo: String(args.to_repo || "").trim(),
+        amount: Number(args.amount),
+      };
+      if (args.task) body.task = String(args.task);
+      const r = await api("/api/subwallet/spend", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_subwallet_close": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/subwallet/close", { method: "POST", body: { id } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_subwallet_list": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status);
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/subwallet" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+
+    /* ─── Stage 4: Dispute ─── */
+    case "agentpay_dispute_open": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        claim_id: String(args.claim_id || "").trim(),
+        reason: String(args.reason || ""),
+      };
+      if (args.evidence_uri) body.evidence_uri = String(args.evidence_uri);
+      if (args.evidence_hash) body.evidence_hash = String(args.evidence_hash);
+      if (args.complainant_bond != null) body.complainant_bond = Number(args.complainant_bond);
+      if (args.arbiter_bond_required != null) body.arbiter_bond_required = Number(args.arbiter_bond_required);
+      if (args.min_arbiters != null) body.min_arbiters = Number(args.min_arbiters);
+      if (args.ttl_seconds != null) body.ttl_seconds = Number(args.ttl_seconds);
+      const r = await api("/api/dispute/open", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_dispute_accept": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = { id: String(args.id || "").trim() };
+      if (args.arbiter_repo) body.arbiter_repo = String(args.arbiter_repo).trim();
+      if (args.bond_usd != null) body.bond_usd = Number(args.bond_usd);
+      const r = await api("/api/dispute/accept", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_dispute_vote": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const body = {
+        id: String(args.id || "").trim(),
+        decision: String(args.decision || "").toLowerCase(),
+      };
+      if (args.split_bps != null) body.split_bps = Number(args.split_bps);
+      if (args.note) body.note = String(args.note);
+      if (args.arbiter_repo) body.arbiter_repo = String(args.arbiter_repo).trim();
+      const r = await api("/api/dispute/vote", { method: "POST", body });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_dispute_execute": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/dispute/execute", { method: "POST", body: { id } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_dispute_cancel": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/dispute/cancel", { method: "POST", body: { id } });
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_dispute_get": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const id = String(args.id || "").trim();
+      if (!id) return textResult({ ok: false, error: "id required" }, true);
+      const r = await api("/api/dispute/" + encodeURIComponent(id));
+      return textResult(r.data, isFail(r));
+    }
+    case "agentpay_dispute_list": {
+      const blocked = needKey();
+      if (blocked) return blocked;
+      const params = {};
+      if (args.repo) params.repo = String(args.repo).trim();
+      if (args.status) params.status = String(args.status);
+      if (args.claim_id) params.claim_id = String(args.claim_id);
+      if (args.limit != null) params.limit = Number(args.limit);
+      const r = await api("/api/dispute" + qstr(params));
+      return textResult(r.data, isFail(r));
+    }
+
+
     default:
       return textResult({ ok: false, error: "Unknown tool: " + name }, true);
   }
@@ -2136,7 +2828,7 @@ async function main() {
   const server = new Server(
     {
       name: "agentpay",
-      version: "0.4.0",
+      version: "0.5.0",
     },
     {
       capabilities: {
