@@ -32,8 +32,6 @@ import {
   CREDIT_REP_FAIL_PENALTY,
 } from "./constants.js";
 
-/* ─── Heartbeat Continuity (dead-agent recovery) ─── */
-
 export function parseContInterval(body) {
   const sec = Number(body.interval_sec ?? body.interval);
   if (Number.isFinite(sec)) {
@@ -79,7 +77,6 @@ export async function loadContSession(env, id) {
   }
 }
 
-/** Recover one session (bond movement + status). Caller must have claimed status. */
 export async function recoverContinuitySession(env, row, reason, t0, ctx) {
   const bond = Number(row.bond_usd || 0);
   const action = String(row.recovery_action || "refund");
@@ -142,7 +139,6 @@ export async function recoverContinuitySession(env, row, reason, t0, ctx) {
       if (stmts.length) await env.DB.batch(stmts);
       paidTo = row.owner_repo;
     } else {
-      // refund
       paidTo = row.owner_repo;
       await ensureAccount(env, paidTo);
       await env.DB.batch([
@@ -278,20 +274,9 @@ export async function handleContinuityOpen(request, env, ctx) {
            ?13, ?14, datetime('now'), datetime('now')
          )`
       ).bind(
-        id,
-        ownerRepo,
-        successorRepo,
-        refType,
-        refId,
-        bond,
-        intervalSec,
-        graceSec,
-        missLimit,
-        modifier,
-        recoveryAction,
-        slashBps,
-        authUser.id,
-        label
+        id, ownerRepo, successorRepo, refType, refId, bond,
+        intervalSec, graceSec, missLimit, modifier,
+        recoveryAction, slashBps, authUser.id, label
       ),
     ];
     if (bond > 0) {
@@ -324,33 +309,20 @@ export async function handleContinuityOpen(request, env, ctx) {
 
   if (authUser.id) {
     scheduleWebhook(ctx, env, authUser.id, "continuity.opened", {
-      id,
-      owner_repo: ownerRepo,
-      successor_repo: successorRepo,
-      bond_usd: bond,
-      interval_sec: intervalSec,
-      grace_sec: graceSec,
-      recovery_action: recoveryAction,
-      status: "active",
+      id, owner_repo: ownerRepo, successor_repo: successorRepo,
+      bond_usd: bond, interval_sec: intervalSec, grace_sec: graceSec,
+      recovery_action: recoveryAction, status: "active",
     });
   }
 
   return json(request, {
     ok: true,
     session: {
-      id,
-      owner_repo: ownerRepo,
-      successor_repo: successorRepo,
-      bond_usd: bond,
-      status: "active",
-      interval_sec: intervalSec,
-      grace_sec: graceSec,
-      miss_limit: missLimit,
-      recovery_action: recoveryAction,
-      slash_bps: slashBps,
-      ref_type: refType,
-      ref_id: refId,
-      label,
+      id, owner_repo: ownerRepo, successor_repo: successorRepo,
+      bond_usd: bond, status: "active",
+      interval_sec: intervalSec, grace_sec: graceSec, miss_limit: missLimit,
+      recovery_action: recoveryAction, slash_bps: slashBps,
+      ref_type: refType, ref_id: refId, label,
     },
     latency_ms: Date.now() - t0,
     hint: "POST /api/continuity/beat { id } before next_deadline_at or recovery fires.",
@@ -388,7 +360,6 @@ export async function handleContinuityBeat(request, env, ctx) {
     (authUser.auth_via === "api_key" && authUser.default_repo === row.owner_repo);
   if (!allowed) return bad(request, "Not authorized to heartbeat this session", 403);
 
-  // If already past deadline, do not accept beat — force recovery path
   if (row.next_deadline_at) {
     const expMs = Date.parse(String(row.next_deadline_at).replace(" ", "T") + "Z");
     if (Number.isFinite(expMs) && expMs < Date.now()) {
@@ -422,17 +393,13 @@ export async function handleContinuityBeat(request, env, ctx) {
 
   if (row.created_by) {
     scheduleWebhook(ctx, env, row.created_by, "continuity.beat", {
-      id,
-      owner_repo: row.owner_repo,
-      next_deadline_at: upd.next_deadline_at,
-      status: "active",
+      id, owner_repo: row.owner_repo,
+      next_deadline_at: upd.next_deadline_at, status: "active",
     });
   }
 
   return json(request, {
-    ok: true,
-    id,
-    status: "active",
+    ok: true, id, status: "active",
     last_heartbeat_at: upd.last_heartbeat_at,
     next_deadline_at: upd.next_deadline_at,
     latency_ms: Date.now() - t0,
@@ -496,19 +463,12 @@ export async function handleContinuityClose(request, env, ctx) {
 
   if (row.created_by) {
     scheduleWebhook(ctx, env, row.created_by, "continuity.closed", {
-      id,
-      owner_repo: row.owner_repo,
-      refunded: bond,
-      status: "closed",
+      id, owner_repo: row.owner_repo, refunded: bond, status: "closed",
     });
   }
 
   return json(request, {
-    ok: true,
-    id,
-    status: "closed",
-    refunded: bond,
-    latency_ms: Date.now() - t0,
+    ok: true, id, status: "closed", refunded: bond, latency_ms: Date.now() - t0,
   });
 }
 
@@ -535,7 +495,6 @@ export async function handleContinuityRecover(request, env, ctx) {
   if (!row) return bad(request, "Session not found", 404);
   if (row.status !== "active") return bad(request, "Session not active", 400);
 
-  // Manual recover: creator, owner, or successor may trigger if deadline passed
   const pastDeadline =
     row.next_deadline_at &&
     Date.parse(String(row.next_deadline_at).replace(" ", "T") + "Z") < Date.now();
@@ -556,11 +515,7 @@ export async function handleContinuityRecover(request, env, ctx) {
 
   const result = await recoverContinuitySession(env, claim, body.reason || "manual_recover", t0, ctx);
   return json(request, {
-    ok: true,
-    id,
-    status: "recovered",
-    ...result,
-    latency_ms: Date.now() - t0,
+    ok: true, id, status: "recovered", ...result, latency_ms: Date.now() - t0,
   });
 }
 
@@ -644,7 +599,6 @@ export async function expireContinuitySessions(env, ctx) {
         const nextMiss = Number(row.miss_count || 0) + 1;
 
         if (nextMiss < missLimit) {
-          // Soft miss: extend once more by interval only, increment miss_count
           const intervalSec = Number(row.interval_sec);
           const modifier = "+" + intervalSec + " seconds";
           await env.DB.prepare(
@@ -661,11 +615,8 @@ export async function expireContinuitySessions(env, ctx) {
           });
           if (row.created_by) {
             scheduleWebhook(ctx, env, row.created_by, "continuity.missed", {
-              id: row.id,
-              owner_repo: row.owner_repo,
-              miss_count: nextMiss,
-              miss_limit: missLimit,
-              status: "active",
+              id: row.id, owner_repo: row.owner_repo,
+              miss_count: nextMiss, miss_limit: missLimit, status: "active",
             });
           }
           continue;
@@ -690,5 +641,3 @@ export async function expireContinuitySessions(env, ctx) {
   }
   return { recovered, bond_total: bondTotal, latency_ms: Date.now() - t0 };
 }
-
-
