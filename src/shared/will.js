@@ -1,15 +1,5 @@
 /**
  * Agent Will — owner names heirs; on retire/death, balance splits by bps.
- *
- * PUT|POST /api/will          { repo?, heirs:[{repo,bps}], reserve_usd?, auto_on_continuity_fail?, note? }
- * GET  /api/will              ?repo=
- * POST /api/will/revoke       { repo? }
- * POST /api/will/execute      { repo?, idempotency_key?, trigger? }
- * GET  /api/will/executions   ?repo=&limit=
- *
- * Session owner preferred for PUT/revoke/execute.
- * API key: only if default_repo matches and (legacy or pay scope) for execute.
- * Execute is one-shot; status → executed; optional wallet lock via agent_limits.
  */
 import { json, bad } from "./http.js";
 import { parseRepo, parseAmount, randomId } from "./utils.js";
@@ -123,23 +113,17 @@ function resolveRepo(body, authUser) {
   return repo;
 }
 
-/** Owner session, or API key (lab keys often have no default_repo). */
 function canManageWill(authUser, repoId, willOwnerUserId) {
   if (authUser.auth_via === "session") {
     if (willOwnerUserId && authUser.id === willOwnerUserId) return true;
-    // Creating: any signed-in user may set will for a repo they claim (lab uses swarm/*)
     if (!willOwnerUserId) return true;
     return authUser.id === willOwnerUserId;
   }
   if (authUser.auth_via === "api_key") {
-    // Same user id as owner
     if (willOwnerUserId && authUser.id === willOwnerUserId) return true;
-    // Key bound to this agent
     if (authUser.default_repo && parseRepo(authUser.default_repo) === repoId) {
       return true;
     }
-    // Unbound / multi-repo lab keys (pay/split style) may act on any named repo
-    // Scope still enforced on execute via applyScopeVerb + checkKeyScope
     return true;
   }
   return false;
@@ -189,7 +173,6 @@ export async function handleWillUpsert(request, env, ctx) {
   let reserve = 0;
   if (body.reserve_usd != null || body.reserve != null) {
     const raw = body.reserve_usd ?? body.reserve;
-    // 0 is valid (pay out full balance). parseAmount often rejects 0 as "no amount".
     if (raw === 0 || raw === "0" || raw === 0.0) {
       reserve = 0;
     } else {
@@ -236,7 +219,6 @@ export async function handleWillUpsert(request, env, ctx) {
     return bad(request, "Not authorized", 403);
   }
 
-  // Prefer session for create ownership
   const ownerId = existing
     ? existing.owner_user_id
     : authUser.id || authUser.user_id || "unknown";
@@ -260,9 +242,7 @@ export async function handleWillUpsert(request, env, ctx) {
         ).bind(willId, auto, minMissed, reserve, note)
       );
       stmts.push(
-        env.DB.prepare(`DELETE FROM agent_will_heirs WHERE will_id = ?1`).bind(
-          willId
-        )
+        env.DB.prepare(`DELETE FROM agent_will_heirs WHERE will_id = ?1`).bind(willId)
       );
     } else {
       stmts.push(
@@ -409,10 +389,6 @@ export async function handleWillRevoke(request, env, ctx) {
   return json(request, { ok: true, id: will.id, status: "revoked" });
 }
 
-/**
- * Core execute — used by HTTP handler and continuity auto path.
- * @param {string} trigger manual | continuity | admin
- */
 export async function executeWill(env, ctx, {
   repoId,
   authUser,
@@ -423,47 +399,21 @@ export async function executeWill(env, ctx, {
   const t0 = Date.now();
   const will = await loadWillByRepo(env, repoId);
   if (!will) {
-    return {
-      ok: false,
-      status: 404,
-      error: "No will for this repo",
-      code: "will_missing",
-    };
+    return { ok: false, status: 404, error: "No will for this repo", code: "will_missing" };
   }
   if (will.status === "executed") {
-    return {
-      ok: false,
-      status: 400,
-      error: "Will already executed",
-      code: "will_executed",
-      will_id: will.id,
-    };
+    return { ok: false, status: 400, error: "Will already executed", code: "will_executed", will_id: will.id };
   }
   if (will.status === "revoked") {
-    return {
-      ok: false,
-      status: 400,
-      error: "Will is revoked",
-      code: "will_revoked",
-    };
+    return { ok: false, status: 400, error: "Will is revoked", code: "will_revoked" };
   }
   if (will.status !== "active") {
-    return {
-      ok: false,
-      status: 400,
-      error: "Will not active",
-      code: "will_inactive",
-    };
+    return { ok: false, status: 400, error: "Will not active", code: "will_inactive" };
   }
 
   const heirsRows = await loadWillHeirs(env, will.id);
   if (!heirsRows.length) {
-    return {
-      ok: false,
-      status: 400,
-      error: "Will has no heirs",
-      code: "no_heirs",
-    };
+    return { ok: false, status: 400, error: "Will has no heirs", code: "no_heirs" };
   }
   const legsIn = heirsRows.map((h) => ({
     repo: h.to_repo,
@@ -478,11 +428,7 @@ export async function executeWill(env, ctx, {
       .bind(repoId)
       .first();
   } catch (e) {
-    return {
-      ok: false,
-      status: 500,
-      error: "accounts read failed: " + (e.message || e),
-    };
+    return { ok: false, status: 500, error: "accounts read failed: " + (e.message || e) };
   }
   const balance = Number(balRow && balRow.balance != null ? balRow.balance : 0);
   const reserve = Math.max(0, Number(will.reserve_usd || 0));
@@ -510,17 +456,11 @@ export async function executeWill(env, ctx, {
         .bind(idem)
         .first();
       if (existing) {
-        return {
-          ok: true,
-          replayed: true,
-          execution_id: existing.id,
-          will_id: will.id,
-        };
+        return { ok: true, replayed: true, execution_id: existing.id, will_id: will.id };
       }
     } catch (_) {}
   }
 
-  // Safety / scopes only when human or key triggered
   if (authUser && request) {
     applyScopeVerb(authUser, "pay");
     if (authUser.auth_via === "api_key") {
@@ -559,7 +499,6 @@ export async function executeWill(env, ctx, {
     };
     const blocked = await safetyGate(request, env, authUser, repoId, payable);
     if (blocked) {
-      // blocked is a Response
       return { ok: false, response: blocked };
     }
   }
@@ -594,7 +533,6 @@ export async function executeWill(env, ctx, {
       .bind(will.id)
       .first();
     if (!claim) {
-      // race
       try {
         await env.DB.prepare(
           `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
@@ -602,12 +540,7 @@ export async function executeWill(env, ctx, {
           .bind(payable, repoId)
           .run();
       } catch (_) {}
-      return {
-        ok: false,
-        status: 409,
-        error: "Will execute race",
-        code: "will_race",
-      };
+      return { ok: false, status: 409, error: "Will execute race", code: "will_race" };
     }
 
     const stmts = [
@@ -620,14 +553,9 @@ export async function executeWill(env, ctx, {
            ?7, ?8, datetime('now')
          )`
       ).bind(
-        execId,
-        will.id,
-        repoId,
-        payable,
+        execId, will.id, repoId, payable,
         String(trigger || "manual").slice(0, 40),
-        allocated.length,
-        idem,
-        createdBy
+        allocated.length, idem, createdBy
       ),
       env.DB.prepare(
         `UPDATE agent_wills
@@ -659,19 +587,15 @@ export async function executeWill(env, ctx, {
           `INSERT INTO transactions (from_repo, to_repo, amount, task, status, latency_ms, idempotency_key)
            VALUES (?1, ?2, ?3, ?4, 'success', ?5, ?6)`
         ).bind(
-          repoId,
-          leg.repo,
-          leg.amount_usd,
+          repoId, leg.repo, leg.amount_usd,
           "will:" + will.id + ":" + leg.repo,
-          latency,
-          legIdem
+          latency, legIdem
         )
       );
     }
 
     await env.DB.batch(stmts);
 
-    // Soft-lock wallet after settle (best-effort; columns may vary)
     try {
       await env.DB.prepare(
         `UPDATE agent_limits
@@ -837,10 +761,6 @@ export async function handleWillExecutionsList(request, url, env) {
   }
 }
 
-/**
- * Optional: after continuity recovery, auto-execute will if flagged.
- * Call from recoverContinuitySession or expireContinuitySessions.
- */
 export async function maybeAutoExecuteWillOnDeath(env, ctx, ownerRepo) {
   try {
     const will = await loadWillByRepo(env, ownerRepo);
