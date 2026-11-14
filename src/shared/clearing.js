@@ -1,5 +1,5 @@
 /**
- * Shared Clearing — multilateral clearing batches + HMAC settlement manifests.
+ * Shared Clearing — multilateral clearing batches + HMAC settlement manifests. 
  */
 import { json, bad } from "./http.js";
 import {
