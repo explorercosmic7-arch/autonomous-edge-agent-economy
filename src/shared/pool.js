@@ -1,4 +1,4 @@
-/**
+/** 
  * Shared Pool — collaborative / swarm co-funding + expireCollaborativePools cron.
  */
 import { json, bad } from "./http.js";
