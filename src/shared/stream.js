@@ -336,3 +336,4 @@ export async function handleStreamList(request, url, env) {
     return bad(request, "streams table missing — run d1-stream-migration.sql", 500);
   }
 }
+
