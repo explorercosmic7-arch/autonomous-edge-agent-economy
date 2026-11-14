@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/**
+/** 
  * AgentPay MCP Server v0.4.0 — Stage 1–3
  *
  * Thin adapter: MCP tools → live Cloudflare Worker APIs.
