@@ -27,12 +27,6 @@ import {
   EXPIRE_SUBWALLET_BATCH,
 } from "./constants.js";
 
-/* ─── Ephemeral sub-wallets (task wallets) ───
- * Parent debits budget → held in system/subwallet.
- * Child spends only via POST /api/subwallet/spend { id, to_repo, amount }.
- * Close / TTL expire → refund remaining to parent. Blast radius = budget only.
- */
-
 export function parseSubWalletTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
   if (Number.isFinite(sec)) {
@@ -234,7 +228,6 @@ export async function handleSubWalletSpend(request, env) {
     });
   }
 
-  // TTL check
   if (row.expires_at) {
     const expMs = Date.parse(String(row.expires_at).replace(" ", "T") + "Z");
     if (Number.isFinite(expMs) && expMs < Date.now()) {
@@ -244,7 +237,6 @@ export async function handleSubWalletSpend(request, env) {
     }
   }
 
-  // Authorization: creator or parent default agent
   const allowed =
     authUser.id === row.created_by ||
     (authUser.default_repo && authUser.default_repo === row.parent_repo);
@@ -367,7 +359,6 @@ export async function closeSubWalletInternal(env, row, reason, t0) {
 
   if (!claim) return 0;
 
-  // Use pre-update remaining from row (claim.remaining already 0)
   const refund = Math.max(
     0,
     Math.round(Number(row.remaining != null ? row.remaining : row.budget - row.spent) * 1e6) / 1e6
