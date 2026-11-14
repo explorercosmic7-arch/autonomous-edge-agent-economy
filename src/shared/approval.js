@@ -1,16 +1,5 @@
 /**
  * Approval gates — intelligent rules + pending request lifecycle.
- *
- * Design (v1):
- *  - No debit until human approves (simple, safe).
- *  - Account-wide settings (user_id), same pattern as fleet_limits.
- *  - Rules OR'd: amount threshold, new counterparty, task prefix match.
- *  - Soft alerts (webhook only) separate from hard approval holds.
- *  - X-Approval-Id is validated before gate; marked consumed only AFTER
- *    a successful pay (so velocity/fleet failures do not burn the approval).
- *
- * Used by: safetyGate (check), meApproval routes (settings / list / decide),
- *          ledger handlePay (validate + mark consumed).
  */
 import { randomId, parseRepo } from "./utils.js";
 import { logSafetyEvent } from "./safety.js";
@@ -19,8 +8,6 @@ import { scheduleWebhook } from "./webhooks.js";
 const DEFAULT_TTL = 3600;
 const MIN_TTL = 60;
 const MAX_TTL = 7 * 24 * 3600;
-
-/* ─── Settings ─── */
 
 export async function ensureApprovalSettings(env, userId) {
   if (!userId) return;
@@ -80,10 +67,8 @@ export function serializeApprovalSettings(row) {
   };
 }
 
-/* ─── Counterparty history (new peer detection) ─── */
-
 async function hasPaidCounterpartyBefore(env, userId, toRepo) {
-  if (!userId || !toRepo) return true; // fail open on missing data
+  if (!userId || !toRepo) return true;
   try {
     const row = await env.DB.prepare(
       `SELECT 1 AS ok FROM transactions t
@@ -131,12 +116,6 @@ async function hasPaidCounterpartyBefore(env, userId, toRepo) {
   return false;
 }
 
-/* ─── Intelligent rule evaluation ─── */
-
-/**
- * Evaluate approval + alert rules for a proposed spend.
- * Returns { needApproval, softAlert, rule_code, reason, settings }.
- */
 export async function evaluateApprovalRules(
   env,
   userId,
@@ -221,8 +200,6 @@ export async function evaluateApprovalRules(
   };
 }
 
-/* ─── Requests ─── */
-
 export async function createApprovalRequest(
   env,
   {
@@ -258,40 +235,23 @@ export async function createApprovalRequest(
      )`
   )
     .bind(
-      id,
-      userId,
-      fromRepo,
-      toRepo,
-      Number(amount),
+      id, userId, fromRepo, toRepo, Number(amount),
       task ? String(task).slice(0, 200) : null,
       rule_code || "approval_required",
       reason ? String(reason).slice(0, 500) : null,
       idempotency_key || null,
       pay_meta ? JSON.stringify(pay_meta).slice(0, 4000) : null,
-      api_key_id || null,
-      expiresAt
+      api_key_id || null, expiresAt
     )
     .run();
   return {
-    id,
-    status: "pending",
-    expires_at: expiresAt,
-    rule_code,
-    reason,
-    amount: Number(amount),
-    from_repo: fromRepo,
-    to_repo: toRepo,
-    task: task || null,
+    id, status: "pending", expires_at: expiresAt, rule_code, reason,
+    amount: Number(amount), from_repo: fromRepo, to_repo: toRepo, task: task || null,
   };
 }
 
-/**
- * Expire stale pending rows (best-effort).
- * Emits approval.expired webhooks for rows that transition (capped).
- */
 export async function expirePendingApprovals(env, userId = null) {
   try {
-    // Snapshot a few rows about to expire so we can notify
     let toNotify = [];
     try {
       if (userId) {
@@ -374,11 +334,7 @@ export async function getApprovalRequest(env, id) {
   }
 }
 
-export async function listApprovalRequests(
-  env,
-  userId,
-  { status, limit } = {}
-) {
+export async function listApprovalRequests(env, userId, { status, limit } = {}) {
   await expirePendingApprovals(env, userId);
   const lim = Math.min(50, Math.max(1, Number(limit) || 20));
   try {
@@ -423,9 +379,6 @@ export async function countPendingApprovals(env, userId) {
   }
 }
 
-/**
- * Main gate helper for safetyGate.
- */
 export async function checkApprovalGate(
   env,
   authUser,
@@ -437,10 +390,7 @@ export async function checkApprovalGate(
   const userId = authUser.id;
   const to = parseRepo(toRepo) || String(toRepo || "").trim() || null;
   const evalResult = await evaluateApprovalRules(env, userId, {
-    fromRepo,
-    toRepo: to,
-    amount,
-    task,
+    fromRepo, toRepo: to, amount, task,
   });
   if (!evalResult) return null;
 
@@ -478,10 +428,7 @@ export async function checkApprovalGate(
        ORDER BY created_at DESC LIMIT 1`
     )
       .bind(
-        userId,
-        fromRepo,
-        to || "",
-        Number(amount),
+        userId, fromRepo, to || "", Number(amount),
         task ? String(task).slice(0, 200) : null
       )
       .first();
@@ -518,12 +465,7 @@ export async function checkApprovalGate(
     user_id: userId,
     repo_id: fromRepo,
     reason: req.reason,
-    meta: {
-      approval_id: req.id,
-      rule_code: req.rule_code,
-      amount,
-      to_repo: to,
-    },
+    meta: { approval_id: req.id, rule_code: req.rule_code, amount, to_repo: to },
   });
   scheduleWebhook(ctx || null, env, userId, "approval.requested", {
     approval_id: req.id,
@@ -547,10 +489,6 @@ export async function checkApprovalGate(
   };
 }
 
-/**
- * Decide approve | reject on a pending request.
- * Approve does NOT auto-pay — agent must retry /api/pay with X-Approval-Id.
- */
 export async function decideApproval(
   env,
   { id, userId, decision, resolved_by, note }
@@ -609,12 +547,7 @@ export async function decideApproval(
          resolve_note = ?4
      WHERE id = ?1 AND status = 'pending'`
   )
-    .bind(
-      id,
-      status,
-      resolved_by || userId,
-      note ? String(note).slice(0, 400) : null
-    )
+    .bind(id, status, resolved_by || userId, note ? String(note).slice(0, 400) : null)
     .run();
 
   await logSafetyEvent(env, "approval." + status, {
@@ -656,10 +589,6 @@ export async function decideApproval(
   };
 }
 
-/**
- * Validate an approved allowance for this pay — does NOT burn the id.
- * Call markApprovalConsumed only after a successful debit.
- */
 export async function validateApprovedAllowance(
   env,
   authUser,
@@ -675,32 +604,16 @@ export async function validateApprovedAllowance(
     return { ok: false, error: "Invalid approval", code: "approval_invalid" };
   }
   if (row.status === "pending") {
-    return {
-      ok: false,
-      error: "Still pending approval",
-      code: "approval_pending",
-    };
+    return { ok: false, error: "Still pending approval", code: "approval_pending" };
   }
   if (row.status === "rejected" || row.status === "expired") {
-    return {
-      ok: false,
-      error: "Approval " + row.status,
-      code: "approval_" + row.status,
-    };
+    return { ok: false, error: "Approval " + row.status, code: "approval_" + row.status };
   }
   if (row.status === "consumed" || row.status === "cancelled") {
-    return {
-      ok: false,
-      error: "Approval already used",
-      code: "approval_consumed",
-    };
+    return { ok: false, error: "Approval already used", code: "approval_consumed" };
   }
   if (row.status !== "approved") {
-    return {
-      ok: false,
-      error: "Approval not approved",
-      code: "approval_invalid",
-    };
+    return { ok: false, error: "Approval not approved", code: "approval_invalid" };
   }
   try {
     const fresh = await env.DB.prepare(
@@ -714,38 +627,21 @@ export async function validateApprovedAllowance(
     }
   } catch (_) {}
   if (String(row.from_repo) !== String(fromRepo)) {
-    return {
-      ok: false,
-      error: "from_repo mismatch",
-      code: "approval_mismatch",
-    };
+    return { ok: false, error: "from_repo mismatch", code: "approval_mismatch" };
   }
   if (String(row.to_repo) !== String(toRepo || "")) {
-    return {
-      ok: false,
-      error: "to_repo mismatch",
-      code: "approval_mismatch",
-    };
+    return { ok: false, error: "to_repo mismatch", code: "approval_mismatch" };
   }
   if (Math.abs(Number(row.amount) - Number(amount)) > 1e-9) {
-    return {
-      ok: false,
-      error: "amount mismatch",
-      code: "approval_mismatch",
-    };
+    return { ok: false, error: "amount mismatch", code: "approval_mismatch" };
   }
   return { ok: true, approval_id: approvalId, row };
 }
 
-/** @deprecated name — same as validateApprovedAllowance (no burn). */
 export async function consumeApprovedAllowance(env, authUser, approvalId, ctx) {
   return validateApprovedAllowance(env, authUser, approvalId, ctx);
 }
 
-/**
- * Mark approved id as consumed — call only after successful settlement.
- * Emits approval.consumed webhook when transition succeeds.
- */
 export async function markApprovalConsumed(env, approvalId, userId) {
   if (!approvalId) return { ok: false };
   try {
