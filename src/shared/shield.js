@@ -16,8 +16,6 @@ import {
   SHIELD_MAX_LEVEL,
 } from "./constants.js";
 
-/* ─── Edge Shield helpers ─── */
-
 export async function logShieldEvent(env, event, { scope, scope_id, level, reason, meta } = {}) {
   try {
     await env.DB.prepare(
@@ -58,7 +56,6 @@ export async function getShield(env, id) {
     await ensureShieldRow(env, id);
     const row = await env.DB.prepare(`SELECT * FROM edge_shield WHERE id = ?1`).bind(id).first();
     if (!row) return { id, level: 0, reason: null, cools_at: null };
-    // auto cool-down
     if (row.cools_at && Number(row.level) > 0) {
       const ms = Date.parse(String(row.cools_at).replace(" ", "T") + "Z");
       if (Number.isFinite(ms) && ms < Date.now()) {
@@ -120,7 +117,6 @@ export async function setShieldLevel(env, id, level, reason, { cooldownSec } = {
   return getShield(env, id);
 }
 
-/** Count recent wallet locks — drives global auto-trip. */
 export async function countRecentWalletLocks(env) {
   try {
     const row = await env.DB.prepare(
@@ -136,10 +132,6 @@ export async function countRecentWalletLocks(env) {
   }
 }
 
-/**
- * Shield gate: returns bad() Response if spend blocked, or null if OK.
- * Throttle level only annotates; FREEZE+ blocks discretionary spends.
- */
 export async function checkShieldGate(request, env, fromRepo) {
   const global = await getShield(env, "global");
   const gLevel = Number(global.level || 0);
