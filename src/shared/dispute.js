@@ -34,32 +34,6 @@ import {
   CREDIT_REP_FAIL_PENALTY,
 } from "./constants.js";
 
-/* ─── Dispute / Arbitration (Supreme Court) ───
- * Closes the work trust loop when attestation / parties disagree.
- *
- * POST /api/dispute/open    { claim_id, reason, evidence_uri?, evidence_hash?, complainant_bond?,
- *                             arbiter_bond_required?, min_arbiters?, ttl_seconds? }
- *   Buyer (or locked payer) opens court. Optional complainant bond locked to system/dispute.
- *   Claim must be locked (funds in system/work). Claim marked disputed.
- *
- * POST /api/dispute/accept  { id, arbiter_repo?, bond_usd? }
- *   Bonded arbiter joins the panel (stake required).
- *
- * POST /api/dispute/vote    { id, decision: release|slash|split, split_bps?, note? }
- *   Arbiter casts vote. When quorum met → auto-execute.
- *
- * POST /api/dispute/execute { id }  — force execute if quorum already reached
- * POST /api/dispute/cancel  { id }  — complainant cancels before ruling (bonds return)
- * GET  /api/dispute         ?repo=&status=&claim_id=
- * GET  /api/dispute/:id
- * Cron: expireDisputes — timeout → default release-to-provider with bond penalties
- *
- * Decisions:
- *   release — pay locked amount to provider (buyer loses dispute)
- *   slash   — refund buyer; provider may lose respondent bond to slash pool
- *   split   — split locked amount by split_bps (bps to provider)
- */
-
 export function parseDisputeTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
   if (Number.isFinite(sec)) {
@@ -112,10 +86,6 @@ export async function countOpenDisputeForClaim(env, claimId) {
   }
 }
 
-/**
- * Execute a ruled dispute: move work lock + bonds according to decision.
- * Idempotent on status=executed.
- */
 export async function executeDisputeRuling(env, dispute, t0, ctx) {
   if (!dispute || !["ruled", "open", "accepted"].includes(dispute.status)) {
     return { ok: false, error: "not executable" };
@@ -143,7 +113,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
     return { ok: false, error: "unknown decision" };
   }
 
-  // Mark executed first (race guard)
   const claimExec = await env.DB.prepare(
     `UPDATE work_disputes
      SET status = 'executed', executed_at = datetime('now'), updated_at = datetime('now'),
@@ -161,7 +130,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
   await ensureAccount(env, dispute.buyer_repo);
 
   const stmts = [];
-  // Work funds: system/work holds the lock
   if (toProvider > 0) {
     stmts.push(
       env.DB.prepare(
@@ -185,13 +153,11 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
     );
   }
 
-  // Bonds: return winners, slash losers (simplified: complainant loses bond on release, respondent loses on slash)
   const cBond = Number(dispute.complainant_bond_usd || 0);
   const rBond = Number(dispute.respondent_bond_usd || 0);
   let cRet = 0, rRet = 0, bondSlash = 0;
 
   if (decision === "release") {
-    // Buyer lost — complainant bond → slash pool; respondent bond returns
     if (cBond > 0) {
       bondSlash += cBond;
       await ensureAccount(env, SYSTEM_SLASH_POOL);
@@ -218,7 +184,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
       );
     }
   } else if (decision === "slash") {
-    // Provider lost — respondent bond → slash; complainant returns
     if (rBond > 0) {
       bondSlash += rBond;
       await ensureAccount(env, SYSTEM_SLASH_POOL);
@@ -245,7 +210,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
       );
     }
   } else {
-    // split — return both bonds (good-faith disagreement)
     if (cBond > 0) {
       cRet = cBond;
       stmts.push(
@@ -272,7 +236,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
     }
   }
 
-  // Return arbiter bonds
   try {
     const aq = await env.DB.prepare(
       `SELECT id, arbiter_repo, bond_usd FROM dispute_arbiters
@@ -306,7 +269,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
 
   if (stmts.length) await env.DB.batch(stmts);
 
-  // Close claim
   if (claim && ["locked", "disputed", "attested"].includes(claim.status)) {
     try {
       await env.DB.prepare(
@@ -336,7 +298,6 @@ export async function executeDisputeRuling(env, dispute, t0, ctx) {
     meta: { decision, toProvider, toBuyer, bondSlash },
   });
 
-  // Reputation
   if (decision === "release") {
     await adjustRep(env, dispute.provider_repo, CREDIT_REP_SUCCESS_BONUS * 2, "dispute_won", id);
     await adjustRep(env, dispute.buyer_repo, -CREDIT_REP_FAIL_PENALTY, "dispute_lost", id);
@@ -375,7 +336,6 @@ export async function tryQuorumAndExecute(env, disputeId, ctx) {
   const votes = Number(d.votes_release || 0) + Number(d.votes_slash || 0) + Number(d.votes_split || 0);
   if (votes < minA) return null;
 
-  // Majority decision
   const tallies = [
     { k: "release", n: Number(d.votes_release || 0) },
     { k: "slash", n: Number(d.votes_slash || 0) },
@@ -383,15 +343,12 @@ export async function tryQuorumAndExecute(env, disputeId, ctx) {
   ].sort((a, b) => b.n - a.n);
   const winner = tallies[0];
   if (winner.n <= 0) return null;
-  // Require strict majority of min_arbiters
   if (winner.n < Math.ceil(minA / 2) && winner.n < minA) {
-    // if all min_arbiters voted and there's a unique top — accept
     if (votes < minA) return null;
   }
 
   let splitBps = Number(d.split_bps != null ? d.split_bps : 5000);
   if (winner.k === "split") {
-    // average split_bps from split voters
     try {
       const q = await env.DB.prepare(
         `SELECT AVG(split_bps) AS a FROM dispute_arbiters
@@ -476,11 +433,6 @@ export async function handleDisputeOpen(request, env, ctx) {
   const providerRepo = parseRepo(claim.provider_repo);
   if (!buyerRepo || !providerRepo) return bad(request, "Claim missing buyer/provider", 400);
 
-  // Only buyer (complainant) may open.
-  // Allow when:
-  //  - default_repo is the claim buyer, OR
-  //  - same account that created the claim (API key / session — Lab multi-agent keys), OR
-  //  - same account that locked the claim (locked_by), if column present
   const isBuyerRepo =
     !!(authUser.default_repo && authUser.default_repo === buyerRepo);
   const isClaimCreator =
@@ -503,7 +455,6 @@ export async function handleDisputeOpen(request, env, ctx) {
   const amount = Number(claim.locked_amount || claim.amount || 0);
   if (!(amount > 0)) return bad(request, "Claim has no locked amount to dispute", 400);
 
-  // Complainant bond (default 5% of claim)
   let cBond = body.complainant_bond != null ? parseAmount(body.complainant_bond) : null;
   if (cBond == null) {
     cBond = Math.round(((amount * DISPUTE_DEFAULT_COMPLAINANT_BOND_BPS) / 10000) * 1e6) / 1e6;
@@ -517,7 +468,6 @@ export async function handleDisputeOpen(request, env, ctx) {
   }
   if (arbBondReq == null || arbBondReq < 0) arbBondReq = 0;
 
-  // Optional respondent bond deposit at open (provider may add later via accept-style)
   let rBond = body.respondent_bond != null ? parseAmount(body.respondent_bond) : 0;
   if (rBond == null) rBond = 0;
 
@@ -646,7 +596,6 @@ export async function handleDisputeAccept(request, env, ctx) {
   if (!["open", "accepted"].includes(d.status)) {
     return bad(request, "Dispute not open for arbiters (status=" + d.status + ")", 400);
   }
-  // Arbiters cannot be buyer or provider (impartiality)
   if (arbiterRepo === d.buyer_repo || arbiterRepo === d.provider_repo) {
     return bad(request, "Buyer and provider cannot serve as arbiters on their own case", 403, {
       code: "not_impartial",
@@ -802,7 +751,6 @@ export async function handleDisputeVote(request, env, ctx) {
     note: decision + (splitBps != null ? " bps=" + splitBps : ""),
   });
 
-  // Quorum check
   const exec = await tryQuorumAndExecute(env, id, ctx);
 
   return json(request, {
@@ -843,7 +791,6 @@ export async function handleDisputeExecute(request, env, ctx) {
     return json(request, { ok: true, id, ...result, latency_ms: Date.now() - t0 });
   }
 
-  // Try quorum
   const exec = await tryQuorumAndExecute(env, id, ctx);
   if (exec && exec.ok) {
     return json(request, { ok: true, id, ...exec, latency_ms: Date.now() - t0 });
@@ -883,7 +830,6 @@ export async function handleDisputeCancel(request, env, ctx) {
     (authUser.default_repo && authUser.default_repo === d.buyer_repo);
   if (!allowed) return bad(request, "Only complainant may cancel", 403);
 
-  // Block cancel if any votes already cast
   const votes = Number(d.votes_release || 0) + Number(d.votes_slash || 0) + Number(d.votes_split || 0);
   if (votes > 0) {
     return bad(request, "Cannot cancel after votes have been cast", 400, { code: "votes_exist" });
@@ -899,7 +845,6 @@ export async function handleDisputeCancel(request, env, ctx) {
     .first();
   if (!claim) return bad(request, "Cancel race", 409);
 
-  // Return bonds; restore claim to locked
   const cBond = Number(d.complainant_bond_usd || 0);
   const stmts = [];
   if (cBond > 0) {
@@ -934,7 +879,11 @@ export async function handleDisputeCancel(request, env, ctx) {
           ).bind(SYSTEM_DISPUTE, a.arbiter_repo, b, "dispute-cancel-arbiter-return:" + id)
         );
       }
-      stmts.push(env.DB.prepare(`UPDATE dispute_arbiters SET status = 'refunded' WHERE id = ?1`).bind(a.id));
+      stmts.push(
+        env.DB.prepare(
+          `UPDATE dispute_arbiters SET status = 'refunded' WHERE id = ?1`
+        ).bind(a.id)
+      );
     }
   } catch (_) {}
 
@@ -1047,8 +996,6 @@ export async function expireDisputes(env, ctx) {
       .all();
     for (const row of q.results || []) {
       try {
-        // Timeout default: release to provider (buyer failed to prove) if no votes;
-        // if votes exist, execute majority.
         const votes =
           Number(row.votes_release || 0) +
           Number(row.votes_slash || 0) +
@@ -1060,7 +1007,6 @@ export async function expireDisputes(env, ctx) {
             continue;
           }
         }
-        // Default timeout ruling: release (provider wins) — complainant failed to prosecute
         await env.DB.prepare(
           `UPDATE work_disputes
            SET status = 'ruled', decision = 'release', ruled_by = 'timeout',
@@ -1082,5 +1028,3 @@ export async function expireDisputes(env, ctx) {
   }
   return { expired, latency_ms: Date.now() - t0 };
 }
-
-
