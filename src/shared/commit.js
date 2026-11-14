@@ -1,5 +1,5 @@
 /**
- * Shared Commit — commit–reveal counterfactual pay + expireCommits cron.
+ * Shared Commit — commit–reveal counterfactual pay + expireCommits cron. 
  */
 import { json, bad } from "./http.js";
 import {
