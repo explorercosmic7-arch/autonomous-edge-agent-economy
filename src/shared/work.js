@@ -160,11 +160,6 @@ export async function handleWorkClaim(request, env, ctx) {
   });
 }
 
- handleWorkLock in work.js with this function.
-// Also add imports:
-//   import { maybeAssertInstanceFromBody } from "./agentInstance.js";
-//   import { afterInstanceBlock } from "./securityLog.js";
-
 
 
 export async function handleWorkLock(request, env, ctx) {
