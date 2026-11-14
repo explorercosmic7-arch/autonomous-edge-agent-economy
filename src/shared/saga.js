@@ -27,13 +27,6 @@ import {
   CREDIT_REP_FAIL_PENALTY,
 } from "./constants.js";
 
-/* ─── Multi-agent atomic graphs (saga with money) ───
- * Owner locks total_budget into system/saga.
- * Steps run in order via advance: debit reserved → credit step.to_repo.
- * On failure: compensate walks completed steps reverse and refunds to owner.
- * Cancel (open, no spent): full refund of reserved.
- * Expire open/running past TTL: auto-compensate.
- */
 export function parseSagaTtl(body) {
   const sec = Number(body.ttl_seconds ?? body.ttl);
   if (Number.isFinite(sec)) {
@@ -136,7 +129,6 @@ export async function handleSagaStart(request, env, ctx) {
   total = Math.round(total * 1e6) / 1e6;
   if (total > SAGA_MAX_BUDGET) return bad(request, "total budget exceeds max");
 
-  // Optional explicit budget override (must cover steps)
   if (body.total_budget != null) {
     const tb = parseAmount(body.total_budget);
     if (tb == null || tb < total) {
@@ -298,7 +290,6 @@ export async function handleSagaAdvance(request, env, ctx) {
   }
 
   const amount = Number(step.amount);
-  // Move value from system/saga pool → to_repo (budget already reserved from owner)
   await ensureAccount(env, step.to_repo);
   await ensureAccount(env, SYSTEM_SAGA);
 
@@ -386,7 +377,6 @@ export async function compensateSagaInternal(env, row, reason, t0, ctx) {
   let refunded = 0;
   for (const st of doneSteps) {
     const amt = Number(st.amount);
-    // Reverse: debit to_repo if possible, credit owner; else credit owner from system pool
     await ensureAccount(env, st.to_repo);
     await ensureAccount(env, row.owner_repo);
     const took = await env.DB.prepare(
@@ -396,9 +386,6 @@ export async function compensateSagaInternal(env, row, reason, t0, ctx) {
       .bind(amt, st.to_repo)
       .first();
     const fromRepo = took ? st.to_repo : SYSTEM_SAGA;
-    if (!took) {
-      // system/saga already held remaining reserved; use accounting credit only
-    }
     await env.DB.batch([
       env.DB.prepare(
         `UPDATE accounts SET balance = balance + ?1, updated_at = datetime('now') WHERE repo_id = ?2`
@@ -423,7 +410,6 @@ export async function compensateSagaInternal(env, row, reason, t0, ctx) {
     refunded += amt;
   }
 
-  // Unspent reserved still in system/saga → owner
   const unspent = Math.max(
     0,
     Math.round((Number(row.reserved) - Number(row.spent)) * 1e6) / 1e6
@@ -694,4 +680,3 @@ export async function expireSagas(env, ctx) {
   }
   return { expired, refunded_total: refundedTotal, latency_ms: Date.now() - t0 };
 }
-
