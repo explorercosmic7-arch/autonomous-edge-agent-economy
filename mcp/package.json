@@ -1,13 +1,44 @@
 {
   "name": "agentpay-mcp",
   "version": "0.6.0",
-  "description": "MCP server for AgentPay — Stages 1–5 (pay, hire, standing, agents, escrow, stream, intent, work, split, pool, bond, commit, ticket, saga, netting, clearing, instances, will, delegate, subwallet, dispute, continuity, approvals, fleet, receipts, ledger, passport)",
+  "description": "MCP server for AgentPay — Stages 1–5. Pay, hire, escrow, work, dispute, continuity, and more via the AgentPay Cloudflare Worker.",
   "type": "module",
-  "bin": { "agentpay-mcp": "./src/server.js" },
+  "bin": {
+    "agentpay-mcp": "./src/server.js"
+  },
   "main": "./src/server.js",
-  "scripts": { "start": "node src/server.js", "mcp": "node src/server.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "@modelcontextprotocol/sdk": "^1.12.1" },
-  "keywords": ["mcp", "agentpay", "agents", "payments"],
-  "license": "MIT"
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node src/server.js",
+    "mcp": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  },
+  "keywords": [
+    "mcp",
+    "agentpay",
+    "agents",
+    "payments",
+    "model-context-protocol",
+    "cursor",
+    "claude"
+  ],
+  "author": "Binul Nethaka",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/explorercosmic7-arch/autonomous-edge-agent-economy.git",
+    "directory": "mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/explorercosmic7-arch/autonomous-edge-agent-economy/issues"
+  },
+  "homepage": "https://github.com/explorercosmic7-arch/autonomous-edge-agent-economy/tree/main/mcp#readme"
 }
