@@ -1,6 +1,6 @@
 {
   "name": "edgerailmcp",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "MCP server for AgentPay — Stages 1–5. Pay, hire, escrow, work, dispute, continuity, and more via the AgentPay Cloudflare Worker.",
   "type": "module",
   "bin": {
