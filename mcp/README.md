@@ -3,7 +3,7 @@
 
 # AgentPay MCP Server
 
-**Version 0.6.0 — Stages 1–5**
+**Version 0.6.1 — Stages 1–5**
 
 stdio MCP server that maps tools to the live AgentPay Cloudflare Worker. No local ledger.
 
