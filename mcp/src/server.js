@@ -3209,6 +3209,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("agentpay-mcp failed:", err);
+  console.error("edgerailmcp failed:", err);
   process.exit(1);
 });
