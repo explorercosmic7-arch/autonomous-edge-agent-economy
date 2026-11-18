@@ -154,7 +154,7 @@ Approvals: agent gets `approval_required` + `approval_id` → human `POST /api/m
 │   ├── index.js         # router
 │   └── shared/          # domain modules (pay, hire, work, dispute, continuity, …)
 ├── mcp/
-│   ├── package.json     # agentpay-mcp 0.6.0
+│   ├── package.json     # edgerailmcp 0.6.0
 │   ├── payload.js       # Cursor/Claude config snippet
 │   └── src/server.js    # full MCP tool surface Stages 1–5
 ├── migrations/          # D1 SQL (if present)
