@@ -4,7 +4,7 @@
   "description": "MCP server for AgentPay — Stages 1–5. Pay, hire, escrow, work, dispute, continuity, and more via the AgentPay Cloudflare Worker.",
   "type": "module",
   "bin": {
-    "agentpay-mcp": "./src/server.js"
+    "edgerailmcp": "./src/server.js"
   },
   "main": "./src/server.js",
   "files": [
