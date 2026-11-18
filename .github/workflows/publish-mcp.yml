@@ -1,0 +1,48 @@
+# Publish agentpay-mcp to npm when you push a tag like: mcp-v0.6.0
+# Or run manually: Actions → Publish agentpay-mcp → Run workflow
+
+name: Publish agentpay-mcp
+
+on:
+  push:
+    tags:
+      - "mcp-v*"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type publish to confirm'
+        required: true
+        default: ''
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Check package
+        run: |
+          node -e "const p=require('./package.json'); console.log(p.name, p.version); if(p.name!=='agentpay-mcp') process.exit(1)"
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Dry-run package contents
+        run: npm publish --dry-run
+
+      - name: Publish to npm
+        if: github.event_name == 'push' || github.event.inputs.confirm == 'publish'
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
