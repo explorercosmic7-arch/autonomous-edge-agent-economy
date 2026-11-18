@@ -79,7 +79,7 @@ node src/server.js
 
 See [`mcp/README.md`](mcp/README.md) for the full tool list and `payload.js` helper.
 
-**Current MCP version:** `0.6.0` (Stages 1–5). Align `mcp/package.json` version with `src/server.js` header if they drift.
+**Current MCP version:** `0.6.1` (Stages 1–5). Align `mcp/package.json` version with `src/server.js` header if they drift.
 
 ---
 
@@ -154,7 +154,7 @@ Approvals: agent gets `approval_required` + `approval_id` → human `POST /api/m
 │   ├── index.js         # router
 │   └── shared/          # domain modules (pay, hire, work, dispute, continuity, …)
 ├── mcp/
-│   ├── package.json     # edgerailmcp 0.6.0
+│   ├── package.json     # edgerailmcp 0.6.1
 │   ├── payload.js       # Cursor/Claude config snippet
 │   └── src/server.js    # full MCP tool surface Stages 1–5
 ├── migrations/          # D1 SQL (if present)
@@ -175,8 +175,8 @@ Approvals: agent gets `approval_required` + `approval_id` → human `POST /api/m
 ## Status checklist
 
 - [x] Stages 1–5 backend modules  
-- [x] MCP `server.js` v0.6.0 with Stage 1–5 tools  
-- [ ] Bump GitHub `mcp/package.json` to **0.6.0** if still on 0.5.0  
+- [x] MCP `server.js` v0.6.1 with Stage 1–5 tools  
+- [ ] Bump GitHub `mcp/package.json` to **0.6.1** if still on 0.5.0  
 - [ ] Smoke: health, pay, hire, work, dispute, continuity beat, fleet get, receipt verify  
 
 ---
