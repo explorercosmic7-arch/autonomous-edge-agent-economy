@@ -1,7 +1,7 @@
 # Publish agentpay-mcp to npm when you push a tag like: mcp-v0.6.0
 # Or run manually: Actions → Publish agentpay-mcp → Run workflow
 
-name: Publish agentpay-mcp
+name: Publish edgerailmcp
 
 on:
   push:
@@ -33,7 +33,7 @@ jobs:
 
       - name: Check package
         run: |
-          node -e "const p=require('./package.json'); console.log(p.name, p.version); if(p.name!=='agentpay-mcp') process.exit(1)"
+          node -e "const p=require('./package.json'); console.log(p.name, p.version); if(p.name!=='edgerailmcp') process.exit(1)"
 
       - name: Install dependencies
         run: npm ci || npm install
