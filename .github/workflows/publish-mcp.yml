@@ -1,4 +1,4 @@
-# Publish agentpay-mcp to npm when you push a tag like: mcp-v0.6.0
+# Publish agentpay-mcp to npm when you push a tag like: mcp-v0.6.1
 # Or run manually: Actions → Publish agentpay-mcp → Run workflow
 
 name: Publish edgerailmcp
