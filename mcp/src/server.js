@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AgentPay MCP Server v0.6.0 — Stage 1–5
+ * AgentPay MCP Server v0.6.1 — Stage 1–5
  *
  * Thin adapter: MCP tools → live Cloudflare Worker APIs.
  * No new ledger. No second database.
@@ -3175,7 +3175,7 @@ async function main() {
   const server = new Server(
     {
       name: "agentpay",
-      version: "0.6.0",
+      version: "0.6.1",
     },
     {
       capabilities: {
