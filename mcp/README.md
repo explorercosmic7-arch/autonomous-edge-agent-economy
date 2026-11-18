@@ -8,7 +8,7 @@
 stdio MCP server that maps tools to the live AgentPay Cloudflare Worker. No local ledger.
 
 - Worker: `https://autonomous-edge-agent-economy.explorercosmic7.workers.dev`
-- Package: `agentpay-mcp`
+- Package: `edgerailmcp`
 - Entry: `src/server.js`
 
 ---
